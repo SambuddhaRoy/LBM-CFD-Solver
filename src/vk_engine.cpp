@@ -6,6 +6,7 @@
 #include "environment.h"
 #include "sim_scaler.h"
 #include "logger.h"
+#include "benchmark/auto_benchmark.h"
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -1198,7 +1199,7 @@ void VulkanEngine::drawUI_Left() {
 
         ImGui::Dummy({0,4});
         ImGui::PushStyleColor(ImGuiCol_Text,{0.24f,0.24f,0.32f,1.f});
-        ImGui::TextUnformatted("Space \xE2\x80\xA2 R reset \xE2\x80\xA2 1\xE2\x80\x934 modes \xE2\x80\xA2 +/\xE2\x88\x92 steps");
+        ImGui::TextUnformatted("Space \xE2\x80\xA2 R reset \xE2\x80\xA2 1\xE2\x80\x93" "4 modes \xE2\x80\xA2 +/\xE2\x88\x92 steps");
         ImGui::PopStyleColor();
         ImGui::Dummy({0,6});
     }
@@ -1825,6 +1826,68 @@ void VulkanEngine::drawUI_StatusBar() {
     ImGui::End();
     ImGui::PopStyleVar();
     ImGui::PopStyleColor();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Benchmark logic
+// ════════════════════════════════════════════════════════════════════════════
+
+void VulkanEngine::runAutoBenchmark() {
+    benchmarkMode_ = true;
+    benchmark::AutoBenchmark bench(this);
+    bench.run();
+    benchmarkMode_ = false;
+}
+
+void VulkanEngine::stepBenchmark(uint32_t steps) {
+    if (steps == 0) return;
+    auto& fr = frame();
+    VK_CHECK(vkWaitForFences(device_, 1, &fr.renderFence, VK_TRUE, 1'000'000'000));
+    VK_CHECK(vkResetFences(device_, 1, &fr.renderFence));
+
+    VK_CHECK(vkResetCommandBuffer(fr.commandBuffer, 0));
+    
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(fr.commandBuffer, &bi));
+
+    for (uint32_t i = 0; i < steps; ++i) {
+        fluidSolver_.step(fr.commandBuffer, simParams_, uint32_t(totalSteps_), true);
+        ++totalSteps_;
+    }
+    fluidSolver_.dispatchAeroForces(fr.commandBuffer, simParams_, true);
+
+    VK_CHECK(vkEndCommandBuffer(fr.commandBuffer));
+
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1; 
+    si.pCommandBuffers = &fr.commandBuffer;
+    VK_CHECK(vkQueueSubmit(graphicsQueue_, 1, &si, fr.renderFence));
+
+    // Force wait so timing is synchronous for benchmark
+    VK_CHECK(vkWaitForFences(device_, 1, &fr.renderFence, VK_TRUE, 1'000'000'000));
+
+    auto t = fluidSolver_.readTimings();
+    gpuTimings_.lbmMs  = t.lbmMs;
+    gpuTimings_.aeroMs = t.aeroMs;
+    aeroForces_ = fluidSolver_.readAeroForces();
+
+    // Update residual with same EMA formula used in the interactive loop
+    float target = 1e-5f + std::exp(-float(totalSteps_) * 0.00015f) * 0.9f;
+    simResidual_ = simResidual_ * 0.97f + target * 0.03f;
+
+    // Query VRAM so recordMetrics() sees live values
+    VmaBudget budgets[VK_MAX_MEMORY_HEAPS];
+    vmaGetHeapBudgets(allocator_, budgets);
+    vramBudget_ = 0; vramUsage_ = 0;
+    for (int i = 0; i < 8; ++i) {
+        vramBudget_ = std::max(vramBudget_, budgets[i].budget);
+        vramUsage_  = std::max(vramUsage_,  budgets[i].usage);
+    }
+
+    currentFrame_ = (currentFrame_ + 1) % FRAMES_IN_FLIGHT;
 }
 
 } // namespace vwt

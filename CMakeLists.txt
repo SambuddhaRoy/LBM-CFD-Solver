@@ -26,6 +26,8 @@ find_package(assimp CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
 find_package(vk-bootstrap CONFIG REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
+find_path(XLSXWRITER_INCLUDE_DIR NAMES xlsxwriter.h)
+find_library(XLSXWRITER_LIBRARY NAMES xlsxwriter)
 
 set(SOURCES
     src/main.cpp
@@ -33,6 +35,7 @@ set(SOURCES
     src/fluid_solver.cpp
     src/renderer.cpp
     src/vk_engine.cpp
+    src/benchmark/auto_benchmark.cpp
 )
 
 set(HEADERS
@@ -44,6 +47,9 @@ set(HEADERS
     src/environment.h
     src/sim_scaler.h
     src/logger.h
+    src/benchmark/auto_benchmark.h
+    src/benchmark/benchmark_config.h
+    src/benchmark/model_selector.h
 )
 
 add_executable(${PROJECT_NAME} ${SOURCES} ${HEADERS})
@@ -56,6 +62,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     glm::glm
     vk-bootstrap::vk-bootstrap
     GPUOpen::VulkanMemoryAllocator
+    ${XLSXWRITER_LIBRARY}
 )
 
 if(WIN32)
@@ -63,11 +70,21 @@ if(WIN32)
 endif()
 
 if(LINUX)
-    get_filename_component(VULKAN_LIB_DIR ${VULKAN_LIBRARY} DIRECTORY)
-    target_link_options(${PROJECT_NAME} PRIVATE "-Wl,-rpath,${VULKAN_LIB_DIR}")
+    # Vulkan_LIBRARIES is set by find_package(Vulkan); fall back to Vulkan_LIBRARY
+    set(_VK_LIB "${Vulkan_LIBRARIES}")
+    if(NOT _VK_LIB)
+        set(_VK_LIB "${Vulkan_LIBRARY}")
+    endif()
+    if(_VK_LIB)
+        get_filename_component(VULKAN_LIB_DIR "${_VK_LIB}" DIRECTORY)
+        target_link_options(${PROJECT_NAME} PRIVATE "-Wl,-rpath,${VULKAN_LIB_DIR}")
+    endif()
 endif()
 
-target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(${PROJECT_NAME} PRIVATE 
+    ${CMAKE_SOURCE_DIR}/src
+    ${XLSXWRITER_INCLUDE_DIR}
+)
 
 # ─── Compile shaders ────────────────────────────────────────────────────────
 if(Vulkan_GLSLC_EXECUTABLE)
