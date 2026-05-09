@@ -443,21 +443,39 @@ void VulkanEngine::initImGui() {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.IniFilename = nullptr;  // We manage config ourselves
 
+    // Compute DPI scale from framebuffer/window ratio — works on X11, Wayland and XWayland
+    // (glfwGetWindowContentScale returns 1.0 on many Wayland compositors, so we avoid it)
+    float dpiScale = 1.f;
+    if (window_) {
+        int ww = 1, wh = 1, fw = 1, fh = 1;
+        glfwGetWindowSize(window_, &ww, &wh);
+        glfwGetFramebufferSize(window_, &fw, &fh);
+        if (ww > 0 && wh > 0)
+            dpiScale = std::max(float(fw) / float(ww), float(fh) / float(wh));
+        dpiScale = std::max(1.f, dpiScale);
+    }
+    // FontGlobalScale inverts the oversize so logical sizes remain correct;
+    // the atlas is just rasterised at higher resolution for sharpness.
+    io.FontGlobalScale = 1.f / dpiScale;
+
 #ifdef _WIN32
-    fontBody_ = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/segoeui.ttf", 15.f);
-    fontMono_ = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/consola.ttf", 12.f);
+    fontBody_ = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/segoeui.ttf", 15.f * dpiScale);
+    fontMono_ = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/consola.ttf", 12.f * dpiScale);
 #else
-    fontBody_ = io.Fonts->AddFontFromFileTTF("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 15.f);
-    fontMono_ = io.Fonts->AddFontFromFileTTF("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 12.f);
+    fontBody_ = io.Fonts->AddFontFromFileTTF("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",     15.f * dpiScale);
+    fontMono_ = io.Fonts->AddFontFromFileTTF("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 12.f * dpiScale);
 #endif
 
     ImGuiStyle& s = ImGui::GetStyle();
+    // Set base (unscaled) values first, then ScaleAllSizes multiplies them correctly.
+    // Calling ScaleAllSizes before explicit assignments would have no effect.
     s.WindowRounding = 0.f; s.ChildRounding = 4.f; s.FrameRounding = 4.f;
     s.PopupRounding  = 6.f; s.TabRounding   = 4.f; s.GrabRounding  = 4.f;
     s.WindowBorderSize = 0.f; s.FrameBorderSize = 0.f;
     s.ItemSpacing    = {8,5}; s.ItemInnerSpacing = {6,4};
     s.WindowPadding  = {12,10}; s.FramePadding = {8,4};
     s.IndentSpacing  = 14.f; s.ScrollbarSize = 10.f;
+    s.ScaleAllSizes(dpiScale);
 
     constexpr ImVec4 kA  = {0.11f,0.82f,0.63f,1.f};   // teal accent
     constexpr ImVec4 kAD = {0.08f,0.55f,0.42f,1.f};
@@ -874,8 +892,9 @@ static bool SliderPill(const char* id, const char* label,
 // ════════════════════════════════════════════════════════════════════════════
 
 void VulkanEngine::drawUI_Rail() {
-    const float RW = 56.f;
-    const float H  = float(windowExtent_.height) - 26.f;
+    const ImVec2 ds = ImGui::GetIO().DisplaySize;
+    const float RW = std::max(48.f, ds.x * 0.030f);  // ~3% of width, min 48px
+    const float H  = ds.y - 26.f;
     ImGui::SetNextWindowPos({0,0});
     ImGui::SetNextWindowSize({RW, H});
     ImGui::PushStyleColor(ImGuiCol_WindowBg, {0.031f,0.031f,0.043f,1.f});
@@ -886,17 +905,18 @@ void VulkanEngine::drawUI_Rail() {
         ImGuiWindowFlags_NoBringToFrontOnFocus|ImGuiWindowFlags_NoScrollbar);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float btnSz  = std::max(32.f, RW * 0.68f);
+    const float btnOff = (RW - btnSz) * 0.5f;
 
     // Logo mark
     ImVec2 lp = ImGui::GetCursorScreenPos();
-    lp.x += 10.f; lp.y += 4.f;
-    // Gradient square logo
-    dl->AddRectFilledMultiColor(lp, {lp.x+36,lp.y+36},
+    lp.x += btnOff; lp.y += 4.f;
+    dl->AddRectFilledMultiColor(lp, {lp.x+btnSz,lp.y+btnSz},
         IM_COL32(29,209,161,255), IM_COL32(0,206,201,255),
         IM_COL32(0,176,155,255),  IM_COL32(29,209,161,255));
-    dl->AddText(ImGui::GetFont(), 18.f, {lp.x+9,lp.y+8},
+    dl->AddText(ImGui::GetFont(), btnSz*0.5f, {lp.x+btnSz*0.25f,lp.y+btnSz*0.22f},
         IM_COL32(10,20,16,255), "V");
-    ImGui::Dummy({RW, 46.f});
+    ImGui::Dummy({RW, btnSz + 10.f});
     ImGui::Dummy({0, 8.f});
 
     // Rail icon buttons
@@ -907,13 +927,13 @@ void VulkanEngine::drawUI_Rail() {
     };
     for (int i = 0; i < 4; ++i) {
         bool act = (railMode_ == i);
-        ImGui::SetCursorPosX(10.f);
+        ImGui::SetCursorPosX(btnOff);
 
         ImVec2 btnP = ImGui::GetCursorScreenPos();
         if (act) {
-            dl->AddRectFilled(btnP, {btnP.x+36,btnP.y+36},
+            dl->AddRectFilled(btnP, {btnP.x+btnSz,btnP.y+btnSz},
                 IM_COL32(11,72,54,255), 7.f);
-            dl->AddRect(btnP, {btnP.x+36,btnP.y+36},
+            dl->AddRect(btnP, {btnP.x+btnSz,btnP.y+btnSz},
                 IM_COL32(29,209,161,80), 7.f);
         }
 
@@ -924,14 +944,14 @@ void VulkanEngine::drawUI_Rail() {
             act ? ImVec4{0.11f,0.82f,0.63f,1.f} : ImVec4{0.32f,0.32f,0.44f,1.f});
         ImGui::SetWindowFontScale(1.25f);
         char bid[12]; snprintf(bid,12,"##ri%d",i);
-        if (ImGui::Button(bid, {36,36})) railMode_ = i;
+        if (ImGui::Button(bid, {btnSz,btnSz})) railMode_ = i;
         ImGui::SetWindowFontScale(1.f);
         ImGui::PopStyleColor(4);
 
-        // Draw icon text centred (since Button label won't auto-centre for single char)
+        // Draw icon text centred
         ImVec2 iconSz = ImGui::CalcTextSize(items[i].icon);
-        dl->AddText(ImGui::GetFont(), 16.f,
-            {btnP.x + (36.f-iconSz.x)*0.5f, btnP.y + (36.f-iconSz.y)*0.5f},
+        dl->AddText(ImGui::GetFont(), btnSz*0.44f,
+            {btnP.x + (btnSz-iconSz.x)*0.5f, btnP.y + (btnSz-iconSz.y)*0.5f},
             act ? IM_COL32(29,209,161,255) : IM_COL32(82,82,110,255),
             items[i].icon);
 
@@ -941,16 +961,16 @@ void VulkanEngine::drawUI_Rail() {
     }
 
     // Bottom: settings
-    float settY = H - 52.f;
+    float settY = H - btnSz - 12.f;
     ImGui::SetCursorPosY(settY);
-    ImGui::SetCursorPosX(10.f);
+    ImGui::SetCursorPosX(btnOff);
     ImGui::PushStyleColor(ImGuiCol_Button,        {0,0,0,0});
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, {0.10f,0.10f,0.14f,1.f});
     ImGui::PushStyleColor(ImGuiCol_Text,          {0.28f,0.28f,0.38f,1.f});
-    if (ImGui::Button("##sett",{36,36})){}
+    if (ImGui::Button("##sett",{btnSz,btnSz})){}
     ImGui::PopStyleColor(3);
     ImVec2 gp = ImGui::GetItemRectMin();
-    dl->AddText(ImGui::GetFont(), 16.f, {gp.x+10,gp.y+10},
+    dl->AddText(ImGui::GetFont(), btnSz*0.44f, {gp.x+btnSz*0.27f,gp.y+btnSz*0.27f},
         IM_COL32(70,70,95,255), "*");
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Settings");
 
@@ -964,9 +984,10 @@ void VulkanEngine::drawUI_Rail() {
 // ════════════════════════════════════════════════════════════════════════════
 
 void VulkanEngine::drawUI_Left() {
-    const float RW = 56.f;
-    const float SW = 280.f;
-    const float H  = float(windowExtent_.height) - 26.f;
+    const ImVec2 ds = ImGui::GetIO().DisplaySize;
+    const float RW = std::max(48.f, ds.x * 0.030f);
+    const float SW = std::max(220.f, ds.x * 0.175f);  // ~17.5% of width
+    const float H  = ds.y - 26.f;
     ImGui::SetNextWindowPos({RW, 0});
     ImGui::SetNextWindowSize({SW, H});
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {12,12});
@@ -976,18 +997,31 @@ void VulkanEngine::drawUI_Left() {
         ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoCollapse|
         ImGuiWindowFlags_NoBringToFrontOnFocus);
 
-    // Panel title
+    // Panel title — driven by which rail button is active
+    static const char* kPanelTitle[] = {"Simulation",  "Mesh Tools", "Probe",       "Compare"};
+    static const char* kPanelSub[]   = {"D3Q19 Lattice Boltzmann", "Geometry tools", "Flow probes", "Run comparison"};
     ImGui::PushStyleColor(ImGuiCol_Text, {0.86f,0.86f,0.94f,1.f});
     ImGui::SetWindowFontScale(1.08f);
-    ImGui::TextUnformatted("Simulation");
+    ImGui::TextUnformatted(kPanelTitle[railMode_]);
     ImGui::SetWindowFontScale(1.f);
     ImGui::PopStyleColor();
     ImGui::PushStyleColor(ImGuiCol_Text, {0.11f,0.82f,0.63f,1.f});
-    ImGui::TextUnformatted("D3Q19 Lattice Boltzmann");
+    ImGui::TextUnformatted(kPanelSub[railMode_]);
     ImGui::PopStyleColor();
     ImGui::Dummy({0,6});
     UISep();
     ImGui::Dummy({0,8});
+
+    // Modes 1-3 are not yet implemented — show a placeholder and return early
+    if (railMode_ != 0) {
+        ImGui::PushStyleColor(ImGuiCol_Text, {0.32f,0.32f,0.44f,1.f});
+        ImGui::TextUnformatted("Coming soon");
+        ImGui::PopStyleColor();
+        ImGui::End();
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar();
+        return;
+    }
 
     // ── GEOMETRY CARD ──────────────────────────────────────────────────────
     if (BeginCard("##cGeom", 0.f)) {
@@ -1208,7 +1242,7 @@ void VulkanEngine::drawUI_Left() {
 
     // Footer: Run / Reset
     float remH = H - ImGui::GetCursorPosY() - 12.f;
-    if (remH > 56.f) ImGui::SetCursorPosY(H - 56.f);
+    if (remH > 60.f) ImGui::SetCursorPosY(H - 60.f);
     UISep(); ImGui::Dummy({0,6});
     float bw = (ImGui::GetContentRegionAvail().x-4)*0.5f;
 
@@ -1275,9 +1309,9 @@ void VulkanEngine::drawViewportColorbar(ImDrawList* dl, ImVec2 vpMin, ImVec2 /*v
     float x0 = vpMin.x + /* vpMax.x - vpMin.x */ 0.f; // filled below
     // We draw on the background drawlist so it appears behind imgui widgets
     // but we need screen coords from the parent viewport
-    float vpW = float(windowExtent_.width);
-    float vpL = 56.f + 280.f;
-    float vpR = vpW - 268.f;
+    float vpW = ImGui::GetIO().DisplaySize.x;
+    float vpL = std::max(48.f, vpW * 0.030f) + std::max(220.f, vpW * 0.175f);
+    float vpR = vpW - std::max(200.f, vpW * 0.165f);
     x0 = vpR - marginR - cbW;
     float y0 = vpMin.y + marginT;
 
@@ -1405,12 +1439,13 @@ void VulkanEngine::drawViewportToolbar(float vpX, float vpW,
 // ════════════════════════════════════════════════════════════════════════════
 
 void VulkanEngine::drawUI_Viewport() {
-    const float lw  = 56.f + 280.f;
-    const float rw  = 268.f;
+    const ImVec2 ds = ImGui::GetIO().DisplaySize;
+    const float lw  = std::max(48.f, ds.x * 0.030f) + std::max(220.f, ds.x * 0.175f);
+    const float rw  = std::max(200.f, ds.x * 0.165f);
     const float sh  = 26.f;
     const float tbH = 34.f;
-    const float vw  = float(windowExtent_.width)  - lw - rw;
-    const float vh  = float(windowExtent_.height) - sh;
+    const float vw  = ds.x - lw - rw;
+    const float vh  = ds.y - sh;
 
     ImGui::SetNextWindowPos({lw,0});
     ImGui::SetNextWindowSize({vw,vh});
@@ -1716,9 +1751,10 @@ void VulkanEngine::drawCard_GPU() {
 // ════════════════════════════════════════════════════════════════════════════
 
 void VulkanEngine::drawUI_Right() {
-    const float RW = 268.f;
-    const float H  = float(windowExtent_.height) - 26.f;
-    const float X  = float(windowExtent_.width)  - RW;
+    const ImVec2 ds = ImGui::GetIO().DisplaySize;
+    const float RW = std::max(200.f, ds.x * 0.165f);
+    const float H  = ds.y - 26.f;
+    const float X  = ds.x - RW;
     ImGui::SetNextWindowPos({X,0});
     ImGui::SetNextWindowSize({RW,H});
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,{12,12});
@@ -1761,9 +1797,10 @@ void VulkanEngine::drawUI_Right() {
 // ════════════════════════════════════════════════════════════════════════════
 
 void VulkanEngine::drawUI_StatusBar() {
+    const ImVec2 ds = ImGui::GetIO().DisplaySize;
     const float H  = 26.f;
-    const float W  = float(windowExtent_.width);
-    const float Y  = float(windowExtent_.height) - H;
+    const float W  = ds.x;
+    const float Y  = ds.y - H;
     ImGui::SetNextWindowPos({0,Y});
     ImGui::SetNextWindowSize({W,H});
     ImGui::PushStyleColor(ImGuiCol_WindowBg,{0.026f,0.026f,0.036f,1.f});
