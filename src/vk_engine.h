@@ -7,17 +7,23 @@
 #include "mesh_loader.h"
 #include "fluid_solver.h"
 #include "renderer.h"
+#include <imgui.h>
 
 struct GLFWwindow;
 
 namespace vwt {
+namespace benchmark { class AutoBenchmark; }
 
 class VulkanEngine {
 public:
     void init();
     void run();
+    void runAutoBenchmark();
+    void stepBenchmark(uint32_t steps);
     void cleanup();
     bool isInitialized() const { return initialized_; }
+
+    friend class benchmark::AutoBenchmark;
 
 private:
     // ── Init helpers ──────────────────────────────────────────────────────
@@ -40,11 +46,13 @@ private:
     void drawImGui();
 
     // ── UI panels ─────────────────────────────────────────────────────────
+    void drawUI_TopBar();
     void drawUI_Rail();
     void drawUI_Left();
     void drawUI_Viewport();
     void drawUI_Right();
     void drawUI_StatusBar();
+    void drawUI_HotkeyOverlay();
 
     // ── UI sub-helpers ────────────────────────────────────────────────────
     void drawCard_Aero();
@@ -53,6 +61,10 @@ private:
     void drawCard_GPU();
     void drawViewportColorbar(ImDrawList* dl, ImVec2 vpMin, ImVec2 vpMax);
     void drawViewportToolbar(float vpX, float vpW, float toolbarY, float toolbarH);
+    void drawWelcomeOverlay(ImVec2 vpPos, ImVec2 vpSize);
+
+    // Layout helper — converts an unscaled "design" pixel value to scaled pixels.
+    float s(float v) const { return v * dpiScale_; }
 
     // ── App logic ─────────────────────────────────────────────────────────
     void loadMesh(const std::string& path);
@@ -102,6 +114,7 @@ private:
     VkDescriptorPool imguiPool_ = VK_NULL_HANDLE;
     ImFont* fontBody_ = nullptr;   // 15px default
     ImFont* fontMono_ = nullptr;   // 12px monospaced
+    float   dpiScale_ = 1.f;       // window content scale (set during initImGui)
 
     // ── Application modules ───────────────────────────────────────────────
     MeshLoader  meshLoader_;
@@ -145,8 +158,15 @@ private:
     uint32_t baseGridZ_   = 64;
 
     // ── Navigation rail mode ──────────────────────────────────────────────
-    // 0=Simulation 1=Mesh 2=Probe 3=Compare  (future modes — currently only 0 active)
-    int railMode_ = 0;
+    // 0=Simulation 1=Mesh 2=Probes 3=Compare 4=Library 5=Settings
+    int  railMode_         = 0;
+    bool leftPanelOpen_    = true;
+    bool rightPanelOpen_   = true;
+    bool showHotkeys_      = false;
+    bool showAeroCard_     = true;
+    bool showConvCard_     = true;
+    bool showFlowCard_     = true;
+    bool showGpuCard_      = true;
 
     // ── Performance history ───────────────────────────────────────────────
     static constexpr int kHist = 120;
@@ -163,6 +183,8 @@ private:
 
     // ── GPU info ──────────────────────────────────────────────────────────
     char gpuName_[256] = "Unknown";
+
+    bool benchmarkMode_ = false;
 
     DeletionQueue mainDQ_;
 };

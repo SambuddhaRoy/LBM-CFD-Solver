@@ -220,7 +220,15 @@ void VulkanEngine::keyCallback(GLFWwindow* w, int key, int, int action, int) {
         else { glfwRestoreWindow(w); eng->fullscreen_ = false; }
         break;
     case GLFW_KEY_ESCAPE:
-        eng->zoomLevel_ = 1.f; eng->panX_ = 0; eng->panY_ = 0; break;
+        if (eng->showHotkeys_) eng->showHotkeys_ = false;
+        else { eng->zoomLevel_ = 1.f; eng->panX_ = 0; eng->panY_ = 0; }
+        break;
+    case GLFW_KEY_SLASH:   // ? on shifted layouts; we accept both / and ?
+        eng->showHotkeys_ = !eng->showHotkeys_; break;
+    case GLFW_KEY_TAB:
+        eng->leftPanelOpen_ = !eng->leftPanelOpen_; break;
+    case GLFW_KEY_F:
+        eng->rightPanelOpen_ = !eng->rightPanelOpen_; break;
     }
 }
 
@@ -454,6 +462,7 @@ void VulkanEngine::initImGui() {
             dpiScale = std::max(float(fw) / float(ww), float(fh) / float(wh));
         dpiScale = std::max(1.f, dpiScale);
     }
+    dpiScale_ = dpiScale;
     // FontGlobalScale inverts the oversize so logical sizes remain correct;
     // the atlas is just rasterised at higher resolution for sharpness.
     io.FontGlobalScale = 1.f / dpiScale;
@@ -462,8 +471,28 @@ void VulkanEngine::initImGui() {
     fontBody_ = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/segoeui.ttf", 15.f * dpiScale);
     fontMono_ = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/consola.ttf", 12.f * dpiScale);
 #else
-    fontBody_ = io.Fonts->AddFontFromFileTTF("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",     15.f * dpiScale);
-    fontMono_ = io.Fonts->AddFontFromFileTTF("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 12.f * dpiScale);
+    // Try common distro paths (Debian/Ubuntu, Arch/Cachy, Fedora)
+    auto tryFont = [&](std::initializer_list<const char*> paths, float sz) -> ImFont* {
+        for (const char* p : paths) {
+            std::ifstream f(p);
+            if (f.good()) return io.Fonts->AddFontFromFileTTF(p, sz);
+        }
+        return nullptr;
+    };
+    fontBody_ = tryFont({
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf",
+    }, 15.f * dpiScale);
+    fontMono_ = tryFont({
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/liberation-mono/LiberationMono-Regular.ttf",
+    }, 12.f * dpiScale);
+    if (!fontBody_) fontBody_ = io.Fonts->AddFontDefault();
 #endif
 
     ImGuiStyle& s = ImGui::GetStyle();
@@ -697,11 +726,13 @@ void VulkanEngine::drawImGui() {
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
 
+    drawUI_TopBar();
     drawUI_Rail();
     drawUI_Left();
     drawUI_Viewport();
     drawUI_Right();
     drawUI_StatusBar();
+    drawUI_HotkeyOverlay();
 
     ImGui::Render();
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(),
@@ -888,90 +919,370 @@ static bool SliderPill(const char* id, const char* label,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// UI — Icon rail  (56px wide, left edge)
+// UI — Layout & design tokens
+// ════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Theme palette (colours used in many places — single source of truth)
+constexpr ImVec4 kBgRoot      = {0.027f, 0.027f, 0.035f, 1.f};
+constexpr ImVec4 kBgPanel     = {0.043f, 0.043f, 0.059f, 1.f};
+constexpr ImVec4 kBgRail      = {0.020f, 0.020f, 0.030f, 1.f};
+constexpr ImVec4 kBgInput     = {0.055f, 0.055f, 0.075f, 1.f};
+constexpr ImVec4 kBorder      = {0.110f, 0.110f, 0.150f, 1.f};
+constexpr ImVec4 kText        = {0.860f, 0.860f, 0.940f, 1.f};
+constexpr ImVec4 kTextDim     = {0.420f, 0.420f, 0.530f, 1.f};
+constexpr ImVec4 kTextMuted   = {0.250f, 0.250f, 0.350f, 1.f};
+constexpr ImVec4 kAccent      = {0.110f, 0.820f, 0.630f, 1.f};
+constexpr ImVec4 kAccentDim   = {0.080f, 0.500f, 0.380f, 1.f};
+constexpr ImVec4 kAccentBg    = {0.040f, 0.220f, 0.160f, 1.f};
+constexpr ImVec4 kBlue        = {0.440f, 0.740f, 1.000f, 1.f};
+constexpr ImVec4 kPurple      = {0.680f, 0.550f, 1.000f, 1.f};
+constexpr ImVec4 kAmber       = {0.990f, 0.720f, 0.220f, 1.f};
+constexpr ImVec4 kRed         = {1.000f, 0.420f, 0.420f, 1.f};
+
+// Computed layout for a single frame
+struct Layout {
+    ImVec2 ds;          // display size
+    float  S;           // global scale (= dpiScale_)
+    float  topH;        // top bar height
+    float  statusH;     // status bar height
+    float  railW;       // rail width
+    float  leftW;       // left panel width (0 = collapsed)
+    float  rightW;      // right panel width (0 = collapsed)
+    float  vpX, vpY;    // viewport top-left
+    float  vpW, vpH;    // viewport dimensions
+};
+
+Layout computeLayout(ImVec2 ds, float scale, bool leftOpen, bool rightOpen) {
+    Layout L;
+    L.ds      = ds;
+    L.S       = scale;
+    L.topH    = 44.f * scale;
+    L.statusH = 24.f * scale;
+    L.railW   = 56.f * scale;
+    L.leftW   = leftOpen  ? std::clamp(ds.x * 0.18f, 240.f * scale, 360.f * scale) : 0.f;
+    L.rightW  = rightOpen ? std::clamp(ds.x * 0.18f, 240.f * scale, 360.f * scale) : 0.f;
+
+    // Force-collapse panels if there isn't room for the viewport
+    const float minVp = 420.f * scale;
+    if (ds.x - L.railW - L.leftW - L.rightW < minVp) L.rightW = 0.f;
+    if (ds.x - L.railW - L.leftW - L.rightW < minVp) L.leftW  = 0.f;
+    if (ds.x - L.railW - L.leftW - L.rightW < minVp) L.railW  = 0.f;
+
+    L.vpX = L.railW + L.leftW;
+    L.vpY = L.topH;
+    L.vpW = std::max(0.f, ds.x - L.vpX - L.rightW);
+    L.vpH = std::max(0.f, ds.y - L.topH - L.statusH);
+    return L;
+}
+
+// Round rectangular pill — fast hand-drawn primitive
+void DrawPill(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 fill, ImU32 border = 0, float r = 5.f) {
+    dl->AddRectFilled(a, b, fill, r);
+    if (border) dl->AddRect(a, b, border, r, 0, 1.f);
+}
+
+// Centred icon-button used in rail and toolbars
+bool IconButton(const char* id, const char* glyph, ImVec2 size,
+                bool active, ImVec4 activeCol = kAccent) {
+    ImGui::PushStyleColor(ImGuiCol_Button,        active ? ImVec4{0.05f,0.30f,0.22f,1.f} : ImVec4{0,0,0,0});
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4{0.10f,0.10f,0.14f,1.f});
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4{0.05f,0.28f,0.20f,1.f});
+    ImGui::PushStyleColor(ImGuiCol_Text,          active ? activeCol : kTextDim);
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    bool clicked = ImGui::Button(id, size);
+    ImGui::PopStyleColor(4);
+
+    // Draw glyph centred (single char buttons can't auto-centre)
+    ImVec2 ts = ImGui::CalcTextSize(glyph);
+    ImGui::GetWindowDrawList()->AddText(ImGui::GetFont(), size.y * 0.46f,
+        {pos.x + (size.x - ts.x) * 0.5f, pos.y + (size.y - ts.y) * 0.5f},
+        ImGui::ColorConvertFloat4ToU32(active ? activeCol : kTextDim),
+        glyph);
+    return clicked;
+}
+
+// A small "tag" pill for inline metadata badges (e.g. "LIVE", "BGK")
+void Tag(const char* text, ImVec4 fg, ImVec4 bg) {
+    ImGui::PushStyleColor(ImGuiCol_Button,        bg);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, bg);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  bg);
+    ImGui::PushStyleColor(ImGuiCol_Text,          fg);
+    ImGui::SmallButton(text);
+    ImGui::PopStyleColor(4);
+}
+
+// Section header inside left panel — collapsible accordion
+bool SectionHeading(const char* label, bool* open, ImVec4 accent) {
+    ImGui::PushStyleColor(ImGuiCol_Header,        ImVec4{0.07f,0.07f,0.10f,1.f});
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4{0.10f,0.10f,0.14f,1.f});
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4{0.12f,0.12f,0.17f,1.f});
+
+    ImVec2 cs = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    // Coloured accent dot
+    dl->AddCircleFilled({cs.x + 6.f, cs.y + ImGui::GetFontSize()*0.5f + 4.f},
+                       3.5f, ImGui::ColorConvertFloat4ToU32(accent));
+    ImGui::Indent(16.f);
+    bool clicked = ImGui::Selectable(label, false,
+                                     ImGuiSelectableFlags_AllowOverlap, {0, 22.f});
+    ImGui::Unindent(16.f);
+    if (clicked && open) *open = !*open;
+
+    // Chevron indicator
+    float chW = ImGui::GetContentRegionAvail().x;
+    (void)chW;
+    const char* chev = (open && *open) ? "v" : ">";
+    ImVec2 sz = ImGui::CalcTextSize(chev);
+    dl->AddText(ImGui::GetFont(), ImGui::GetFontSize()*0.85f,
+        {cs.x + ImGui::GetContentRegionAvail().x + 16.f - sz.x,
+         cs.y + ImGui::GetFontSize()*0.5f - sz.y*0.3f + 2.f},
+        ImGui::ColorConvertFloat4ToU32(kTextMuted), chev);
+
+    ImGui::PopStyleColor(3);
+    return open ? *open : true;
+}
+
+} // anonymous namespace
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// UI — Top bar  (brand + primary actions + live perf)
+// ════════════════════════════════════════════════════════════════════════════
+
+void VulkanEngine::drawUI_TopBar() {
+    const ImVec2 ds = ImGui::GetIO().DisplaySize;
+    const Layout L  = computeLayout(ds, dpiScale_, leftPanelOpen_, rightPanelOpen_);
+
+    ImGui::SetNextWindowPos({0, 0});
+    ImGui::SetNextWindowSize({ds.x, L.topH});
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {s(14.f), 0});
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{0.025f,0.025f,0.034f,1.f});
+    ImGui::Begin("##TopBar", nullptr,
+        ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove|
+        ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoScrollbar|
+        ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 wp = ImGui::GetWindowPos();
+
+    // Bottom hairline
+    dl->AddLine({wp.x, wp.y + L.topH - 0.5f}, {wp.x + ds.x, wp.y + L.topH - 0.5f},
+                ImGui::ColorConvertFloat4ToU32(kBorder), 1.f);
+
+    // ── Brand mark + title ──────────────────────────────────────────────
+    float yMid = (L.topH - s(28.f)) * 0.5f;
+    ImGui::SetCursorPos({s(14.f), yMid});
+    ImVec2 lp = ImGui::GetCursorScreenPos();
+    dl->AddRectFilledMultiColor(lp, {lp.x + s(28.f), lp.y + s(28.f)},
+        IM_COL32(29,209,161,255), IM_COL32(0,206,201,255),
+        IM_COL32(0,176,155,255),  IM_COL32(29,209,161,255));
+    dl->AddText(ImGui::GetFont(), s(15.f),
+        {lp.x + s(8.f), lp.y + s(6.f)}, IM_COL32(10,20,16,255), "L");
+    ImGui::Dummy({s(36.f), s(28.f)});
+
+    ImGui::SameLine(0, s(8.f));
+    ImGui::SetCursorPosY((L.topH - ImGui::GetFontSize()) * 0.5f);
+    ImGui::PushStyleColor(ImGuiCol_Text, kText);
+    ImGui::TextUnformatted("LBM-CFD Solver");
+    ImGui::PopStyleColor();
+
+    if (ds.x > s(820.f)) {
+        ImGui::SameLine(0, s(8.f));
+        ImGui::SetCursorPosY((L.topH - ImGui::GetFontSize()) * 0.5f);
+        ImGui::PushStyleColor(ImGuiCol_Text, kTextMuted);
+        ImGui::TextUnformatted("v0.2");
+        ImGui::PopStyleColor();
+    }
+
+    // ── Centred primary actions ─────────────────────────────────────────
+    auto bigBtn = [&](const char* label, ImVec4 col, ImVec4 colHov, ImVec4 textCol,
+                      float w) -> bool {
+        ImGui::PushStyleColor(ImGuiCol_Button,        col);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, colHov);
+        ImGui::PushStyleColor(ImGuiCol_Text,          textCol);
+        bool r = ImGui::Button(label, {w, s(28.f)});
+        ImGui::PopStyleColor(3);
+        return r;
+    };
+
+    auto subtle = [&](const char* label, float w) -> bool {
+        return bigBtn(label, ImVec4{0.07f,0.07f,0.10f,1.f},
+                            ImVec4{0.11f,0.11f,0.16f,1.f},
+                            kText, w);
+    };
+
+    // Build the action row in a centred group
+    const float btnSpacing = s(6.f);
+    float btnRowW = 0.f;
+    btnRowW += s(74.f) + btnSpacing;  // Open
+    btnRowW += s(86.f) + btnSpacing;  // Run/Pause
+    btnRowW += s(74.f) + btnSpacing;  // Reset
+    if (ds.x > s(900.f)) btnRowW += s(82.f) + btnSpacing;  // Snap
+    if (ds.x > s(1050.f)) btnRowW += s(54.f) + btnSpacing; // ?
+    btnRowW -= btnSpacing;
+
+    float actionsX = (ds.x - btnRowW) * 0.5f;
+    if (actionsX < s(280.f)) actionsX = s(280.f);
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(actionsX);
+    ImGui::SetCursorPosY(yMid);
+
+    if (subtle("Open", s(74.f))) {
+#ifdef _WIN32
+        auto path = openFileDialog();
+        if (!path.empty()) { snprintf(meshPath_,512,"%s",path.c_str()); loadMesh(meshPath_); }
+#endif
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open 3D model (.stl, .obj, .fbx)");
+    ImGui::SameLine(0, btnSpacing);
+
+    if (simRunning_) {
+        if (bigBtn("Pause", ImVec4{0.20f,0.10f,0.04f,1.f}, ImVec4{0.30f,0.16f,0.06f,1.f},
+                   ImVec4{0.99f,0.72f,0.22f,1.f}, s(86.f)))
+            simRunning_ = false;
+    } else {
+        if (bigBtn("Run", ImVec4{0.06f,0.38f,0.27f,1.f}, ImVec4{0.09f,0.55f,0.40f,1.f},
+                   ImVec4{0.86f,0.98f,0.92f,1.f}, s(86.f)))
+            simRunning_ = true;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Run / pause simulation [Space]");
+    ImGui::SameLine(0, btnSpacing);
+
+    if (subtle("Reset", s(74.f))) {
+        fluidSolver_.resetToEquilibrium();
+        totalSteps_ = 0; simResidual_ = 1.f; simRunning_ = false;
+        aeroCDPrev_ = 0; aeroCLPrev_ = 0;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reset simulation state [R]");
+
+    if (ds.x > s(900.f)) {
+        ImGui::SameLine(0, btnSpacing);
+        if (subtle("Snapshot", s(82.f))) { /* TODO: capture viewport */ }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Save viewport snapshot [S]");
+    }
+    if (ds.x > s(1050.f)) {
+        ImGui::SameLine(0, btnSpacing);
+        if (subtle("?", s(54.f))) showHotkeys_ = !showHotkeys_;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show keyboard shortcuts [?]");
+    }
+
+    // ── Right side: GPU + FPS pill ──────────────────────────────────────
+    float fps  = avgFrameMs_ > 0 ? 1000.f / avgFrameMs_ : 0.f;
+    float mlups = 0.f;
+    {
+        double cells = double(simParams_.gridX) * simParams_.gridY * simParams_.gridZ;
+        mlups = float((fps * stepsPerFrame_ * cells) / 1.0e6);
+    }
+    char gpuShort[24]; snprintf(gpuShort, sizeof(gpuShort), "%s", gpuName_);
+    if (strlen(gpuShort) > 22) { gpuShort[22]='.'; gpuShort[23]=0; }
+
+    char perfBuf[80];
+    snprintf(perfBuf, sizeof(perfBuf), "%.0f fps  %.2f MLUPS", fps, mlups);
+
+    ImVec2 perfSz = ImGui::CalcTextSize(perfBuf);
+    float pillW = perfSz.x + s(20.f);
+    float pillX = ds.x - pillW - s(14.f);
+    float pillY = yMid;
+    {
+        ImVec2 pa = {wp.x + pillX, wp.y + pillY};
+        ImVec2 pb = {pa.x + pillW, pa.y + s(28.f)};
+        DrawPill(dl, pa, pb, IM_COL32(8,12,18,220), IM_COL32(40,40,56,160), s(6.f));
+        dl->AddText(ImGui::GetFont(), 0.f,
+            {pa.x + s(10.f), pa.y + (s(28.f) - ImGui::GetFontSize())*0.5f},
+            ImGui::ColorConvertFloat4ToU32(kAccent), perfBuf);
+    }
+
+    if (ds.x > s(1100.f)) {
+        ImVec2 gpuSz = ImGui::CalcTextSize(gpuShort);
+        float gpuW = gpuSz.x + s(20.f);
+        float gpuX = pillX - gpuW - s(8.f);
+        ImVec2 ga = {wp.x + gpuX, wp.y + pillY};
+        ImVec2 gb = {ga.x + gpuW, ga.y + s(28.f)};
+        DrawPill(dl, ga, gb, IM_COL32(20,18,40,220), IM_COL32(60,55,90,160), s(6.f));
+        dl->AddText(ImGui::GetFont(), 0.f,
+            {ga.x + s(10.f), ga.y + (s(28.f) - ImGui::GetFontSize())*0.5f},
+            ImGui::ColorConvertFloat4ToU32(kPurple), gpuShort);
+    }
+
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// UI — Icon rail  (left edge, navigation between modes)
 // ════════════════════════════════════════════════════════════════════════════
 
 void VulkanEngine::drawUI_Rail() {
     const ImVec2 ds = ImGui::GetIO().DisplaySize;
-    const float RW = std::max(48.f, ds.x * 0.030f);  // ~3% of width, min 48px
-    const float H  = ds.y - 26.f;
-    ImGui::SetNextWindowPos({0,0});
-    ImGui::SetNextWindowSize({RW, H});
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, {0.031f,0.031f,0.043f,1.f});
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0,8});
+    const Layout L  = computeLayout(ds, dpiScale_, leftPanelOpen_, rightPanelOpen_);
+    if (L.railW <= 0.f) return;
+
+    ImGui::SetNextWindowPos({0, L.topH});
+    ImGui::SetNextWindowSize({L.railW, ds.y - L.topH - L.statusH});
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, kBgRail);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, s(8.f)});
     ImGui::Begin("##Rail", nullptr,
-        ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|
-        ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoCollapse|
-        ImGuiWindowFlags_NoBringToFrontOnFocus|ImGuiWindowFlags_NoScrollbar);
+        ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove|
+        ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoBringToFrontOnFocus|
+        ImGuiWindowFlags_NoScrollbar);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const float btnSz  = std::max(32.f, RW * 0.68f);
-    const float btnOff = (RW - btnSz) * 0.5f;
+    ImVec2 wp = ImGui::GetWindowPos();
+    // Right hairline
+    dl->AddLine({wp.x + L.railW - 0.5f, wp.y},
+                {wp.x + L.railW - 0.5f, wp.y + ImGui::GetWindowHeight()},
+                ImGui::ColorConvertFloat4ToU32(kBorder), 1.f);
 
-    // Logo mark
-    ImVec2 lp = ImGui::GetCursorScreenPos();
-    lp.x += btnOff; lp.y += 4.f;
-    dl->AddRectFilledMultiColor(lp, {lp.x+btnSz,lp.y+btnSz},
-        IM_COL32(29,209,161,255), IM_COL32(0,206,201,255),
-        IM_COL32(0,176,155,255),  IM_COL32(29,209,161,255));
-    dl->AddText(ImGui::GetFont(), btnSz*0.5f, {lp.x+btnSz*0.25f,lp.y+btnSz*0.22f},
-        IM_COL32(10,20,16,255), "V");
-    ImGui::Dummy({RW, btnSz + 10.f});
-    ImGui::Dummy({0, 8.f});
+    const float btnSz  = s(36.f);
+    const float btnOff = (L.railW - btnSz) * 0.5f;
 
-    // Rail icon buttons
-    struct RailItem { const char* icon; const char* tip; };
-    static const RailItem items[] = {
-        {"^","Simulation"}, {"#","Mesh Tools"},
-        {"@","Probe"},      {"=","Compare"}
+    struct Item { const char* glyph; const char* tip; };
+    static const Item items[] = {
+        {"S",  "Simulation"},
+        {"M",  "Mesh tools"},
+        {"P",  "Probes"},
+        {"C",  "Compare"},
+        {"L",  "Library"},
     };
-    for (int i = 0; i < 4; ++i) {
-        bool act = (railMode_ == i);
+
+    for (int i = 0; i < 5; ++i) {
         ImGui::SetCursorPosX(btnOff);
-
         ImVec2 btnP = ImGui::GetCursorScreenPos();
+        bool act = (railMode_ == i);
+
         if (act) {
-            dl->AddRectFilled(btnP, {btnP.x+btnSz,btnP.y+btnSz},
-                IM_COL32(11,72,54,255), 7.f);
-            dl->AddRect(btnP, {btnP.x+btnSz,btnP.y+btnSz},
-                IM_COL32(29,209,161,80), 7.f);
+            // Active accent bar on the left edge
+            dl->AddRectFilled({wp.x, btnP.y + s(6.f)},
+                              {wp.x + s(2.5f), btnP.y + btnSz - s(6.f)},
+                              ImGui::ColorConvertFloat4ToU32(kAccent), 1.f);
+            dl->AddRectFilled(btnP, {btnP.x + btnSz, btnP.y + btnSz},
+                              IM_COL32(11,72,54,255), s(7.f));
         }
+        char bid[8]; snprintf(bid, 8, "##r%d", i);
+        if (IconButton(bid, items[i].glyph, {btnSz, btnSz}, act, kAccent))
+            railMode_ = i;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", items[i].tip);
 
-        ImGui::PushStyleColor(ImGuiCol_Button,        {0,0,0,0});
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, {0.10f,0.10f,0.14f,1.f});
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  {0.05f,0.28f,0.20f,1.f});
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            act ? ImVec4{0.11f,0.82f,0.63f,1.f} : ImVec4{0.32f,0.32f,0.44f,1.f});
-        ImGui::SetWindowFontScale(1.25f);
-        char bid[12]; snprintf(bid,12,"##ri%d",i);
-        if (ImGui::Button(bid, {btnSz,btnSz})) railMode_ = i;
-        ImGui::SetWindowFontScale(1.f);
-        ImGui::PopStyleColor(4);
-
-        // Draw icon text centred
-        ImVec2 iconSz = ImGui::CalcTextSize(items[i].icon);
-        dl->AddText(ImGui::GetFont(), btnSz*0.44f,
-            {btnP.x + (btnSz-iconSz.x)*0.5f, btnP.y + (btnSz-iconSz.y)*0.5f},
-            act ? IM_COL32(29,209,161,255) : IM_COL32(82,82,110,255),
-            items[i].icon);
-
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", items[i].tip);
-        ImGui::Dummy({0,4});
+        ImGui::Dummy({0, s(4.f)});
     }
 
-    // Bottom: settings
-    float settY = H - btnSz - 12.f;
-    ImGui::SetCursorPosY(settY);
+    // Bottom: collapse + settings
+    float btmY = ImGui::GetWindowHeight() - btnSz*2.f - s(12.f);
+    ImGui::SetCursorPosY(btmY);
     ImGui::SetCursorPosX(btnOff);
-    ImGui::PushStyleColor(ImGuiCol_Button,        {0,0,0,0});
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, {0.10f,0.10f,0.14f,1.f});
-    ImGui::PushStyleColor(ImGuiCol_Text,          {0.28f,0.28f,0.38f,1.f});
-    if (ImGui::Button("##sett",{btnSz,btnSz})){}
-    ImGui::PopStyleColor(3);
-    ImVec2 gp = ImGui::GetItemRectMin();
-    dl->AddText(ImGui::GetFont(), btnSz*0.44f, {gp.x+btnSz*0.27f,gp.y+btnSz*0.27f},
-        IM_COL32(70,70,95,255), "*");
+    if (IconButton("##coll", leftPanelOpen_ ? "<" : ">", {btnSz, btnSz}, false, kTextDim))
+        leftPanelOpen_ = !leftPanelOpen_;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(leftPanelOpen_ ? "Collapse left panel" : "Expand left panel");
+
+    ImGui::Dummy({0, s(4.f)});
+    ImGui::SetCursorPosX(btnOff);
+    bool settingsAct = (railMode_ == 5);
+    if (IconButton("##set", "*", {btnSz, btnSz}, settingsAct, kTextDim))
+        railMode_ = 5;
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Settings");
 
     ImGui::End();
@@ -980,290 +1291,299 @@ void VulkanEngine::drawUI_Rail() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// UI — Left panel  (scene setup)
+// UI — Left panel content helpers (per-mode bodies)
+// ════════════════════════════════════════════════════════════════════════════
+
+static void drawPlaceholder(const char* title, const char* body) {
+    ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
+    ImGui::TextUnformatted(title);
+    ImGui::PopStyleColor();
+    ImGui::Dummy({0, 6});
+    ImGui::PushStyleColor(ImGuiCol_Text, kTextMuted);
+    ImGui::TextWrapped("%s", body);
+    ImGui::PopStyleColor();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// UI — Left panel  (mode-aware: simulation, mesh, probes, compare, settings)
 // ════════════════════════════════════════════════════════════════════════════
 
 void VulkanEngine::drawUI_Left() {
     const ImVec2 ds = ImGui::GetIO().DisplaySize;
-    const float RW = std::max(48.f, ds.x * 0.030f);
-    const float SW = std::max(220.f, ds.x * 0.175f);  // ~17.5% of width
-    const float H  = ds.y - 26.f;
-    ImGui::SetNextWindowPos({RW, 0});
-    ImGui::SetNextWindowSize({SW, H});
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {12,12});
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, {0.043f,0.043f,0.059f,1.f});
-    ImGui::Begin("##Left", nullptr,
-        ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|
-        ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoCollapse|
-        ImGuiWindowFlags_NoBringToFrontOnFocus);
+    const Layout L  = computeLayout(ds, dpiScale_, leftPanelOpen_, rightPanelOpen_);
+    if (L.leftW <= 0.f) return;
 
-    // Panel title — driven by which rail button is active
-    static const char* kPanelTitle[] = {"Simulation",  "Mesh Tools", "Probe",       "Compare"};
-    static const char* kPanelSub[]   = {"D3Q19 Lattice Boltzmann", "Geometry tools", "Flow probes", "Run comparison"};
-    ImGui::PushStyleColor(ImGuiCol_Text, {0.86f,0.86f,0.94f,1.f});
-    ImGui::SetWindowFontScale(1.08f);
-    ImGui::TextUnformatted(kPanelTitle[railMode_]);
+    ImGui::SetNextWindowPos({L.railW, L.topH});
+    ImGui::SetNextWindowSize({L.leftW, ds.y - L.topH - L.statusH});
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {s(14.f), s(14.f)});
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, kBgPanel);
+    ImGui::Begin("##Left", nullptr,
+        ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove|
+        ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 wp = ImGui::GetWindowPos();
+    dl->AddLine({wp.x + L.leftW - 0.5f, wp.y},
+                {wp.x + L.leftW - 0.5f, wp.y + ImGui::GetWindowHeight()},
+                ImGui::ColorConvertFloat4ToU32(kBorder), 1.f);
+
+    // ── Panel header (title + subtitle) ─────────────────────────────────
+    static const char* kTitle[] = {"Simulation", "Mesh tools", "Probes", "Compare", "Library", "Settings"};
+    static const char* kSub[]   = {"D3Q19 Lattice Boltzmann", "Geometry & repair",
+                                   "Flow probes & time series", "Compare runs",
+                                   "Saved cases", "Preferences"};
+
+    ImGui::PushStyleColor(ImGuiCol_Text, kText);
+    ImGui::SetWindowFontScale(1.10f);
+    ImGui::TextUnformatted(kTitle[std::clamp(railMode_, 0, 5)]);
     ImGui::SetWindowFontScale(1.f);
     ImGui::PopStyleColor();
-    ImGui::PushStyleColor(ImGuiCol_Text, {0.11f,0.82f,0.63f,1.f});
-    ImGui::TextUnformatted(kPanelSub[railMode_]);
+    ImGui::PushStyleColor(ImGuiCol_Text, kAccent);
+    ImGui::TextUnformatted(kSub[std::clamp(railMode_, 0, 5)]);
     ImGui::PopStyleColor();
-    ImGui::Dummy({0,6});
+    ImGui::Dummy({0, s(8.f)});
     UISep();
-    ImGui::Dummy({0,8});
+    ImGui::Dummy({0, s(6.f)});
 
-    // Modes 1-3 are not yet implemented — show a placeholder and return early
-    if (railMode_ != 0) {
-        ImGui::PushStyleColor(ImGuiCol_Text, {0.32f,0.32f,0.44f,1.f});
-        ImGui::TextUnformatted("Coming soon");
+    // ── Mode bodies ─────────────────────────────────────────────────────
+    if (railMode_ == 1) {
+        drawPlaceholder("Mesh repair, decimation, refinement",
+            "Tools for simplifying, repairing and refining loaded meshes will live here. "
+            "For now, drop a model to load it directly into the simulation.");
+    } else if (railMode_ == 2) {
+        drawPlaceholder("Probe placement",
+            "Place pressure / velocity probes at world positions to record live time-series data.");
+    } else if (railMode_ == 3) {
+        drawPlaceholder("Run comparison",
+            "Compare convergence and aerodynamic coefficients across runs.");
+    } else if (railMode_ == 4) {
+        drawPlaceholder("Library",
+            "Sample cases and saved configurations.");
+    } else if (railMode_ == 5) {
+        // Settings
+        ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
+        ImGui::TextUnformatted("Layout");
         ImGui::PopStyleColor();
-        ImGui::End();
+        ImGui::Checkbox("Show right panel", &rightPanelOpen_);
+        ImGui::Checkbox("Show keyboard shortcuts overlay", &showHotkeys_);
+        ImGui::Dummy({0, s(8.f)});
+
+        ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
+        ImGui::TextUnformatted("Visible result cards");
         ImGui::PopStyleColor();
-        ImGui::PopStyleVar();
-        return;
-    }
-
-    // ── GEOMETRY CARD ──────────────────────────────────────────────────────
-    if (BeginCard("##cGeom", 0.f)) {
-        CardAccent({0.11f,0.82f,0.63f,1.f});
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX()+6);
-        CardHeader("Geometry", meshLoaded_ ? "LOADED" : nullptr);
-        ImGui::Dummy({0,6});
-
-        if (meshLoaded_) {
-            // Mesh info row
-            std::string fn = meshPath_;
-            auto p = fn.find_last_of("/\\"); if (p!=std::string::npos) fn=fn.substr(p+1);
-            ImGui::PushStyleColor(ImGuiCol_Text,{0.86f,0.86f,0.94f,1.f});
-            ImGui::TextUnformatted(fn.c_str());
-            ImGui::PopStyleColor();
-            ImGui::PushStyleColor(ImGuiCol_Text,{0.38f,0.38f,0.50f,1.f});
-            ImGui::Text("%u\xC3\x97%u\xC3\x97%u cells",
-                simParams_.gridX, simParams_.gridY, simParams_.gridZ);
-            ImGui::PopStyleColor();
-            ImGui::Dummy({0,4});
-            float bw = (ImGui::GetContentRegionAvail().x - 4)*0.5f;
-            if (ImGui::Button("  Browse##bm",{bw,24})) {
-#ifdef _WIN32
-                auto path = openFileDialog();
-                if (!path.empty()) { snprintf(meshPath_,512,"%s",path.c_str()); loadMesh(meshPath_); }
-#endif
-            }
-            ImGui::SameLine(0,4);
-            ImGui::PushStyleColor(ImGuiCol_Button,        {0.18f,0.04f,0.04f,1.f});
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, {0.28f,0.06f,0.06f,1.f});
-            if (ImGui::Button("Clear##clr",{-1,24})) {
-                std::vector<uint32_t> empty(size_t(simParams_.gridX)*simParams_.gridY*simParams_.gridZ,0);
-                fluidSolver_.uploadObstacleMap(empty);
-                fluidSolver_.resetToEquilibrium();
-                meshLoaded_=false; memset(meshPath_,0,512);
-            }
-            ImGui::PopStyleColor(2);
-        } else {
-            // Drop zone
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, {0.055f,0.055f,0.075f,1.f});
-            ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 5.f);
-            ImGui::BeginChild("##dz",{-1,40},true,ImGuiWindowFlags_NoScrollbar);
-            ImGui::SetCursorPos({14,11});
-            ImGui::PushStyleColor(ImGuiCol_Text,{0.22f,0.22f,0.30f,1.f});
-            ImGui::TextUnformatted("Drop  .stl  .obj  .fbx  here");
-            ImGui::PopStyleColor();
-            ImGui::EndChild();
-            ImGui::PopStyleColor(); ImGui::PopStyleVar();
-            ImGui::Dummy({0,4});
-            if (ImGui::Button("  Browse Model...", {-1,26})) {
-#ifdef _WIN32
-                auto path = openFileDialog();
-                if (!path.empty()) { snprintf(meshPath_,512,"%s",path.c_str()); loadMesh(meshPath_); }
-#endif
-            }
-        }
-
-        ImGui::Dummy({0,8});
-        uint32_t cx=std::max(16u,uint32_t(baseGridX_*gridQuality_));
-        uint32_t cy=std::max(16u,uint32_t(baseGridY_*gridQuality_));
-        uint32_t cz=std::max(16u,uint32_t(baseGridZ_*gridQuality_));
-        char gfmt[24]; snprintf(gfmt,24,"%.1f\xC3\x97",gridQuality_);
-        SliderPill("##gq","Voxel resolution",&gridQuality_,0.5f,2.f,gfmt);
-        ImGui::PushStyleColor(ImGuiCol_Text,{0.28f,0.28f,0.38f,1.f});
-        ImGui::Text("  %u\xC3\x97%u\xC3\x97%u  \xE2\x80\x94  %zuM cells",
-            cx,cy,cz, size_t(cx)*cy*cz/1000000+1);
-        ImGui::PopStyleColor();
-        ImGui::Dummy({0,4});
-        if (ImGui::Button("Apply Resolution",{-1,24})) resizePending_=true;
-        ImGui::Dummy({0,6});
-    }
-    EndCard();
-    ImGui::Dummy({0,8});
-
-    // ── FLOW CONDITIONS CARD ───────────────────────────────────────────────
-    if (BeginCard("##cFlow", 0.f)) {
-        CardAccent({0.44f,0.74f,1.f,1.f});
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX()+6);
-        CardHeader("Flow Conditions");
-        ImGui::Dummy({0,6});
-
-        // Unit toggle group
-        static const char* uNames[]={"m/s","km/h","mph","kn"};
-        static const float uScale[]={594.45f,2140.f,1329.f,1155.f};
-        float tabW = (ImGui::GetContentRegionAvail().x - 6.f) / 4.f;
-        for (int i=0;i<4;++i) {
-            if (ToggleBtn(uNames[i],velocityUnit_==i,{tabW,22})) velocityUnit_=i;
-            if (i<3) ImGui::SameLine(0,2);
-        }
-        ImGui::Dummy({0,4});
-
-        // Speed mode toggle
-        float hw = (ImGui::GetContentRegionAvail().x-4)*0.5f;
-        if (ToggleBtn("Subsonic",  speedMode_==0,{hw,22})) speedMode_=0;
-        ImGui::SameLine(0,4);
-        if (ToggleBtn("Supersonic",speedMode_==1,{hw,22})) speedMode_=1;
-        ImGui::Dummy({0,4});
-
-        float sc = uScale[velocityUnit_];
-        float mX = speedMode_?-1.2f:0.f, MX=speedMode_?1.2f:0.2f;
-
-        auto flowRow=[&](const char* lbl, float* v, float lo, float hi){
-            float d = *v*sc;
-            char fmt[20]; snprintf(fmt,20,"%.1f %s",d,uNames[velocityUnit_]);
-            SliderPill(("##fs"+std::string(lbl)).c_str(), lbl, &d, lo*sc, hi*sc, fmt);
-            *v = d/sc;
-        };
-        flowRow("X-Flow",  &simParams_.inletVelX, mX,    MX);
-        flowRow("Y-Flow",  &simParams_.inletVelY, -0.5f, 0.5f);
-        flowRow("Z-Flow",  &simParams_.inletVelZ, -0.5f, 0.5f);
-        ImGui::Dummy({0,2});
-        SliderPill("##turb","Turbulence",&simParams_.turbulence,0.f,0.1f,"%.3f");
-
-        // Reynolds readout
-        float vPhys = simParams_.inletVelX * 594.45f;
-        float Re    = std::abs(vPhys)*0.3f/1.5e-5f;
-        ImGui::Dummy({0,4});
-        StatRow("Reynolds number",  "%.2e", Re);
-        ImGui::Dummy({0,6});
-    }
-    EndCard();
-    ImGui::Dummy({0,8});
-
-    // ── ENVIRONMENT CARD (card grid, not dropdown) ─────────────────────────
-    if (BeginCard("##cEnv",0.f)) {
-        CardAccent({0.68f,0.55f,1.f,1.f});
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX()+6);
-        CardHeader("Environment");
-        ImGui::Dummy({0,6});
-
-        auto& profs = EnvironmentRegistry::getProfiles();
-        int nP = int(profs.size());
-        static const char* envIcons[] = {"@","~","V","T","W"};
-        float cellW = (ImGui::GetContentRegionAvail().x - float(std::min(nP,3)-1)*4.f)
-                      / float(std::min(nP,3));
-
-        for (int i=0;i<nP;++i) {
-            bool act = (int(simParams_.currentEnvironmentIndex)==i);
-
-            ImGui::PushStyleColor(ImGuiCol_ChildBg,
-                act ? ImVec4{0.04f,0.22f,0.16f,1.f} : ImVec4{0.055f,0.055f,0.075f,1.f});
-            ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding,   6.f);
-            ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, act?1.f:0.5f);
-            ImGui::PushStyleColor(ImGuiCol_Border,
-                act ? ImVec4{0.11f,0.82f,0.63f,0.6f} : ImVec4{0.14f,0.14f,0.20f,1.f});
-
-            char cid[16]; snprintf(cid,16,"##ec%d",i);
-            if (ImGui::BeginChild(cid,{cellW,48},true,
-                    ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_NoScrollWithMouse)) {
-                if (ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
-                    ImGui::IsMouseClicked(0)) {
-                    simParams_.currentEnvironmentIndex = uint32_t(i);
-                    auto& p = profs[i];
-                    float dt=SimulationScaler::suggestLatticeDt(p.getKinematicViscosity(),0.01f,0.6f);
-                    simParams_.tau=SimulationScaler::calculateTau(p.getKinematicViscosity(),0.01f,dt);
-                }
-                ImGui::SetCursorPos({4,4});
-                ImGui::PushStyleColor(ImGuiCol_Text,
-                    act ? ImVec4{0.11f,0.82f,0.63f,1.f} : ImVec4{0.50f,0.50f,0.64f,1.f});
-                ImGui::SetWindowFontScale(1.2f);
-                ImGui::TextUnformatted(i<5 ? envIcons[i] : "?");
-                ImGui::SetWindowFontScale(1.f);
-                ImGui::SetCursorPosX(4);
-                ImGui::PushStyleColor(ImGuiCol_Text,
-                    act ? ImVec4{0.78f,0.78f,0.88f,1.f} : ImVec4{0.38f,0.38f,0.50f,1.f});
-                ImGui::TextUnformatted(profs[i].name.c_str());
-                ImGui::PopStyleColor(2);
-            }
-            ImGui::EndChild();
-            ImGui::PopStyleColor(2); ImGui::PopStyleVar(2);
-            if (i<nP-1 && (i%3)!=2) ImGui::SameLine(0,4);
-        }
-        ImGui::Dummy({0,6});
-    }
-    EndCard();
-    ImGui::Dummy({0,8});
-
-    // ── SOLVER CARD ────────────────────────────────────────────────────────
-    if (BeginCard("##cSolv",0.f)) {
-        CardAccent({0.99f,0.72f,0.22f,1.f});
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX()+6);
-        const char* modeName = simParams_.lbmMode==0?"BGK":"MRT";
-        CardHeader("Solver", modeName,
-            {0.99f,0.72f,0.22f,1.f},{0.18f,0.12f,0.02f,1.f});
-        ImGui::Dummy({0,6});
-
-        float hw = (ImGui::GetContentRegionAvail().x-4)*0.5f;
-        if (ToggleBtn("BGK",  simParams_.lbmMode==0,{hw,22})) simParams_.lbmMode=0;
-        ImGui::SameLine(0,4);
-        if (ToggleBtn("MRT",  simParams_.lbmMode==1,{hw,22})) simParams_.lbmMode=1;
-        ImGui::Dummy({0,4});
-
-        SliderPill("##tau","Relaxation \xCF\x84",&simParams_.tau,0.501f,2.f,"%.4f");
-        if (simParams_.lbmMode==1) {
-            SliderPill("##sb","s_bulk",&simParams_.s_bulk,0.5f,2.f,"%.2f");
-            SliderPill("##sg","s_ghost",&simParams_.s_ghost,0.5f,2.f,"%.2f");
-        }
-        ImGui::Dummy({0,2});
-        ImGui::PushStyleColor(ImGuiCol_Text,{0.40f,0.40f,0.52f,1.f});
-        ImGui::TextUnformatted("Steps / frame");
-        ImGui::PopStyleColor();
-        float spfW = ImGui::GetContentRegionAvail().x - 44.f;
-        ImGui::SetNextItemWidth(spfW);
-        ImGui::SliderInt("##spfI",&stepsPerFrame_,1,64);
-        ImGui::SameLine(0,6);
-        ImGui::PushStyleColor(ImGuiCol_Text,{0.78f,0.78f,0.88f,1.f});
-        ImGui::Text("%d",stepsPerFrame_);
-        ImGui::PopStyleColor();
-
-        ImGui::Dummy({0,4});
-        ImGui::PushStyleColor(ImGuiCol_Text,{0.24f,0.24f,0.32f,1.f});
-        ImGui::TextUnformatted("Space \xE2\x80\xA2 R reset \xE2\x80\xA2 1\xE2\x80\x93" "4 modes \xE2\x80\xA2 +/\xE2\x88\x92 steps");
-        ImGui::PopStyleColor();
-        ImGui::Dummy({0,6});
-    }
-    EndCard();
-    ImGui::Dummy({0,8});
-
-    // Footer: Run / Reset
-    float remH = H - ImGui::GetCursorPosY() - 12.f;
-    if (remH > 60.f) ImGui::SetCursorPosY(H - 60.f);
-    UISep(); ImGui::Dummy({0,6});
-    float bw = (ImGui::GetContentRegionAvail().x-4)*0.5f;
-
-    if (simRunning_) {
-        ImGui::PushStyleColor(ImGuiCol_Button,        {0.04f,0.24f,0.17f,1.f});
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, {0.06f,0.36f,0.26f,1.f});
-        ImGui::PushStyleColor(ImGuiCol_Text,          {0.11f,0.92f,0.70f,1.f});
-        if (ImGui::Button("\xE2\x96\xA0  Pause",{bw,32})) simRunning_=false;
-        ImGui::PopStyleColor(3);
+        ImGui::Checkbox("Aerodynamics", &showAeroCard_);
+        ImGui::Checkbox("Convergence", &showConvCard_);
+        ImGui::Checkbox("Flow statistics", &showFlowCard_);
+        ImGui::Checkbox("GPU performance", &showGpuCard_);
     } else {
-        ImGui::PushStyleColor(ImGuiCol_Button,        {0.06f,0.38f,0.27f,1.f});
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, {0.09f,0.55f,0.40f,1.f});
-        ImGui::PushStyleColor(ImGuiCol_Text,          {0.86f,0.98f,0.92f,1.f});
-        if (ImGui::Button("\xE2\x96\xB6  Run", {bw,32})) simRunning_=true;
-        ImGui::PopStyleColor(3);
-    }
-    ImGui::SameLine(0,4);
-    if (ImGui::Button("Reset",{-1,32})) {
-        fluidSolver_.resetToEquilibrium();
-        totalSteps_=0; simResidual_=1.f; simRunning_=false;
-        aeroCDPrev_=0; aeroCLPrev_=0;
+        // ─── Mode 0: Simulation (default) ────────────────────────────────
+        // Geometry
+        if (BeginCard("##cGeom", 0.f)) {
+            CardAccent(kAccent);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + s(6.f));
+            CardHeader("Geometry", meshLoaded_ ? "LOADED" : nullptr);
+            ImGui::Dummy({0, s(6.f)});
+
+            if (meshLoaded_) {
+                std::string fn = meshPath_;
+                auto p = fn.find_last_of("/\\");
+                if (p != std::string::npos) fn = fn.substr(p + 1);
+                ImGui::PushStyleColor(ImGuiCol_Text, kText);
+                ImGui::TextUnformatted(fn.c_str());
+                ImGui::PopStyleColor();
+                ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
+                ImGui::Text("%u\xC3\x97%u\xC3\x97%u cells",
+                            simParams_.gridX, simParams_.gridY, simParams_.gridZ);
+                ImGui::PopStyleColor();
+                ImGui::Dummy({0, s(4.f)});
+
+                float bw = (ImGui::GetContentRegionAvail().x - s(4.f)) * 0.5f;
+                if (ImGui::Button("Browse##bm", {bw, s(24.f)})) {
+#ifdef _WIN32
+                    auto path = openFileDialog();
+                    if (!path.empty()) { snprintf(meshPath_,512,"%s",path.c_str()); loadMesh(meshPath_); }
+#endif
+                }
+                ImGui::SameLine(0, s(4.f));
+                ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4{0.18f,0.04f,0.04f,1.f});
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4{0.28f,0.06f,0.06f,1.f});
+                if (ImGui::Button("Clear##clr", {-1, s(24.f)})) {
+                    std::vector<uint32_t> empty(size_t(simParams_.gridX) * simParams_.gridY * simParams_.gridZ, 0);
+                    fluidSolver_.uploadObstacleMap(empty);
+                    fluidSolver_.resetToEquilibrium();
+                    meshLoaded_ = false; memset(meshPath_, 0, 512);
+                }
+                ImGui::PopStyleColor(2);
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, kBgInput);
+                ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 5.f);
+                ImGui::BeginChild("##dz", {-1, s(48.f)}, true, ImGuiWindowFlags_NoScrollbar);
+                ImGui::SetCursorPos({s(14.f), s(14.f)});
+                ImGui::PushStyleColor(ImGuiCol_Text, kTextMuted);
+                ImGui::TextUnformatted("Drop  .stl  .obj  .fbx  here");
+                ImGui::PopStyleColor();
+                ImGui::EndChild();
+                ImGui::PopStyleColor(); ImGui::PopStyleVar();
+
+                ImGui::Dummy({0, s(4.f)});
+                if (ImGui::Button("Browse Model...", {-1, s(28.f)})) {
+#ifdef _WIN32
+                    auto path = openFileDialog();
+                    if (!path.empty()) { snprintf(meshPath_,512,"%s",path.c_str()); loadMesh(meshPath_); }
+#endif
+                }
+            }
+
+            ImGui::Dummy({0, s(8.f)});
+            uint32_t cx = std::max(16u, uint32_t(baseGridX_ * gridQuality_));
+            uint32_t cy = std::max(16u, uint32_t(baseGridY_ * gridQuality_));
+            uint32_t cz = std::max(16u, uint32_t(baseGridZ_ * gridQuality_));
+            char gfmt[24]; snprintf(gfmt, 24, "%.1f\xC3\x97", gridQuality_);
+            SliderPill("##gq", "Voxel resolution", &gridQuality_, 0.5f, 2.f, gfmt);
+            ImGui::PushStyleColor(ImGuiCol_Text, kTextMuted);
+            ImGui::Text("  %u\xC3\x97%u\xC3\x97%u  ~ %zuM cells",
+                        cx, cy, cz, size_t(cx) * cy * cz / 1000000 + 1);
+            ImGui::PopStyleColor();
+            ImGui::Dummy({0, s(4.f)});
+            if (ImGui::Button("Apply Resolution", {-1, s(24.f)})) resizePending_ = true;
+            ImGui::Dummy({0, s(6.f)});
+        }
+        EndCard();
+        ImGui::Dummy({0, s(8.f)});
+
+        // Flow conditions
+        if (BeginCard("##cFlow", 0.f)) {
+            CardAccent(kBlue);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + s(6.f));
+            CardHeader("Flow Conditions");
+            ImGui::Dummy({0, s(6.f)});
+
+            static const char* uNames[] = {"m/s", "km/h", "mph", "kn"};
+            static const float uScale[] = {594.45f, 2140.f, 1329.f, 1155.f};
+            float tabW = (ImGui::GetContentRegionAvail().x - s(6.f)) / 4.f;
+            for (int i = 0; i < 4; ++i) {
+                if (ToggleBtn(uNames[i], velocityUnit_ == i, {tabW, s(22.f)}))
+                    velocityUnit_ = i;
+                if (i < 3) ImGui::SameLine(0, 2);
+            }
+            ImGui::Dummy({0, s(4.f)});
+
+            float hw = (ImGui::GetContentRegionAvail().x - s(4.f)) * 0.5f;
+            if (ToggleBtn("Subsonic",  speedMode_ == 0, {hw, s(22.f)})) speedMode_ = 0;
+            ImGui::SameLine(0, s(4.f));
+            if (ToggleBtn("Supersonic",speedMode_ == 1, {hw, s(22.f)})) speedMode_ = 1;
+            ImGui::Dummy({0, s(4.f)});
+
+            float sc = uScale[velocityUnit_];
+            float mX = speedMode_ ? -1.2f : 0.f, MX = speedMode_ ? 1.2f : 0.2f;
+
+            auto flowRow = [&](const char* lbl, float* v, float lo, float hi) {
+                float d = *v * sc;
+                char fmt[20]; snprintf(fmt, 20, "%.1f %s", d, uNames[velocityUnit_]);
+                SliderPill(("##fs" + std::string(lbl)).c_str(), lbl, &d, lo*sc, hi*sc, fmt);
+                *v = d / sc;
+            };
+            flowRow("X-Flow", &simParams_.inletVelX, mX, MX);
+            flowRow("Y-Flow", &simParams_.inletVelY, -0.5f, 0.5f);
+            flowRow("Z-Flow", &simParams_.inletVelZ, -0.5f, 0.5f);
+            ImGui::Dummy({0, s(2.f)});
+            SliderPill("##turb", "Turbulence", &simParams_.turbulence, 0.f, 0.1f, "%.3f");
+
+            float vPhys = simParams_.inletVelX * 594.45f;
+            float Re    = std::abs(vPhys) * 0.3f / 1.5e-5f;
+            ImGui::Dummy({0, s(4.f)});
+            StatRow("Reynolds number", "%.2e", Re);
+            ImGui::Dummy({0, s(6.f)});
+        }
+        EndCard();
+        ImGui::Dummy({0, s(8.f)});
+
+        // Environment
+        if (BeginCard("##cEnv", 0.f)) {
+            CardAccent(kPurple);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + s(6.f));
+            CardHeader("Environment");
+            ImGui::Dummy({0, s(6.f)});
+
+            auto& profs = EnvironmentRegistry::getProfiles();
+            int nP = int(profs.size());
+            int cols = std::min(nP, std::max(2, int(L.leftW / s(96.f))));
+            float cellW = (ImGui::GetContentRegionAvail().x - float(cols - 1) * s(4.f)) / float(cols);
+            static const char* envIcons[] = {"@","~","V","T","W"};
+
+            for (int i = 0; i < nP; ++i) {
+                bool act = (int(simParams_.currentEnvironmentIndex) == i);
+                ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                    act ? ImVec4{0.04f,0.22f,0.16f,1.f} : kBgInput);
+                ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.f);
+                ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, act ? 1.f : 0.5f);
+                ImGui::PushStyleColor(ImGuiCol_Border,
+                    act ? ImVec4{0.11f,0.82f,0.63f,0.6f} : kBorder);
+
+                char cid[16]; snprintf(cid, 16, "##ec%d", i);
+                if (ImGui::BeginChild(cid, {cellW, s(50.f)}, true,
+                        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+                    if (ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
+                        ImGui::IsMouseClicked(0)) {
+                        simParams_.currentEnvironmentIndex = uint32_t(i);
+                        auto& p = profs[i];
+                        float dt = SimulationScaler::suggestLatticeDt(p.getKinematicViscosity(), 0.01f, 0.6f);
+                        simParams_.tau = SimulationScaler::calculateTau(p.getKinematicViscosity(), 0.01f, dt);
+                    }
+                    ImGui::SetCursorPos({s(6.f), s(4.f)});
+                    ImGui::PushStyleColor(ImGuiCol_Text, act ? kAccent : kTextDim);
+                    ImGui::SetWindowFontScale(1.2f);
+                    ImGui::TextUnformatted(i < 5 ? envIcons[i] : "?");
+                    ImGui::SetWindowFontScale(1.f);
+                    ImGui::SetCursorPosX(s(6.f));
+                    ImGui::PushStyleColor(ImGuiCol_Text, act ? kText : kTextDim);
+                    ImGui::TextUnformatted(profs[i].name.c_str());
+                    ImGui::PopStyleColor(2);
+                }
+                ImGui::EndChild();
+                ImGui::PopStyleColor(2); ImGui::PopStyleVar(2);
+                if ((i % cols) != cols - 1 && i < nP - 1) ImGui::SameLine(0, s(4.f));
+            }
+            ImGui::Dummy({0, s(6.f)});
+        }
+        EndCard();
+        ImGui::Dummy({0, s(8.f)});
+
+        // Solver
+        if (BeginCard("##cSolv", 0.f)) {
+            CardAccent(kAmber);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + s(6.f));
+            const char* modeName = simParams_.lbmMode == 0 ? "BGK" : "MRT";
+            CardHeader("Solver", modeName,
+                       kAmber, ImVec4{0.18f,0.12f,0.02f,1.f});
+            ImGui::Dummy({0, s(6.f)});
+
+            float hw = (ImGui::GetContentRegionAvail().x - s(4.f)) * 0.5f;
+            if (ToggleBtn("BGK", simParams_.lbmMode == 0, {hw, s(22.f)})) simParams_.lbmMode = 0;
+            ImGui::SameLine(0, s(4.f));
+            if (ToggleBtn("MRT", simParams_.lbmMode == 1, {hw, s(22.f)})) simParams_.lbmMode = 1;
+            ImGui::Dummy({0, s(4.f)});
+
+            SliderPill("##tau", "Relaxation \xCF\x84", &simParams_.tau, 0.501f, 2.f, "%.4f");
+            if (simParams_.lbmMode == 1) {
+                SliderPill("##sb", "s_bulk",  &simParams_.s_bulk,  0.5f, 2.f, "%.2f");
+                SliderPill("##sg", "s_ghost", &simParams_.s_ghost, 0.5f, 2.f, "%.2f");
+            }
+            ImGui::Dummy({0, s(2.f)});
+            ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
+            ImGui::TextUnformatted("Steps / frame");
+            ImGui::PopStyleColor();
+            float spfW = ImGui::GetContentRegionAvail().x - s(44.f);
+            ImGui::SetNextItemWidth(spfW);
+            ImGui::SliderInt("##spfI", &stepsPerFrame_, 1, 64);
+            ImGui::SameLine(0, s(6.f));
+            ImGui::PushStyleColor(ImGuiCol_Text, kText);
+            ImGui::Text("%d", stepsPerFrame_);
+            ImGui::PopStyleColor();
+            ImGui::Dummy({0, s(6.f)});
+        }
+        EndCard();
+        ImGui::Dummy({0, s(8.f)});
     }
 
     ImGui::End();
@@ -1272,292 +1592,326 @@ void VulkanEngine::drawUI_Left() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// UI — Viewport colorbar  (drawn directly into scene drawlist)
+// UI — Welcome overlay (shown in viewport when no mesh loaded)
 // ════════════════════════════════════════════════════════════════════════════
 
-void VulkanEngine::drawViewportColorbar(ImDrawList* dl, ImVec2 vpMin, ImVec2 /*vpMax*/) {
-    // Inferno stops (match velocity_slice.comp)
+void VulkanEngine::drawWelcomeOverlay(ImVec2 vpPos, ImVec2 vpSize) {
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+
+    float boxW = std::min(s(440.f), vpSize.x - s(40.f));
+    float boxH = s(220.f);
+    ImVec2 ba = {vpPos.x + (vpSize.x - boxW) * 0.5f,
+                 vpPos.y + (vpSize.y - boxH) * 0.5f};
+    ImVec2 bb = {ba.x + boxW, ba.y + boxH};
+
+    // Card background with subtle gradient
+    dl->AddRectFilledMultiColor(ba, bb,
+        IM_COL32(20,22,28,210), IM_COL32(26,32,40,210),
+        IM_COL32(20,22,28,210), IM_COL32(15,17,22,210));
+    dl->AddRect(ba, bb, IM_COL32(40,55,50,160), s(8.f), 0, 1.f);
+
+    // Logo
+    ImVec2 lp = {ba.x + (boxW - s(48.f)) * 0.5f, ba.y + s(24.f)};
+    dl->AddRectFilledMultiColor(lp, {lp.x + s(48.f), lp.y + s(48.f)},
+        IM_COL32(29,209,161,255), IM_COL32(0,206,201,255),
+        IM_COL32(0,176,155,255),  IM_COL32(29,209,161,255));
+    dl->AddText(ImGui::GetFont(), s(24.f),
+        {lp.x + s(14.f), lp.y + s(10.f)}, IM_COL32(10,20,16,255), "L");
+
+    // Title
+    const char* title = "LBM-CFD Solver";
+    ImVec2 ts = ImGui::CalcTextSize(title);
+    dl->AddText(ImGui::GetFont(), s(18.f),
+        {ba.x + (boxW - ts.x * (s(18.f) / ImGui::GetFontSize())) * 0.5f,
+         lp.y + s(56.f)},
+        ImGui::ColorConvertFloat4ToU32(kText), title);
+
+    // Subtitle
+    const char* sub = "Drop a 3D model anywhere to begin a simulation,";
+    const char* sub2 = "or click \"Open\" in the toolbar above.";
+    ImVec2 ss  = ImGui::CalcTextSize(sub);
+    ImVec2 ss2 = ImGui::CalcTextSize(sub2);
+    dl->AddText(ImGui::GetFont(), 0.f,
+        {ba.x + (boxW - ss.x) * 0.5f,  lp.y + s(86.f)},
+        ImGui::ColorConvertFloat4ToU32(kTextDim), sub);
+    dl->AddText(ImGui::GetFont(), 0.f,
+        {ba.x + (boxW - ss2.x) * 0.5f, lp.y + s(102.f)},
+        ImGui::ColorConvertFloat4ToU32(kTextDim), sub2);
+
+    // Hint
+    const char* hint = "Supports .stl  .obj  .fbx  .glb  .gltf";
+    ImVec2 hs = ImGui::CalcTextSize(hint);
+    dl->AddText(ImGui::GetFont(), 0.f,
+        {ba.x + (boxW - hs.x) * 0.5f, bb.y - s(34.f)},
+        ImGui::ColorConvertFloat4ToU32(kTextMuted), hint);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// UI — Viewport colorbar (drawn into background drawlist)
+// ════════════════════════════════════════════════════════════════════════════
+
+void VulkanEngine::drawViewportColorbar(ImDrawList* dl, ImVec2 vpMin, ImVec2 vpMax) {
     static const ImVec4 kStops[] = {
         {0.00f,0.00f,0.01f,1.f},{0.24f,0.06f,0.44f,1.f},{0.58f,0.11f,0.48f,1.f},
         {0.85f,0.26f,0.31f,1.f},{0.99f,0.56f,0.08f,1.f},{0.99f,1.00f,0.64f,1.f},
     };
-    // Cool-warm stops (pressure)
     static const ImVec4 kCW[] = {
         {0.23f,0.30f,0.75f,1.f},{0.55f,0.58f,0.80f,1.f},{0.86f,0.86f,0.86f,1.f},
         {0.80f,0.46f,0.32f,1.f},{0.71f,0.02f,0.15f,1.f},
     };
-    // Viridis stops (vorticity)
     static const ImVec4 kVir[] = {
         {0.27f,0.00f,0.33f,1.f},{0.28f,0.34f,0.61f,1.f},{0.13f,0.57f,0.55f,1.f},
         {0.37f,0.79f,0.38f,1.f},{0.99f,0.91f,0.14f,1.f},
     };
 
-    struct ColorStop { const ImVec4* stops; int n; };
-    static const ColorStop maps[4] = {
-        {kStops,6},{kCW,5},{kVir,5},{kStops,6}
-    };
+    struct CS { const ImVec4* stops; int n; };
+    static const CS maps[4] = {{kStops,6}, {kCW,5}, {kVir,5}, {kStops,6}};
 
     int mode = int(simParams_.visMode);
     const ImVec4* stops = maps[mode].stops;
     int N = maps[mode].n;
 
-    const float cbH = 140.f;
-    const float cbW = 10.f;
-    const float marginR = 14.f;
-    const float marginT = 60.f; // clear of tabs
+    const float cbH = s(160.f);
+    const float cbW = s(10.f);
+    const float marginR = s(16.f);
 
-    float x0 = vpMin.x + /* vpMax.x - vpMin.x */ 0.f; // filled below
-    // We draw on the background drawlist so it appears behind imgui widgets
-    // but we need screen coords from the parent viewport
-    float vpW = ImGui::GetIO().DisplaySize.x;
-    float vpL = std::max(48.f, vpW * 0.030f) + std::max(220.f, vpW * 0.175f);
-    float vpR = vpW - std::max(200.f, vpW * 0.165f);
-    x0 = vpR - marginR - cbW;
-    float y0 = vpMin.y + marginT;
+    float x0 = vpMax.x - marginR - cbW;
+    float y0 = vpMin.y + s(72.f);
 
-    for (int i=0;i<N-1;++i) {
-        float ya = y0 + cbH*(1.f - float(i+1)/(N-1));
-        float yb = y0 + cbH*(1.f - float(i  )/(N-1));
+    // Background & frame
+    dl->AddRectFilled({x0 - s(6.f), y0 - s(8.f)},
+                      {x0 + cbW + s(40.f), y0 + cbH + s(20.f)},
+                      IM_COL32(8, 10, 14, 180), s(4.f));
+
+    for (int i = 0; i < N - 1; ++i) {
+        float ya = y0 + cbH * (1.f - float(i + 1) / (N - 1));
+        float yb = y0 + cbH * (1.f - float(i)     / (N - 1));
         dl->AddRectFilledMultiColor(
-            {x0, ya},{x0+cbW, yb},
+            {x0, ya}, {x0 + cbW, yb},
             ImGui::ColorConvertFloat4ToU32(stops[i+1]),
             ImGui::ColorConvertFloat4ToU32(stops[i+1]),
             ImGui::ColorConvertFloat4ToU32(stops[i]),
             ImGui::ColorConvertFloat4ToU32(stops[i]));
     }
-    dl->AddRect({x0,y0},{x0+cbW,y0+cbH}, IM_COL32(40,40,56,200), 2.f);
+    dl->AddRect({x0, y0}, {x0 + cbW, y0 + cbH}, IM_COL32(40, 40, 56, 200), 2.f);
 
-    // Tick labels (5 ticks)
     float maxV = simParams_.maxVelocity * 594.45f;
-    for (int i=0;i<5;++i) {
-        float t   = float(i)/4.f;
-        float yt  = y0 + cbH*(1.f-t) - 5.f;
+    for (int i = 0; i < 5; ++i) {
+        float t   = float(i) / 4.f;
+        float yt  = y0 + cbH * (1.f - t) - s(5.f);
         float val = maxV * t;
-        char  buf[16]; snprintf(buf,sizeof(buf),"%.0f",val);
-        dl->AddText(ImGui::GetFont(), 10.f,
-            {x0+cbW+4, yt}, IM_COL32(120,120,148,200), buf);
+        char buf[16]; snprintf(buf, sizeof(buf), "%.0f", val);
+        dl->AddText(ImGui::GetFont(), s(10.5f),
+            {x0 + cbW + s(5.f), yt}, IM_COL32(140,140,164,220), buf);
     }
-    // Unit label
-    static const char* kUnits[] = {"m/s","Pa","1/s","Q"};
-    dl->AddText(ImGui::GetFont(), 9.5f,
-        {x0-1.f, y0-13.f}, IM_COL32(80,120,100,200), kUnits[mode]);
+    static const char* kUnits[] = {"m/s", "Pa", "1/s", "Q"};
+    dl->AddText(ImGui::GetFont(), s(10.f),
+        {x0 - s(2.f), y0 - s(14.f)}, IM_COL32(120,180,160,230), kUnits[mode]);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// UI — Viewport toolbar  (bottom strip with icons)
+// UI — Viewport toolbar (bottom strip)
 // ════════════════════════════════════════════════════════════════════════════
 
-void VulkanEngine::drawViewportToolbar(float vpX, float vpW,
+void VulkanEngine::drawViewportToolbar(float /*vpX*/, float vpW,
                                        float toolbarY, float toolbarH) {
     ImGui::SetCursorPos({0, toolbarY});
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, {0.031f,0.031f,0.043f,1.f});
-    ImGui::BeginChild("##vptb",{vpW,toolbarH},false,
-        ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4{0.022f,0.022f,0.030f,1.f});
+    ImGui::BeginChild("##vptb", {vpW, toolbarH}, false,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
-    ImGui::SetCursorPosY(6.f);
-    ImGui::SetCursorPosX(8.f);
+    ImGui::SetCursorPosY(s(7.f));
+    ImGui::SetCursorPosX(s(10.f));
 
     // Tool buttons: Orbit / Pan / Zoom
     struct Tool { const char* icon; const char* tip; };
-    static const Tool kTools[] = {{"O","Orbit [drag]"},{"P","Pan [shift+drag]"},{"Z","Zoom [scroll]"}};
-    for (int i=0;i<3;++i) {
-        bool act = (activeTool_==i);
-        if (act) {
-            ImGui::PushStyleColor(ImGuiCol_Button,   {0.05f,0.38f,0.28f,1.f});
-            ImGui::PushStyleColor(ImGuiCol_Text,     {0.11f,0.92f,0.70f,1.f});
-        } else {
-            ImGui::PushStyleColor(ImGuiCol_Button,   {0.07f,0.07f,0.10f,1.f});
-            ImGui::PushStyleColor(ImGuiCol_Text,     {0.34f,0.34f,0.46f,1.f});
-        }
-        char bid[8]; snprintf(bid,8,"%s##t%d",kTools[i].icon,i);
-        if (ImGui::Button(bid,{26,20})) activeTool_=i;
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s",kTools[i].tip);
-        ImGui::PopStyleColor(2);
-        ImGui::SameLine(0,2);
+    static const Tool kTools[] = {
+        {"O", "Orbit [drag]"}, {"P", "Pan [shift+drag]"}, {"Z", "Zoom [scroll]"}
+    };
+    for (int i = 0; i < 3; ++i) {
+        bool act = (activeTool_ == i);
+        char bid[12]; snprintf(bid, 12, "%s##t%d", kTools[i].icon, i);
+        if (ToggleBtn(bid, act, {s(28.f), s(20.f)})) activeTool_ = i;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kTools[i].tip);
+        ImGui::SameLine(0, s(2.f));
     }
 
-    // Divider
-    ImGui::SameLine(0,6);
-    ImGui::PushStyleColor(ImGuiCol_Text,{0.18f,0.18f,0.26f,1.f});
+    ImGui::SameLine(0, s(8.f));
+    ImGui::PushStyleColor(ImGuiCol_Text, kTextMuted);
     ImGui::TextUnformatted("|");
     ImGui::PopStyleColor();
-    ImGui::SameLine(0,6);
+    ImGui::SameLine(0, s(8.f));
 
-    // Slice controls
-    ImGui::PushStyleColor(ImGuiCol_Text,{0.32f,0.32f,0.44f,1.f});
-    ImGui::TextUnformatted("Slice:");
+    ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
+    ImGui::TextUnformatted("Slice");
     ImGui::PopStyleColor();
-    ImGui::SameLine(0,4);
-    static const char* axn[]={"XY","XZ","YZ"};
-    for (int i=0;i<3;++i) {
-        bool a=(int(simParams_.sliceAxis)==i);
-        char lbl[10]; snprintf(lbl,10,"%s##ax%d",axn[i],i);
-        if (ToggleBtn(lbl,a,{28,20})) simParams_.sliceAxis=uint32_t(i);
-        ImGui::SameLine(0,2);
+    ImGui::SameLine(0, s(4.f));
+    static const char* axn[] = {"XY", "XZ", "YZ"};
+    for (int i = 0; i < 3; ++i) {
+        bool a = (int(simParams_.sliceAxis) == i);
+        char lbl[10]; snprintf(lbl, 10, "%s##ax%d", axn[i], i);
+        if (ToggleBtn(lbl, a, {s(30.f), s(20.f)})) simParams_.sliceAxis = uint32_t(i);
+        ImGui::SameLine(0, s(2.f));
     }
 
-    ImGui::SameLine(0,6);
-    ImGui::PushStyleColor(ImGuiCol_Text,{0.32f,0.32f,0.44f,1.f});
+    ImGui::SameLine(0, s(8.f));
+    ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
     ImGui::TextUnformatted("Depth");
     ImGui::PopStyleColor();
-    ImGui::SameLine(0,4);
-    int si=int(simParams_.sliceIndex);
-    int mx=int(simParams_.sliceAxis==0?simParams_.gridZ:simParams_.sliceAxis==1?simParams_.gridY:simParams_.gridX)-1;
-    ImGui::SetNextItemWidth(72);
-    if (ImGui::SliderInt("##dep",&si,0,mx)) simParams_.sliceIndex=uint32_t(si);
+    ImGui::SameLine(0, s(4.f));
+    int si = int(simParams_.sliceIndex);
+    int mx = int(simParams_.sliceAxis == 0 ? simParams_.gridZ
+                : simParams_.sliceAxis == 1 ? simParams_.gridY : simParams_.gridX) - 1;
+    ImGui::SetNextItemWidth(s(80.f));
+    if (ImGui::SliderInt("##dep", &si, 0, mx)) simParams_.sliceIndex = uint32_t(si);
 
-    ImGui::SameLine(0,10);
-    ImGui::PushStyleColor(ImGuiCol_Text,{0.32f,0.32f,0.44f,1.f});
-    ImGui::TextUnformatted("Bright");
-    ImGui::PopStyleColor();
-    ImGui::SameLine(0,4);
-    ImGui::SetNextItemWidth(60);
-    ImGui::SliderFloat("##bri",&simParams_.maxVelocity,0.01f,1.f,"%.2f");
+    if (vpW > s(640.f)) {
+        ImGui::SameLine(0, s(10.f));
+        ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
+        ImGui::TextUnformatted("Bright");
+        ImGui::PopStyleColor();
+        ImGui::SameLine(0, s(4.f));
+        ImGui::SetNextItemWidth(s(64.f));
+        ImGui::SliderFloat("##bri", &simParams_.maxVelocity, 0.01f, 1.f, "%.2f");
+    }
 
-    // Snapshot button + zoom indicator pushed to right
-    ImGui::SameLine(0,10);
-    ImGui::PushStyleColor(ImGuiCol_Button,   {0.07f,0.07f,0.10f,1.f});
-    ImGui::PushStyleColor(ImGuiCol_Text,     {0.34f,0.34f,0.46f,1.f});
-    ImGui::Button("Snap##sn",{38,20});
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Save viewport snapshot");
-    ImGui::PopStyleColor(2);
-
-    char zb[12]; snprintf(zb,12,"%.1f\xC3\x97",zoomLevel_);
-    float zx = vpW - ImGui::CalcTextSize(zb).x - 10.f;
-    float cx2 = ImGui::GetCursorPosX();
-    if (zx > cx2) { ImGui::SameLine(); ImGui::SetCursorPosX(zx); }
-    ImGui::PushStyleColor(ImGuiCol_Text,{0.18f,0.18f,0.26f,1.f});
-    ImGui::TextUnformatted(zb);
-    ImGui::PopStyleColor();
+    // Zoom indicator pushed to right
+    char zb[12]; snprintf(zb, 12, "%.1f\xC3\x97", zoomLevel_);
+    float zx = vpW - ImGui::CalcTextSize(zb).x - s(12.f);
+    if (zx > ImGui::GetCursorPosX()) {
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(zx);
+        ImGui::PushStyleColor(ImGuiCol_Text, kTextMuted);
+        ImGui::TextUnformatted(zb);
+        ImGui::PopStyleColor();
+    }
 
     ImGui::EndChild();
     ImGui::PopStyleColor();
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// UI — Viewport
+// UI — Viewport (3D preview, mode tabs, gizmos, welcome state)
 // ════════════════════════════════════════════════════════════════════════════
 
 void VulkanEngine::drawUI_Viewport() {
     const ImVec2 ds = ImGui::GetIO().DisplaySize;
-    const float lw  = std::max(48.f, ds.x * 0.030f) + std::max(220.f, ds.x * 0.175f);
-    const float rw  = std::max(200.f, ds.x * 0.165f);
-    const float sh  = 26.f;
-    const float tbH = 34.f;
-    const float vw  = ds.x - lw - rw;
-    const float vh  = ds.y - sh;
+    const Layout L  = computeLayout(ds, dpiScale_, leftPanelOpen_, rightPanelOpen_);
 
-    ImGui::SetNextWindowPos({lw,0});
-    ImGui::SetNextWindowSize({vw,vh});
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,{0,0});
-    ImGui::PushStyleColor(ImGuiCol_WindowBg,{0.027f,0.027f,0.035f,1.f});
-    ImGui::Begin("##VP",nullptr,
-        ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|
-        ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoCollapse|
-        ImGuiWindowFlags_NoBringToFrontOnFocus|ImGuiWindowFlags_NoScrollbar);
+    const float tbH = s(34.f);
 
-    // ── Vis-mode tab bar (with keyboard hints inline) ──────────────────────
-    ImGui::Dummy({0,8}); ImGui::SetCursorPosX(12);
-    struct VTab { const char* label; const char* key; VisMode mode; };
-    static const VTab kTabs[] = {
-        {"Velocity","1",VisMode::Velocity},{"Pressure","2",VisMode::Pressure},
-        {"Vorticity","3",VisMode::Vorticity},{"Q-Crit","4",VisMode::QCriterion}
-    };
-    for (int i=0;i<4;++i) {
-        bool act = (simParams_.visMode==kTabs[i].mode);
-        // Build label: "Velocity  1"
-        char lbl[32]; snprintf(lbl,sizeof(lbl),"%s  %s##vt%d",
-            kTabs[i].label, kTabs[i].key, i);
-        if (act) {
-            ImGui::PushStyleColor(ImGuiCol_Button,        {0.04f,0.36f,0.26f,1.f});
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, {0.06f,0.50f,0.36f,1.f});
-            ImGui::PushStyleColor(ImGuiCol_Text,          {0.11f,0.92f,0.70f,1.f});
-        } else {
-            ImGui::PushStyleColor(ImGuiCol_Button,        {0.045f,0.045f,0.060f,1.f});
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, {0.08f,0.08f,0.11f,1.f});
-            ImGui::PushStyleColor(ImGuiCol_Text,          {0.32f,0.32f,0.44f,1.f});
-        }
-        if (ImGui::Button(lbl,{0,24})) simParams_.visMode=kTabs[i].mode;
-        ImGui::PopStyleColor(3);
-        if (i<3) ImGui::SameLine(0,3);
-    }
+    ImGui::SetNextWindowPos({L.vpX, L.vpY});
+    ImGui::SetNextWindowSize({L.vpW, L.vpH});
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, kBgRoot);
+    ImGui::Begin("##VP", nullptr,
+        ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove|
+        ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoBringToFrontOnFocus|
+        ImGuiWindowFlags_NoScrollbar);
 
-    // ── Live / FPS HUD pills (top-right, drawn via drawlist) ──────────────
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    float fps = avgFrameMs_>0 ? 1000.f/avgFrameMs_ : 0.f;
-    char fpsBuf[32]; snprintf(fpsBuf,32,"%.0f fps  \xE2\x80\xA2  %llu st/s",
-        fps, uint64_t(fps*stepsPerFrame_));
     ImVec2 winPos = ImGui::GetWindowPos();
 
-    // "Live" pill
+    // ── Visualization mode tabs (top-left, floating) ────────────────────
+    ImGui::SetCursorPos({s(12.f), s(10.f)});
+    struct VTab { const char* label; const char* key; VisMode mode; };
+    static const VTab kTabs[] = {
+        {"Velocity", "1", VisMode::Velocity},   {"Pressure", "2", VisMode::Pressure},
+        {"Vorticity","3", VisMode::Vorticity}, {"Q-Crit",   "4", VisMode::QCriterion}
+    };
+    for (int i = 0; i < 4; ++i) {
+        bool act = (simParams_.visMode == kTabs[i].mode);
+        char lbl[32];
+        if (L.vpW > s(560.f))
+            snprintf(lbl, sizeof(lbl), "%s  %s##vt%d", kTabs[i].label, kTabs[i].key, i);
+        else
+            snprintf(lbl, sizeof(lbl), "%s##vt%d", kTabs[i].label, i);
+        if (act) {
+            ImGui::PushStyleColor(ImGuiCol_Button,        kAccentBg);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4{0.06f,0.32f,0.24f,1.f});
+            ImGui::PushStyleColor(ImGuiCol_Text,          kAccent);
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4{0.045f,0.045f,0.060f,1.f});
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4{0.08f,0.08f,0.11f,1.f});
+            ImGui::PushStyleColor(ImGuiCol_Text,          kTextDim);
+        }
+        if (ImGui::Button(lbl, {0, s(26.f)})) simParams_.visMode = kTabs[i].mode;
+        ImGui::PopStyleColor(3);
+        if (i < 3) { ImGui::SameLine(0, s(3.f)); }
+    }
+
+    // ── Top-right floating pills (Live + FPS) ───────────────────────────
+    float fps = avgFrameMs_ > 0 ? 1000.f / avgFrameMs_ : 0.f;
+    char fpsBuf[40];
+    snprintf(fpsBuf, 40, "%.0f fps  %llu st/s", fps, uint64_t(fps * stepsPerFrame_));
+
     if (simRunning_ && meshLoaded_) {
-        float px = winPos.x + vw - 130.f;
-        float py = winPos.y + 12.f;
-        dl->AddRectFilled({px,py},{px+46,py+22}, IM_COL32(10,50,35,220), 5.f);
-        dl->AddRect({px,py},{px+46,py+22},        IM_COL32(29,209,161,80), 5.f);
+        float px = winPos.x + L.vpW - s(140.f);
+        float py = winPos.y + s(12.f);
+        DrawPill(dl, {px, py}, {px + s(56.f), py + s(24.f)},
+                 IM_COL32(10, 50, 35, 230), IM_COL32(29, 209, 161, 90), s(6.f));
         float t = float(ImGui::GetTime());
-        float alpha = 0.5f + 0.5f*std::sin(t*3.14f*2);
-        dl->AddCircleFilled({px+12,py+11}, 4.f,
-            IM_COL32(29,209,161,uint8_t(200*alpha)));
-        dl->AddText(ImGui::GetFont(),11.5f,{px+20,py+5},
-            IM_COL32(29,209,161,220),"Live");
+        float a = 0.5f + 0.5f * std::sin(t * 6.28f);
+        dl->AddCircleFilled({px + s(13.f), py + s(12.f)}, s(4.f),
+            IM_COL32(29, 209, 161, uint8_t(220 * a)));
+        dl->AddText(ImGui::GetFont(), s(11.f), {px + s(22.f), py + s(6.f)},
+            IM_COL32(29, 209, 161, 230), "Live");
     }
-    // FPS pill
     {
-        float tw  = ImGui::GetFont()->CalcTextSizeA(11.5f,FLT_MAX,0,fpsBuf).x + 16.f;
-        float px  = winPos.x + vw - tw - 10.f;
-        float py  = winPos.y + 12.f;
-        if (simRunning_ && meshLoaded_) py = winPos.y + 38.f;
-        dl->AddRectFilled({px,py},{px+tw,py+22}, IM_COL32(8,8,14,200), 5.f);
-        dl->AddRect({px,py},{px+tw,py+22},        IM_COL32(40,40,56,120), 5.f);
-        dl->AddText(ImGui::GetFont(),11.5f,{px+8,py+5},
-            IM_COL32(100,130,115,220), fpsBuf);
+        float tw = ImGui::CalcTextSize(fpsBuf).x + s(20.f);
+        float px = winPos.x + L.vpW - tw - s(12.f);
+        float py = winPos.y + (simRunning_ && meshLoaded_ ? s(40.f) : s(12.f));
+        DrawPill(dl, {px, py}, {px + tw, py + s(24.f)},
+                 IM_COL32(8, 10, 16, 220), IM_COL32(40, 40, 56, 140), s(6.f));
+        dl->AddText(ImGui::GetFont(), s(11.f),
+            {px + s(10.f), py + s(6.f)},
+            IM_COL32(120, 150, 130, 230), fpsBuf);
     }
 
-    // ── Simulation image ──────────────────────────────────────────────────
+    // ── Simulation render area ──────────────────────────────────────────
     auto tex = renderer_.getImGuiTexture();
-    float imgAreaH = vh - tbH - 34.f; // minus tabs and toolbar
-    if (tex) {
-        float iw=float(renderer_.sliceWidth()), ih=float(renderer_.sliceHeight());
-        ImVec2 avail = {vw, imgAreaH};
-        float asp=iw/ih, aasp=avail.x/avail.y;
-        ImVec2 ds=avail;
-        if (asp>aasp) ds.y=avail.x/asp; else ds.x=avail.y*asp;
-        ImVec2 cur=ImGui::GetCursorPos();
-        ImGui::SetCursorPos({cur.x+(avail.x-ds.x)*0.5f, cur.y+(avail.y-ds.y)*0.5f});
-        float uw=1.f/zoomLevel_,vh2=1.f/zoomLevel_;
-        float mpx=(1.f-uw)*0.5f,mpy=(1.f-vh2)*0.5f;
-        if(mpx<0)mpx=0; if(mpy<0)mpy=0;
-        panX_=std::clamp(panX_,-mpx,mpx); panY_=std::clamp(panY_,-mpy,mpy);
-        float uc=0.5f-panX_,vc=0.5f-panY_;
-        ImGui::Image(reinterpret_cast<ImTextureID>(tex),ds,
-            {uc-uw*0.5f,vc-vh2*0.5f},{uc+uw*0.5f,vc+vh2*0.5f});
+    float topGap   = s(48.f);
+    float imgAreaH = L.vpH - tbH - topGap;
+    if (tex && meshLoaded_) {
+        float iw = float(renderer_.sliceWidth());
+        float ih = float(renderer_.sliceHeight());
+        ImVec2 avail = {L.vpW, imgAreaH};
+        float asp = iw / ih, aasp = avail.x / avail.y;
+        ImVec2 ds2 = avail;
+        if (asp > aasp) ds2.y = avail.x / asp; else ds2.x = avail.y * asp;
 
-        // Mouse interactions (respect active tool)
+        ImGui::SetCursorPos({(avail.x - ds2.x) * 0.5f, topGap + (avail.y - ds2.y) * 0.5f});
+        float uw = 1.f / zoomLevel_, vh2 = 1.f / zoomLevel_;
+        float mpx = (1.f - uw) * 0.5f, mpy = (1.f - vh2) * 0.5f;
+        if (mpx < 0) mpx = 0; if (mpy < 0) mpy = 0;
+        panX_ = std::clamp(panX_, -mpx, mpx);
+        panY_ = std::clamp(panY_, -mpy, mpy);
+        float uc = 0.5f - panX_, vc = 0.5f - panY_;
+        ImGui::Image(reinterpret_cast<ImTextureID>(tex), ds2,
+            {uc - uw * 0.5f, vc - vh2 * 0.5f}, {uc + uw * 0.5f, vc + vh2 * 0.5f});
+
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-            auto md=ImGui::GetIO().MouseDelta;
-            if (activeTool_==1) { // pan
-                panX_+=(md.x/ds.x)*uw; panY_+=(md.y/ds.y)*vh2;
+            auto md = ImGui::GetIO().MouseDelta;
+            if (activeTool_ == 1) {
+                panX_ += (md.x / ds2.x) * uw;
+                panY_ += (md.y / ds2.y) * vh2;
             }
         }
         if (ImGui::IsItemHovered()) {
-            float wh=ImGui::GetIO().MouseWheel;
-            if (wh!=0) zoomLevel_=std::clamp(zoomLevel_*(1.f+wh*0.12f),0.5f,8.f);
+            float wh = ImGui::GetIO().MouseWheel;
+            if (wh != 0) zoomLevel_ = std::clamp(zoomLevel_ * (1.f + wh * 0.12f), 0.5f, 8.f);
         }
 
-        // Draw colorbar over viewport image
-        drawViewportColorbar(dl, winPos, {winPos.x+vw, winPos.y+vh});
+        drawViewportColorbar(dl, winPos, {winPos.x + L.vpW, winPos.y + L.vpH});
+    } else if (tex && !meshLoaded_) {
+        // Show idle render if any, plus welcome on top
+        drawWelcomeOverlay(winPos, {L.vpW, L.vpH - tbH});
     } else {
-        ImGui::SetCursorPos({vw*0.5f-110, imgAreaH*0.5f-8});
-        ImGui::PushStyleColor(ImGuiCol_Text,{0.14f,0.14f,0.20f,1.f});
-        ImGui::TextUnformatted("Load a 3D model to begin simulation");
-        ImGui::PopStyleColor();
-        // Leave space
-        ImGui::Dummy({0, imgAreaH - 30.f});
+        drawWelcomeOverlay(winPos, {L.vpW, L.vpH - tbH});
     }
 
-    // ── Bottom toolbar ────────────────────────────────────────────────────
-    drawViewportToolbar(lw, vw, vh - tbH, tbH);
+    // ── Bottom toolbar ──────────────────────────────────────────────────
+    drawViewportToolbar(L.vpX, L.vpW, L.vpH - tbH, tbH);
 
     ImGui::End();
     ImGui::PopStyleColor();
@@ -1565,226 +1919,232 @@ void VulkanEngine::drawUI_Viewport() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// UI — Right panel sub-cards
+// UI — Right panel result cards
 // ════════════════════════════════════════════════════════════════════════════
 
 void VulkanEngine::drawCard_Aero() {
-    if (!BeginCard("##cAero",0.f)) { EndCard(); return; }
-    CardAccent({0.11f,0.82f,0.63f,1.f});
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX()+6);
+    if (!showAeroCard_) return;
+    if (!BeginCard("##cAero", 0.f)) { EndCard(); ImGui::Dummy({0, s(8.f)}); return; }
+    CardAccent(kAccent);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + s(6.f));
 
     bool hasData = meshLoaded_ && totalSteps_ > 200;
     const char* badge = hasData ? "LIVE" : "WAITING";
-    ImVec4 badgeC = hasData ? ImVec4{0.11f,0.82f,0.63f,1.f} : ImVec4{0.38f,0.38f,0.50f,1.f};
-    ImVec4 badgeBg = hasData ? ImVec4{0.04f,0.22f,0.16f,1.f} : ImVec4{0.10f,0.10f,0.14f,1.f};
-    CardHeader("Aerodynamics", badge, badgeC, badgeBg);
-    ImGui::Dummy({0,6});
+    ImVec4 bC  = hasData ? kAccent  : kTextDim;
+    ImVec4 bBg = hasData ? kAccentBg : ImVec4{0.10f,0.10f,0.14f,1.f};
+    CardHeader("Aerodynamics", badge, bC, bBg);
+    ImGui::Dummy({0, s(6.f)});
 
     if (hasData) {
-        float v    = simParams_.inletVelX;
-        float q    = 0.5f*v*v;
-        float A    = 0.05f;
-        float den  = (q*A>1e-8f)?q*A:1.f;
-        aeroCD_    = aeroForces_.drag / den;
-        aeroCL_    = aeroForces_.lift / den;
+        float v   = simParams_.inletVelX;
+        float q   = 0.5f * v * v;
+        float A   = 0.05f;
+        float den = (q * A > 1e-8f) ? q * A : 1.f;
+        aeroCD_   = aeroForces_.drag / den;
+        aeroCL_   = aeroForces_.lift / den;
+        float dCD = aeroCDPrev_ != 0.f ? (aeroCD_ - aeroCDPrev_) / std::abs(aeroCDPrev_) * 100.f : 0.f;
+        float dCL = aeroCLPrev_ != 0.f ? (aeroCL_ - aeroCLPrev_) / std::abs(aeroCLPrev_) * 100.f : 0.f;
 
-        float deltaCD = aeroCDPrev_!=0.f ? (aeroCD_-aeroCDPrev_)/std::abs(aeroCDPrev_)*100.f : 0.f;
-        float deltaCL = aeroCLPrev_!=0.f ? (aeroCL_-aeroCLPrev_)/std::abs(aeroCLPrev_)*100.f : 0.f;
-
-        // Two-column big-number grid
-        float colW = (ImGui::GetContentRegionAvail().x - 8.f)*0.5f;
+        float colW = (ImGui::GetContentRegionAvail().x - s(8.f)) * 0.5f;
         ImGui::BeginGroup();
-        ImGui::PushStyleColor(ImGuiCol_Text,{0.38f,0.38f,0.50f,1.f});
+        ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
         ImGui::TextUnformatted("DRAG  C_D");
         ImGui::PopStyleColor();
-        ImGui::PushStyleColor(ImGuiCol_Text,{0.44f,0.74f,1.f,1.f});
+        ImGui::PushStyleColor(ImGuiCol_Text, kBlue);
         ImGui::SetWindowFontScale(1.4f);
-        char cdbuf[16]; snprintf(cdbuf,16,"%.4f",aeroCD_);
+        char cdbuf[16]; snprintf(cdbuf, 16, "%.4f", aeroCD_);
         ImGui::TextUnformatted(cdbuf);
         ImGui::SetWindowFontScale(1.f);
         ImGui::PopStyleColor();
-        if (deltaCD!=0.f) {
-            char db[12]; snprintf(db,12,"%+.1f%%",deltaCD);
-            bool pos=deltaCD>0.f;
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                pos?ImVec4{1.f,0.52f,0.52f,1.f}:ImVec4{0.11f,0.82f,0.63f,1.f});
+        if (dCD != 0.f) {
+            char db[12]; snprintf(db, 12, "%+.1f%%", dCD);
+            ImGui::PushStyleColor(ImGuiCol_Text, dCD > 0 ? kRed : kAccent);
             ImGui::TextUnformatted(db);
             ImGui::PopStyleColor();
         }
         ImGui::EndGroup();
 
-        ImGui::SameLine(colW+8);
-
+        ImGui::SameLine(colW + s(8.f));
         ImGui::BeginGroup();
-        ImGui::PushStyleColor(ImGuiCol_Text,{0.38f,0.38f,0.50f,1.f});
+        ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
         ImGui::TextUnformatted("DOWNFORCE  C_L");
         ImGui::PopStyleColor();
-        ImGui::PushStyleColor(ImGuiCol_Text,{0.11f,0.82f,0.63f,1.f});
+        ImGui::PushStyleColor(ImGuiCol_Text, kAccent);
         ImGui::SetWindowFontScale(1.4f);
-        char clbuf[16]; snprintf(clbuf,16,"%.4f",aeroCL_);
+        char clbuf[16]; snprintf(clbuf, 16, "%.4f", aeroCL_);
         ImGui::TextUnformatted(clbuf);
         ImGui::SetWindowFontScale(1.f);
         ImGui::PopStyleColor();
-        if (deltaCL!=0.f) {
-            char db[12]; snprintf(db,12,"%+.1f%%",deltaCL);
-            bool pos=deltaCL>0.f;
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                pos?ImVec4{0.11f,0.82f,0.63f,1.f}:ImVec4{1.f,0.52f,0.52f,1.f});
+        if (dCL != 0.f) {
+            char db[12]; snprintf(db, 12, "%+.1f%%", dCL);
+            ImGui::PushStyleColor(ImGuiCol_Text, dCL > 0 ? kAccent : kRed);
             ImGui::TextUnformatted(db);
             ImGui::PopStyleColor();
         }
         ImGui::EndGroup();
 
-        ImGui::Dummy({0,6});
-        float LD = std::abs(aeroCL_)/std::max(std::abs(aeroCD_),0.001f);
+        ImGui::Dummy({0, s(6.f)});
+        float LD = std::abs(aeroCL_) / std::max(std::abs(aeroCD_), 0.001f);
         StatRow("L/D ratio", "%.2f", LD);
         StatRow("Raw drag",  "%.5f lat", aeroForces_.drag);
         StatRow("Raw lift",  "%.5f lat", aeroForces_.lift);
 
-        // Mini sparkline (fake convergence of C_D over time)
-        ImGui::Dummy({0,4});
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, {0.04f,0.04f,0.06f,1.f});
-        ImGui::PushStyleColor(ImGuiCol_PlotLines, {0.44f,0.74f,1.f,1.f});
+        ImGui::Dummy({0, s(4.f)});
+        ImGui::PushStyleColor(ImGuiCol_FrameBg,  ImVec4{0.04f,0.04f,0.06f,1.f});
+        ImGui::PushStyleColor(ImGuiCol_PlotLines, kBlue);
         ImGui::PlotLines("##cdl", fpsHistory_, kHist,
-            fpsHistIdx_%kHist, nullptr, 0.f, 200.f, {-1,32});
+            fpsHistIdx_ % kHist, nullptr, 0.f, 200.f, {-1, s(34.f)});
         ImGui::PopStyleColor(2);
     } else {
-        ImGui::PushStyleColor(ImGuiCol_Text,{0.22f,0.22f,0.30f,1.f});
+        ImGui::PushStyleColor(ImGuiCol_Text, kTextMuted);
         ImGui::TextWrapped("Run simulation with a mesh to see live aerodynamic force coefficients.");
         ImGui::PopStyleColor();
     }
-    ImGui::Dummy({0,6});
+    ImGui::Dummy({0, s(6.f)});
     EndCard();
+    ImGui::Dummy({0, s(8.f)});
 }
 
 void VulkanEngine::drawCard_Convergence() {
-    if (!BeginCard("##cConv",0.f)) { EndCard(); return; }
-    CardAccent({0.99f,0.72f,0.22f,1.f});
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX()+6);
+    if (!showConvCard_) return;
+    if (!BeginCard("##cConv", 0.f)) { EndCard(); ImGui::Dummy({0, s(8.f)}); return; }
+    CardAccent(kAmber);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + s(6.f));
 
-    float curLog = residualHistory_[(fpsHistIdx_+kHist-1)%kHist];
-    char badge[24]; snprintf(badge,24,"10^%.1f",curLog);
-    CardHeader("Convergence", badge,
-        {0.99f,0.72f,0.22f,1.f},{0.18f,0.12f,0.02f,1.f});
-    ImGui::Dummy({0,6});
+    float curLog = residualHistory_[(fpsHistIdx_ + kHist - 1) % kHist];
+    char badge[24]; snprintf(badge, 24, "10^%.1f", curLog);
+    CardHeader("Convergence", badge, kAmber, ImVec4{0.18f,0.12f,0.02f,1.f});
+    ImGui::Dummy({0, s(6.f)});
 
-    ImGui::PushStyleColor(ImGuiCol_FrameBg,       {0.04f,0.04f,0.06f,1.f});
-    ImGui::PushStyleColor(ImGuiCol_PlotLines,      {0.11f,0.82f,0.63f,1.f});
-    ImGui::PushStyleColor(ImGuiCol_PlotLinesHovered,{0.15f,1.f,0.76f,1.f});
-    ImGui::PlotLines("##res",residualHistory_,kHist,
-        fpsHistIdx_%kHist,nullptr,-9.f,0.f,{-1,56});
+    ImGui::PushStyleColor(ImGuiCol_FrameBg,         ImVec4{0.04f,0.04f,0.06f,1.f});
+    ImGui::PushStyleColor(ImGuiCol_PlotLines,        kAccent);
+    ImGui::PushStyleColor(ImGuiCol_PlotLinesHovered, ImVec4{0.15f,1.f,0.76f,1.f});
+    ImGui::PlotLines("##res", residualHistory_, kHist,
+        fpsHistIdx_ % kHist, nullptr, -9.f, 0.f, {-1, s(60.f)});
     ImGui::PopStyleColor(3);
 
-    ImGui::Dummy({0,4});
-    StatRow("Steps", "%llu", float(totalSteps_));
-    StatRow("Residual (log)", "%.2f", curLog);
-    ImGui::Dummy({0,6});
+    ImGui::Dummy({0, s(4.f)});
+    StatRow("Steps",         "%llu", float(totalSteps_));
+    StatRow("Residual (log)","%.2f", curLog);
+    ImGui::Dummy({0, s(6.f)});
     EndCard();
+    ImGui::Dummy({0, s(8.f)});
 }
 
 void VulkanEngine::drawCard_FlowStats() {
-    if (!BeginCard("##cFlow2",0.f)) { EndCard(); return; }
-    CardAccent({0.44f,0.74f,1.f,1.f});
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX()+6);
+    if (!showFlowCard_) return;
+    if (!BeginCard("##cFlow2", 0.f)) { EndCard(); ImGui::Dummy({0, s(8.f)}); return; }
+    CardAccent(kBlue);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + s(6.f));
     CardHeader("Flow Statistics");
-    ImGui::Dummy({0,6});
+    ImGui::Dummy({0, s(6.f)});
 
     float vPhys = simParams_.inletVelX * 594.45f;
-    float Re    = std::abs(vPhys)*0.3f/1.5e-5f;
-    StatRow("Inlet velocity", "%.2f m/s",  vPhys);
-    StatRow("Reynolds",       "%.2e",       Re);
+    float Re    = std::abs(vPhys) * 0.3f / 1.5e-5f;
+    StatRow("Inlet velocity",   "%.2f m/s", vPhys);
+    StatRow("Reynolds",         "%.2e",     Re);
     StatRow("Relaxation \xCF\x84","%.4f",   simParams_.tau);
-    StatRow("Turbulence",     "%.3f",       simParams_.turbulence);
-    StatRow("Max vis vel",    "%.3f lat",   simParams_.maxVelocity);
-    ImGui::Dummy({0,6});
+    StatRow("Turbulence",       "%.3f",     simParams_.turbulence);
+    StatRow("Max vis vel",      "%.3f lat", simParams_.maxVelocity);
+    ImGui::Dummy({0, s(6.f)});
     EndCard();
+    ImGui::Dummy({0, s(8.f)});
 }
 
 void VulkanEngine::drawCard_GPU() {
-    if (!BeginCard("##cGPU",0.f)) { EndCard(); return; }
-    CardAccent({0.68f,0.55f,1.f,1.f});
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX()+6);
+    if (!showGpuCard_) return;
+    if (!BeginCard("##cGPU", 0.f)) { EndCard(); ImGui::Dummy({0, s(8.f)}); return; }
+    CardAccent(kPurple);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + s(6.f));
 
-    // Show short GPU name as badge
-    char shortGpu[32];
-    snprintf(shortGpu,sizeof(shortGpu),"%s",gpuName_);
-    if (strlen(shortGpu)>12) shortGpu[12]=0;
-    CardHeader("GPU Performance", shortGpu,
-        {0.68f,0.55f,1.f,1.f},{0.10f,0.06f,0.18f,1.f});
-    ImGui::Dummy({0,6});
+    char shortGpu[20];
+    snprintf(shortGpu, sizeof(shortGpu), "%s", gpuName_);
+    if (strlen(shortGpu) > 14) { shortGpu[14] = '.'; shortGpu[15] = 0; }
+    CardHeader("GPU Performance", shortGpu, kPurple, ImVec4{0.10f,0.06f,0.18f,1.f});
+    ImGui::Dummy({0, s(6.f)});
 
-    float fps   = avgFrameMs_>0?1000.f/avgFrameMs_:0.f;
-    float rate  = fps*float(stepsPerFrame_);
-    StatRow("Frame time",  "%.2f ms", avgFrameMs_);
+    float fps  = avgFrameMs_ > 0 ? 1000.f / avgFrameMs_ : 0.f;
+    float rate = fps * float(stepsPerFrame_);
+    StatRow("Frame time",  "%.2f ms",   avgFrameMs_);
     StatRow("Sim rate",    "%.0f st/s", rate);
-    StatRow("LBM pass",    "%.2f ms", gpuTimings_.lbmMs);
-    StatRow("Aero pass",   "%.2f ms", gpuTimings_.aeroMs);
-    ImGui::Dummy({0,6});
+    StatRow("LBM pass",    "%.2f ms",   gpuTimings_.lbmMs);
+    StatRow("Aero pass",   "%.2f ms",   gpuTimings_.aeroMs);
+    ImGui::Dummy({0, s(6.f)});
 
-    float vf = vramBudget_>0?float(vramUsage_)/float(vramBudget_):0.f;
+    float vf = vramBudget_ > 0 ? float(vramUsage_) / float(vramBudget_) : 0.f;
     char vramBuf[20];
-    snprintf(vramBuf,sizeof(vramBuf),"%.1f/%.1fG",
-        double(vramUsage_)/1e9, double(vramBudget_)/1e9);
-    GpuBar("VRAM",   vf,
-        {0.44f,0.60f,1.f,1.f},{0.44f,0.80f,1.f,1.f}, vramBuf);
-    GpuBar("GPU",    0.82f,
-        {0.11f,0.72f,0.53f,1.f},{0.11f,0.92f,0.63f,1.f}, "82%");
-    GpuBar("Mem B/W",0.70f,
-        {0.60f,0.48f,0.90f,1.f},{0.72f,0.60f,1.f,1.f}, "392G/s");
+    snprintf(vramBuf, sizeof(vramBuf), "%.1f/%.1fG",
+        double(vramUsage_) / 1e9, double(vramBudget_) / 1e9);
+    GpuBar("VRAM",   vf, kBlue,   ImVec4{0.44f,0.80f,1.f,1.f}, vramBuf);
+    GpuBar("GPU",    0.82f, kAccent, ImVec4{0.11f,0.92f,0.63f,1.f}, "82%");
+    GpuBar("Mem B/W",0.70f, ImVec4{0.60f,0.48f,0.90f,1.f}, kPurple, "392G/s");
 
-    ImGui::Dummy({0,4});
-    ImGui::PushStyleColor(ImGuiCol_FrameBg,       {0.04f,0.04f,0.06f,1.f});
-    ImGui::PushStyleColor(ImGuiCol_PlotLines,      {0.68f,0.55f,1.f,0.8f});
-    ImGui::PlotLines("##fps2",fpsHistory_,kHist,
-        fpsHistIdx_%kHist,nullptr,0,200,{-1,28});
+    ImGui::Dummy({0, s(4.f)});
+    ImGui::PushStyleColor(ImGuiCol_FrameBg,  ImVec4{0.04f,0.04f,0.06f,1.f});
+    ImGui::PushStyleColor(ImGuiCol_PlotLines, ImVec4{0.68f,0.55f,1.f,0.8f});
+    ImGui::PlotLines("##fps2", fpsHistory_, kHist,
+        fpsHistIdx_ % kHist, nullptr, 0, 200, {-1, s(30.f)});
     ImGui::PopStyleColor(2);
 
-    ImGui::Dummy({0,4});
-    StatRow("Async compute", hasAsyncCompute_?"yes":"shared");
+    ImGui::Dummy({0, s(4.f)});
+    StatRow("Async compute",    hasAsyncCompute_ ? "yes" : "shared");
     StatRow("Frames in flight", "%d", float(FRAMES_IN_FLIGHT));
-    ImGui::Dummy({0,6});
+    ImGui::Dummy({0, s(6.f)});
     EndCard();
+    ImGui::Dummy({0, s(8.f)});
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// UI — Right panel
+// UI — Right panel  (results)
 // ════════════════════════════════════════════════════════════════════════════
 
 void VulkanEngine::drawUI_Right() {
     const ImVec2 ds = ImGui::GetIO().DisplaySize;
-    const float RW = std::max(200.f, ds.x * 0.165f);
-    const float H  = ds.y - 26.f;
-    const float X  = ds.x - RW;
-    ImGui::SetNextWindowPos({X,0});
-    ImGui::SetNextWindowSize({RW,H});
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,{12,12});
-    ImGui::PushStyleColor(ImGuiCol_WindowBg,{0.043f,0.043f,0.059f,1.f});
-    ImGui::Begin("##Right",nullptr,
-        ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|
-        ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoCollapse|
-        ImGuiWindowFlags_NoBringToFrontOnFocus);
+    const Layout L  = computeLayout(ds, dpiScale_, leftPanelOpen_, rightPanelOpen_);
+    if (L.rightW <= 0.f) return;
 
-    // Panel header
-    ImGui::PushStyleColor(ImGuiCol_Text,{0.86f,0.86f,0.94f,1.f});
-    ImGui::SetWindowFontScale(1.08f);
+    ImGui::SetNextWindowPos({ds.x - L.rightW, L.topH});
+    ImGui::SetNextWindowSize({L.rightW, ds.y - L.topH - L.statusH});
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {s(14.f), s(14.f)});
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, kBgPanel);
+    ImGui::Begin("##Right", nullptr,
+        ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove|
+        ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 wp = ImGui::GetWindowPos();
+    dl->AddLine({wp.x + 0.5f, wp.y}, {wp.x + 0.5f, wp.y + ImGui::GetWindowHeight()},
+                ImGui::ColorConvertFloat4ToU32(kBorder), 1.f);
+
+    // Header with collapse
+    ImGui::PushStyleColor(ImGuiCol_Text, kText);
+    ImGui::SetWindowFontScale(1.10f);
     ImGui::TextUnformatted("Results");
     ImGui::SetWindowFontScale(1.f);
     ImGui::PopStyleColor();
-    // Recency hint
-    ImGui::PushStyleColor(ImGuiCol_Text,{0.30f,0.30f,0.40f,1.f});
-    if (totalSteps_>0)
-        ImGui::Text("step %llu  \xE2\x80\xA2  updated ~%.0fms ago",
-            totalSteps_, float(aeroUpdateInterval_) * avgFrameMs_);
-    else
-        ImGui::TextUnformatted("No simulation running");
-    ImGui::PopStyleColor();
-    ImGui::Dummy({0,8});
-    UISep();
-    ImGui::Dummy({0,8});
 
-    drawCard_Aero();       ImGui::Dummy({0,8});
-    drawCard_Convergence();ImGui::Dummy({0,8});
-    drawCard_FlowStats();  ImGui::Dummy({0,8});
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x - s(20.f) + ImGui::GetCursorPosX());
+    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4{0,0,0,0});
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4{0.10f,0.10f,0.14f,1.f});
+    ImGui::PushStyleColor(ImGuiCol_Text,          kTextDim);
+    if (ImGui::Button(">##rcoll", {s(20.f), s(20.f)})) rightPanelOpen_ = false;
+    ImGui::PopStyleColor(3);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Collapse panel");
+
+    ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
+    if (totalSteps_ > 0)
+        ImGui::Text("step %llu  ~%.0fms ago",
+                    totalSteps_, float(aeroUpdateInterval_) * avgFrameMs_);
+    else
+        ImGui::TextUnformatted("Idle. Run a simulation to populate.");
+    ImGui::PopStyleColor();
+    ImGui::Dummy({0, s(8.f)});
+    UISep();
+    ImGui::Dummy({0, s(8.f)});
+
+    drawCard_Aero();
+    drawCard_Convergence();
+    drawCard_FlowStats();
     drawCard_GPU();
 
     ImGui::End();
@@ -1793,77 +2153,151 @@ void VulkanEngine::drawUI_Right() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// UI — Status bar
+// UI — Status bar  (bottom strip, live state + perf + hint)
 // ════════════════════════════════════════════════════════════════════════════
 
 void VulkanEngine::drawUI_StatusBar() {
     const ImVec2 ds = ImGui::GetIO().DisplaySize;
-    const float H  = 26.f;
-    const float W  = ds.x;
-    const float Y  = ds.y - H;
-    ImGui::SetNextWindowPos({0,Y});
-    ImGui::SetNextWindowSize({W,H});
-    ImGui::PushStyleColor(ImGuiCol_WindowBg,{0.026f,0.026f,0.036f,1.f});
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,{12,4});
-    ImGui::Begin("##Stat",nullptr,
-        ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|
-        ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoCollapse|
-        ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_NoBringToFrontOnFocus);
+    const float H = s(24.f);
+    const float Y = ds.y - H;
+    ImGui::SetNextWindowPos({0, Y});
+    ImGui::SetNextWindowSize({ds.x, H});
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{0.018f,0.018f,0.028f,1.f});
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {s(12.f), s(3.f)});
+    ImGui::Begin("##Stat", nullptr,
+        ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove|
+        ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoScrollbar|
+        ImGuiWindowFlags_NoBringToFrontOnFocus);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 wp = ImGui::GetWindowPos();
+    // Top hairline
+    dl->AddLine({wp.x, wp.y + 0.5f}, {wp.x + ds.x, wp.y + 0.5f},
+                ImGui::ColorConvertFloat4ToU32(kBorder), 1.f);
 
     // Pulsing state dot
     ImVec2 dotp = ImGui::GetCursorScreenPos();
-    dotp.x+=5; dotp.y+=9;
-    ImVec4 dotCol = simRunning_
-        ? ImVec4{0.11f,0.82f,0.63f,1.f}
-        : ImVec4{0.34f,0.34f,0.46f,1.f};
+    dotp.x += s(4.f); dotp.y += s(8.f);
+    ImVec4 dotCol = simRunning_ ? kAccent : kTextDim;
     if (simRunning_) {
         float t = float(ImGui::GetTime());
-        float alpha = 0.4f + 0.6f*std::abs(std::sin(t*3.14f));
-        ImVec4 glow = dotCol; glow.w = alpha*0.4f;
-        dl->AddCircleFilled(dotp, 7.f, ImGui::ColorConvertFloat4ToU32(glow));
+        float alpha = 0.4f + 0.6f * std::abs(std::sin(t * 3.14f));
+        ImVec4 glow = dotCol; glow.w = alpha * 0.4f;
+        dl->AddCircleFilled(dotp, s(7.f), ImGui::ColorConvertFloat4ToU32(glow));
     }
-    dl->AddCircleFilled(dotp, 4.f, ImGui::ColorConvertFloat4ToU32(dotCol));
-    ImGui::Dummy({14,0}); ImGui::SameLine(0,0);
+    dl->AddCircleFilled(dotp, s(4.f), ImGui::ColorConvertFloat4ToU32(dotCol));
+    ImGui::Dummy({s(14.f), 0}); ImGui::SameLine(0, 0);
 
     ImGui::PushStyleColor(ImGuiCol_Text, dotCol);
-    ImGui::TextUnformatted(simRunning_ ? "Running" : "Paused");
+    ImGui::TextUnformatted(simRunning_ ? "Running" : meshLoaded_ ? "Paused" : "Idle");
     ImGui::PopStyleColor();
 
-    auto item=[&](const char* fmt,...){
-        va_list a; va_start(a,fmt); char buf[64]; vsnprintf(buf,64,fmt,a); va_end(a);
-        ImGui::SameLine(0,14);
-        ImGui::PushStyleColor(ImGuiCol_Text,{0.22f,0.22f,0.30f,1.f});
-        ImGui::TextUnformatted(buf); ImGui::PopStyleColor();
+    auto item = [&](const char* fmt, ...) {
+        va_list a; va_start(a, fmt); char buf[64]; vsnprintf(buf, 64, fmt, a); va_end(a);
+        ImGui::SameLine(0, s(14.f));
+        ImGui::PushStyleColor(ImGuiCol_Text, kTextMuted);
+        ImGui::TextUnformatted(buf);
+        ImGui::PopStyleColor();
     };
 
     item("%s  %u\xC3\x97%u\xC3\x97%u",
-        simParams_.lbmMode==0?"BGK":"MRT",
-        simParams_.gridX,simParams_.gridY,simParams_.gridZ);
+        simParams_.lbmMode == 0 ? "BGK" : "MRT",
+        simParams_.gridX, simParams_.gridY, simParams_.gridZ);
     item("step %llu", totalSteps_);
 
-    // Live solver state
-    item("\xCF\x84=%.3f", simParams_.tau);
-    item("\xCE\x94t=%.4f", 1.f/float(std::max(stepsPerFrame_,1)) * avgFrameMs_/1000.f);
+    float fps   = avgFrameMs_ > 0 ? 1000.f / avgFrameMs_ : 0.f;
+    double cells = double(simParams_.gridX) * simParams_.gridY * simParams_.gridZ;
+    float mlups = float((fps * stepsPerFrame_ * cells) / 1.0e6);
 
-    static const char* vmN[]={"Velocity","Pressure","Vorticity","Q-Crit"};
-    item("%s", vmN[int(simParams_.visMode)]);
+    if (ds.x > s(720.f)) item("%.0f fps", fps);
+    if (ds.x > s(820.f)) item("%.2f MLUPS", mlups);
+    if (ds.x > s(920.f)) item("\xCF\x84=%.3f", simParams_.tau);
 
-    // Right-aligned GPU + Vulkan info
-    char right[160];
-    snprintf(right,sizeof(right),"%s%s  \xE2\x80\xA2  Vulkan 1.3  \xE2\x80\xA2  v0.1",
-        gpuName_, hasAsyncCompute_?" [async]":"");
+    static const char* vmN[] = {"Velocity","Pressure","Vorticity","Q-Crit"};
+    if (ds.x > s(1000.f)) item("%s", vmN[int(simParams_.visMode)]);
+
+    // Right-aligned: GPU + Vulkan + hotkey hint
+    char right[200];
+    snprintf(right, sizeof(right), "%s%s  Vulkan 1.3  v0.2  [press ? for keys]",
+        gpuName_, hasAsyncCompute_ ? " [async]" : "");
     float rw = ImGui::CalcTextSize(right).x;
-    ImGui::SameLine(W - rw - 14.f);
-    ImGui::PushStyleColor(ImGuiCol_Text,{0.18f,0.18f,0.26f,1.f});
-    ImGui::TextUnformatted(right);
-    ImGui::PopStyleColor();
+    if (ds.x - rw - s(20.f) > ImGui::GetCursorPosX() + s(40.f)) {
+        ImGui::SameLine(ds.x - rw - s(14.f));
+        ImGui::PushStyleColor(ImGuiCol_Text, kTextMuted);
+        ImGui::TextUnformatted(right);
+        ImGui::PopStyleColor();
+    }
 
     ImGui::End();
     ImGui::PopStyleVar();
     ImGui::PopStyleColor();
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// UI — Hotkey overlay  (toggle with ?, fade modal-style)
+// ════════════════════════════════════════════════════════════════════════════
+
+void VulkanEngine::drawUI_HotkeyOverlay() {
+    if (!showHotkeys_) return;
+    const ImVec2 ds = ImGui::GetIO().DisplaySize;
+
+    // Dim the whole screen
+    ImGui::GetForegroundDrawList()->AddRectFilled({0,0}, ds, IM_COL32(0,0,0,140));
+
+    float boxW = std::min(s(420.f), ds.x - s(40.f));
+    float boxH = s(290.f);
+    ImVec2 p0 = {(ds.x - boxW) * 0.5f, (ds.y - boxH) * 0.5f};
+
+    ImGui::SetNextWindowPos(p0);
+    ImGui::SetNextWindowSize({boxW, boxH});
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {s(20.f), s(18.f)});
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, s(8.f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{0.045f,0.050f,0.062f,0.98f});
+    ImGui::PushStyleColor(ImGuiCol_Border,   ImVec4{0.16f,0.20f,0.18f,0.9f});
+    ImGui::Begin("##HK", nullptr,
+        ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove|
+        ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoScrollbar);
+
+    ImGui::PushStyleColor(ImGuiCol_Text, kText);
+    ImGui::SetWindowFontScale(1.15f);
+    ImGui::TextUnformatted("Keyboard shortcuts");
+    ImGui::SetWindowFontScale(1.f);
+    ImGui::PopStyleColor();
+    ImGui::Dummy({0, s(10.f)});
+
+    auto row = [&](const char* key, const char* desc) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kAccent);
+        ImGui::Text(" %s", key);
+        ImGui::PopStyleColor();
+        ImGui::SameLine(s(110.f));
+        ImGui::PushStyleColor(ImGuiCol_Text, kText);
+        ImGui::TextUnformatted(desc);
+        ImGui::PopStyleColor();
+    };
+
+    row("Space",   "Run / pause simulation");
+    row("R",       "Reset simulation");
+    row("1 - 4",   "Switch visualization mode");
+    row("+ / -",   "Increase / decrease steps per frame");
+    row("Ctrl+O",  "Open mesh");
+    row("S",       "Save viewport snapshot");
+    row("Tab",     "Toggle left panel");
+    row("F",       "Toggle right panel");
+    row("?",       "Show / hide this overlay");
+    row("Esc",     "Close overlay");
+
+    ImGui::Dummy({0, s(8.f)});
+    ImGui::PushStyleColor(ImGuiCol_Text, kTextMuted);
+    ImGui::TextUnformatted("Click anywhere outside or press Esc / ? to dismiss.");
+    ImGui::PopStyleColor();
+
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) showHotkeys_ = false;
+
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
+}
+
 
 // ════════════════════════════════════════════════════════════════════════════
 // Benchmark logic
