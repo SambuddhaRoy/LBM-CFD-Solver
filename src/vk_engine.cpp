@@ -41,6 +41,29 @@ static std::string openFileDialog() {
     ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
     return GetOpenFileNameA(&ofn) ? std::string(buf) : "";
 }
+#elif defined(__linux__)
+#include <cstdio>
+static std::string openFileDialog() {
+    // Try zenity (GTK/GNOME), then kdialog (KDE/Plasma), in that order.
+    static const char* kCmds[] = {
+        "zenity --file-selection --title='Open 3D Model' "
+            "--file-filter='3D Models (stl obj fbx glb gltf)|*.stl *.obj *.fbx *.glb *.gltf' 2>/dev/null",
+        "kdialog --getopenfilename . '*.stl *.obj *.fbx *.glb *.gltf|3D Models' 2>/dev/null",
+    };
+    for (auto* cmd : kCmds) {
+        FILE* fp = popen(cmd, "r");
+        if (!fp) continue;
+        char buf[4096] = {};
+        bool got = (fgets(buf, sizeof(buf), fp) != nullptr);
+        int  rc  = pclose(fp);
+        if (got && rc == 0 && buf[0]) {
+            std::string s(buf);
+            while (!s.empty() && (s.back()=='\n'||s.back()=='\r'||s.back()==' ')) s.pop_back();
+            if (!s.empty()) return s;
+        }
+    }
+    return "";
+}
 #endif
 
 namespace vwt {
@@ -1130,10 +1153,8 @@ void VulkanEngine::drawUI_TopBar() {
     ImGui::SetCursorPosY(yMid);
 
     if (subtle("Open", s(74.f))) {
-#ifdef _WIN32
         auto path = openFileDialog();
         if (!path.empty()) { snprintf(meshPath_,512,"%s",path.c_str()); loadMesh(meshPath_); }
-#endif
     }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open 3D model (.stl, .obj, .fbx)");
     ImGui::SameLine(0, btnSpacing);
@@ -1282,7 +1303,7 @@ void VulkanEngine::drawUI_Rail() {
     ImGui::SetCursorPosX(btnOff);
     bool settingsAct = (railMode_ == 5);
     if (IconButton("##set", "*", {btnSz, btnSz}, settingsAct, kTextDim))
-        railMode_ = 5;
+        railMode_ = settingsAct ? 0 : 5;
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Settings");
 
     ImGui::End();
@@ -1360,21 +1381,95 @@ void VulkanEngine::drawUI_Left() {
         drawPlaceholder("Library",
             "Sample cases and saved configurations.");
     } else if (railMode_ == 5) {
-        // Settings
-        ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
-        ImGui::TextUnformatted("Layout");
-        ImGui::PopStyleColor();
-        ImGui::Checkbox("Show right panel", &rightPanelOpen_);
-        ImGui::Checkbox("Show keyboard shortcuts overlay", &showHotkeys_);
+        // ── Settings: Right-panel card visibility ──────────────────────────
+        if (BeginCard("##sCards", 0.f)) {
+            CardAccent(kBlue);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + s(6.f));
+            CardHeader("Result Cards");
+            ImGui::Dummy({0, s(6.f)});
+            ImGui::PushStyleColor(ImGuiCol_Text, kText);
+            ImGui::Checkbox("Aerodynamic forces",  &showAeroCard_);
+            ImGui::Checkbox("Convergence history", &showConvCard_);
+            ImGui::Checkbox("Flow statistics",     &showFlowCard_);
+            ImGui::Checkbox("GPU performance",     &showGpuCard_);
+            ImGui::PopStyleColor();
+            ImGui::Dummy({0, s(6.f)});
+        }
+        EndCard();
         ImGui::Dummy({0, s(8.f)});
 
-        ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
-        ImGui::TextUnformatted("Visible result cards");
-        ImGui::PopStyleColor();
-        ImGui::Checkbox("Aerodynamics", &showAeroCard_);
-        ImGui::Checkbox("Convergence", &showConvCard_);
-        ImGui::Checkbox("Flow statistics", &showFlowCard_);
-        ImGui::Checkbox("GPU performance", &showGpuCard_);
+        // ── Settings: Performance ──────────────────────────────────────────
+        if (BeginCard("##sPerfCard", 0.f)) {
+            CardAccent(kAmber);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + s(6.f));
+            CardHeader("Performance");
+            ImGui::Dummy({0, s(6.f)});
+
+            ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
+            ImGui::TextUnformatted("Aero update interval (steps)");
+            ImGui::PopStyleColor();
+            float auiW = ImGui::GetContentRegionAvail().x - s(48.f);
+            ImGui::SetNextItemWidth(auiW);
+            int aui = int(aeroUpdateInterval_);
+            if (ImGui::SliderInt("##auiS", &aui, 5, 200)) aeroUpdateInterval_ = uint64_t(aui);
+            ImGui::SameLine(0, s(6.f));
+            ImGui::PushStyleColor(ImGuiCol_Text, kText);
+            ImGui::Text("%d", aui);
+            ImGui::PopStyleColor();
+
+            ImGui::Dummy({0, s(4.f)});
+            ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
+            ImGui::TextUnformatted("Steps per frame");
+            ImGui::PopStyleColor();
+            float spfW = ImGui::GetContentRegionAvail().x - s(48.f);
+            ImGui::SetNextItemWidth(spfW);
+            ImGui::SliderInt("##spfS", &stepsPerFrame_, 1, 64);
+            ImGui::SameLine(0, s(6.f));
+            ImGui::PushStyleColor(ImGuiCol_Text, kText);
+            ImGui::Text("%d", stepsPerFrame_);
+            ImGui::PopStyleColor();
+
+            ImGui::Dummy({0, s(6.f)});
+        }
+        EndCard();
+        ImGui::Dummy({0, s(8.f)});
+
+        // ── Settings: Layout ──────────────────────────────────────────────
+        if (BeginCard("##sLayCard", 0.f)) {
+            CardAccent(kPurple);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + s(6.f));
+            CardHeader("Layout");
+            ImGui::Dummy({0, s(6.f)});
+            ImGui::PushStyleColor(ImGuiCol_Text, kText);
+            ImGui::Checkbox("Right panel (F)",          &rightPanelOpen_);
+            ImGui::Checkbox("Keyboard shortcuts overlay", &showHotkeys_);
+            ImGui::PopStyleColor();
+            ImGui::Dummy({0, s(4.f)});
+            if (ImGui::Button("Show shortcuts now", {-1, s(24.f)}))
+                showHotkeys_ = true;
+            ImGui::Dummy({0, s(6.f)});
+        }
+        EndCard();
+        ImGui::Dummy({0, s(8.f)});
+
+        // ── Settings: Configuration ────────────────────────────────────────
+        if (BeginCard("##sConfCard", 0.f)) {
+            CardAccent(kTextMuted);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + s(6.f));
+            CardHeader("Configuration");
+            ImGui::Dummy({0, s(6.f)});
+            float bwConf = (ImGui::GetContentRegionAvail().x - s(4.f)) * 0.5f;
+            if (ImGui::Button("Load Config", {bwConf, s(24.f)})) loadConfig();
+            ImGui::SameLine(0, s(4.f));
+            if (ImGui::Button("Save Config", {-1, s(24.f)}))     saveConfig();
+            ImGui::Dummy({0, s(8.f)});
+            ImGui::PushStyleColor(ImGuiCol_Text, kTextMuted);
+            ImGui::TextUnformatted("LBM-CFD Solver  \xE2\x80\x94  D3Q19");
+            ImGui::TextUnformatted("Vulkan 1.3  |  BGK + MRT-RLB");
+            ImGui::PopStyleColor();
+            ImGui::Dummy({0, s(6.f)});
+        }
+        EndCard();
     } else {
         // ─── Mode 0: Simulation (default) ────────────────────────────────
         // Geometry
@@ -1399,10 +1494,8 @@ void VulkanEngine::drawUI_Left() {
 
                 float bw = (ImGui::GetContentRegionAvail().x - s(4.f)) * 0.5f;
                 if (ImGui::Button("Browse##bm", {bw, s(24.f)})) {
-#ifdef _WIN32
                     auto path = openFileDialog();
                     if (!path.empty()) { snprintf(meshPath_,512,"%s",path.c_str()); loadMesh(meshPath_); }
-#endif
                 }
                 ImGui::SameLine(0, s(4.f));
                 ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4{0.18f,0.04f,0.04f,1.f});
@@ -1427,10 +1520,8 @@ void VulkanEngine::drawUI_Left() {
 
                 ImGui::Dummy({0, s(4.f)});
                 if (ImGui::Button("Browse Model...", {-1, s(28.f)})) {
-#ifdef _WIN32
                     auto path = openFileDialog();
                     if (!path.empty()) { snprintf(meshPath_,512,"%s",path.c_str()); loadMesh(meshPath_); }
-#endif
                 }
             }
 
