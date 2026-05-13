@@ -1,0 +1,93 @@
+#version 450
+// ============================================================================
+// Aero Forces Integration Compute Shader
+// ============================================================================
+// For each fluid cell adjacent to a solid, accumulates the pressure force
+// contribution onto the obstacle surface.
+//
+// Uses a two-level parallel reduction:
+//   - Each workgroup (256 threads) handles a grid-stride chunk and reduces
+//     to a single vec3 using shared memory.
+//   - 256 partial results written to partial_out[], summed on CPU.
+//
+// Output layout: partial_out[groupIdx * 4 + {0,1,2,3}] = {drag, lift, side, count}
+// ============================================================================
+
+layout(local_size_x=256, local_size_y=1, local_size_z=1) in;
+
+layout(push_constant) uniform PC {
+    uint  gridX, gridY, gridZ;
+    float inletVelX;
+} pc;
+
+layout(std430, set=0, binding=0) readonly  buffer Mac     { float macro[]; };
+layout(std430, set=0, binding=1) readonly  buffer Obs     { uint obstacle[]; };
+layout(std430, set=0, binding=2) writeonly buffer PartOut { float partial_out[]; };
+
+shared vec4 sData[256];  // (drag, lift, side, count)
+
+uint cIdx(uint x, uint y, uint z) {
+    return z*pc.gridX*pc.gridY + y*pc.gridX + x;
+}
+
+// Face normals for the 6 cardinal neighbours
+const ivec3 faceDir[6] = ivec3[6](
+    ivec3(-1,0,0), ivec3(1,0,0),
+    ivec3(0,-1,0), ivec3(0,1,0),
+    ivec3(0,0,-1), ivec3(0,0,1)
+);
+
+void main() {
+    uint tid  = gl_LocalInvocationIndex;
+    uint gid  = gl_WorkGroupID.x;
+    uint total = pc.gridX * pc.gridY * pc.gridZ;
+    uint stride = gl_NumWorkGroups.x * 256u;
+
+    vec4 local = vec4(0.0);
+
+    for (uint cell = gid*256u + tid; cell < total; cell += stride) {
+        // Only process fluid cells adjacent to solid
+        if (obstacle[cell] != 0u) continue;
+
+        uint z =  cell / (pc.gridX*pc.gridY);
+        uint r =  cell % (pc.gridX*pc.gridY);
+        uint y =  r / pc.gridX;
+        uint x =  r % pc.gridX;
+
+        float pressure = macro[cell*4u + 0u] / 3.0; // p = rho*cs^2 = rho/3
+
+        for (int f = 0; f < 6; f++) {
+            int nx = int(x) + faceDir[f].x;
+            int ny = int(y) + faceDir[f].y;
+            int nz = int(z) + faceDir[f].z;
+            if (nx<0||ny<0||nz<0||uint(nx)>=pc.gridX||uint(ny)>=pc.gridY||uint(nz)>=pc.gridZ)
+                continue;
+            uint ni = cIdx(uint(nx),uint(ny),uint(nz));
+            if (obstacle[ni] == 0u) continue;
+
+            // Surface normal points from solid → fluid = -faceDir
+            vec3 n = -vec3(faceDir[f]);
+            // Force contribution: F = p * n * dA (dA=1 lattice unit)
+            local.x += pressure * n.x;  // drag (along X, flow direction)
+            local.y += pressure * n.y;  // lift (along Y)
+            local.z += pressure * n.z;  // side (along Z)
+            local.w += 1.0;             // surface cell count
+        }
+    }
+
+    sData[tid] = local;
+    barrier();
+
+    // Parallel reduction within workgroup
+    for (uint s=128u; s>0u; s>>=1u) {
+        if (tid < s) sData[tid] += sData[tid+s];
+        barrier();
+    }
+
+    if (tid == 0u) {
+        partial_out[gid*4u+0u] = sData[0].x;
+        partial_out[gid*4u+1u] = sData[0].y;
+        partial_out[gid*4u+2u] = sData[0].z;
+        partial_out[gid*4u+3u] = sData[0].w;
+    }
+}

@@ -1,281 +1,183 @@
 #version 450
 // ============================================================================
-// D3Q19 Lattice Boltzmann Method — Compute Shader (Pull Scheme)
-// ============================================================================
-// Each thread handles one lattice cell (x, y, z).
-// Algorithm: Pull (Gather) -> Collide (BGK) -> Store
-// This eliminates race conditions entirely: 1 thread = 1 write location.
+// D3Q19 LBM Compute Shader — Pull scheme
+// Supports BGK and MRT-Regularized collision operators.
+// SoA layout: f[q * totalCells + cellIdx]
 // ============================================================================
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
 
-// ─── Push Constants ─────────────────────────────────────────────────────
-layout(push_constant) uniform PushConstants {
-    uint  gridX;        // Grid dimension X
-    uint  gridY;        // Grid dimension Y
-    uint  gridZ;        // Grid dimension Z
-    float tau;          // Relaxation time (viscosity = cs^2 * (tau - 0.5*dt))
-    float inletVelX;    // Inlet velocity X component
-    float inletVelY;    // Inlet velocity Y component
-    float inletVelZ;    // Inlet velocity Z component
-    float time;         // Global time step counter
-    float turbulence;   // Turbulence intensity
-    float s_bulk;       // MRT Bulk relaxation
-    float s_ghost;      // MRT Ghost damping
-    uint  lbmMode;      // 0 = BGK, 1 = MRT
+layout(push_constant) uniform PC {
+    uint  gridX, gridY, gridZ;
+    float tau;
+    float inletVelX, inletVelY, inletVelZ;
+    float time;
+    float turbulence;
+    float s_bulk, s_ghost;
+    uint  lbmMode;
 } pc;
 
-// ─── Buffers ────────────────────────────────────────────────────────────
-// Distribution functions: 19 floats per cell, linearized as [q * totalCells + cellIndex]
-layout(std430, set = 0, binding = 0) readonly  buffer FIn     { float f_in[];  };
-layout(std430, set = 0, binding = 1) writeonly buffer FOut    { float f_out[]; };
-// Obstacle map: 1 byte per cell, 0 = fluid, 1 = solid boundary
-layout(std430, set = 0, binding = 2) readonly  buffer Obstacle { uint obstacle[]; };
-// Macroscopic output: density (1 float) + velocity (3 floats) per cell = 4 floats
-layout(std430, set = 0, binding = 3) writeonly buffer MacroOut { float macro_out[]; };
+layout(std430, set=0, binding=0) readonly  buffer FIn  { float f_in[]; };
+layout(std430, set=0, binding=1) writeonly buffer FOut { float f_out[]; };
+layout(std430, set=0, binding=2) readonly  buffer Obs  { uint obstacle[]; };
+layout(std430, set=0, binding=3) writeonly buffer Mac  { float macro[]; };
 
-// ─── D3Q19 Constants ────────────────────────────────────────────────────
-// Lattice velocity vectors e_i for D3Q19
+// D3Q19 lattice velocities
 const ivec3 e[19] = ivec3[19](
-    ivec3( 0,  0,  0),   // 0:  rest
-    ivec3( 1,  0,  0),   // 1:  +x
-    ivec3(-1,  0,  0),   // 2:  -x
-    ivec3( 0,  1,  0),   // 3:  +y
-    ivec3( 0, -1,  0),   // 4:  -y
-    ivec3( 0,  0,  1),   // 5:  +z
-    ivec3( 0,  0, -1),   // 6:  -z
-    ivec3( 1,  1,  0),   // 7:  +x+y
-    ivec3(-1,  1,  0),   // 8:  -x+y
-    ivec3( 1, -1,  0),   // 9:  +x-y
-    ivec3(-1, -1,  0),   // 10: -x-y
-    ivec3( 1,  0,  1),   // 11: +x+z
-    ivec3(-1,  0,  1),   // 12: -x+z
-    ivec3( 1,  0, -1),   // 13: +x-z
-    ivec3(-1,  0, -1),   // 14: -x-z
-    ivec3( 0,  1,  1),   // 15: +y+z
-    ivec3( 0, -1,  1),   // 16: -y+z
-    ivec3( 0,  1, -1),   // 17: +y-z
-    ivec3( 0, -1, -1)    // 18: -y-z
+    ivec3( 0, 0, 0),
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1, 1, 0), ivec3(-1, 1, 0),
+    ivec3( 1,-1, 0), ivec3(-1,-1, 0),
+    ivec3( 1, 0, 1), ivec3(-1, 0, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0,-1),
+    ivec3( 0, 1, 1), ivec3( 0,-1, 1),
+    ivec3( 0, 1,-1), ivec3( 0,-1,-1)
 );
 
-// Weights for D3Q19
 const float w[19] = float[19](
-    1.0 / 3.0,                                          // rest
-    1.0 / 18.0, 1.0 / 18.0, 1.0 / 18.0,               // face neighbors
-    1.0 / 18.0, 1.0 / 18.0, 1.0 / 18.0,
-    1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0,               // edge neighbors
-    1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0,
-    1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0,
-    1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0
+    1.0/3.0,
+    1.0/18.0, 1.0/18.0, 1.0/18.0, 1.0/18.0, 1.0/18.0, 1.0/18.0,
+    1.0/36.0, 1.0/36.0, 1.0/36.0, 1.0/36.0,
+    1.0/36.0, 1.0/36.0, 1.0/36.0, 1.0/36.0,
+    1.0/36.0, 1.0/36.0, 1.0/36.0, 1.0/36.0
 );
 
-// Opposite direction indices for bounce-back
-const int opposite[19] = int[19](
-    0,  2,  1,  4,  3,  6,  5,
-    10, 9,  8,  7,
-    14, 13, 12, 11,
-    18, 17, 16, 15
-);
+const int opp[19] = int[19](0, 2,1, 4,3, 6,5, 10,9,8,7, 14,13,12,11, 18,17,16,15);
 
-// ─── Helper Functions ───────────────────────────────────────────────────
-uint cellIndex(uint x, uint y, uint z) {
-    return z * pc.gridX * pc.gridY + y * pc.gridX + x;
+uint cellIdx(uint x, uint y, uint z) {
+    return z*pc.gridX*pc.gridY + y*pc.gridX + x;
+}
+uint distIdx(uint q, uint cell) {
+    return q*pc.gridX*pc.gridY*pc.gridZ + cell;
 }
 
-uint distIndex(uint q, uint cellIdx) {
-    return q * pc.gridX * pc.gridY * pc.gridZ + cellIdx;
-}
-
-// Read obstacle flag. Obstacle buffer is packed as uint32, 1 flag per uint.
-bool isSolid(uint cellIdx) {
-    return obstacle[cellIdx] != 0u;
-}
-
-// Compute equilibrium distribution for direction q
 float feq(uint q, float rho, vec3 u) {
-    float eu = float(e[q].x) * u.x + float(e[q].y) * u.y + float(e[q].z) * u.z;
-    float usq = dot(u, u);
-    // f_eq = w_i * rho * (1 + 3*e_i.u + 4.5*(e_i.u)^2 - 1.5*u.u)
-    return w[q] * rho * (1.0 + 3.0 * eu + 4.5 * eu * eu - 1.5 * usq);
+    float eu = float(e[q].x)*u.x + float(e[q].y)*u.y + float(e[q].z)*u.z;
+    return w[q]*rho*(1.0 + 3.0*eu + 4.5*eu*eu - 1.5*dot(u,u));
 }
 
-// ─── Main Kernel ────────────────────────────────────────────────────────
+// Simple hash for reproducible per-cell turbulence noise
+float hash(float n) { return fract(sin(n)*43758.5453123); }
+
 void main() {
     uvec3 gid = gl_GlobalInvocationID;
-    uint x = gid.x;
-    uint y = gid.y;
-    uint z = gid.z;
+    if (gid.x>=pc.gridX || gid.y>=pc.gridY || gid.z>=pc.gridZ) return;
 
-    // Bounds check
-    if (x >= pc.gridX || y >= pc.gridY || z >= pc.gridZ) return;
+    uint x=gid.x, y=gid.y, z=gid.z;
+    uint idx = cellIdx(x,y,z);
 
-    uint idx = cellIndex(x, y, z);
-
-    // ── Step 1: Pull (Stream) ───────────────────────────────────────
-    // For each direction q, read from the upstream neighbor.
+    // ── Pull / Stream ──────────────────────────────────────────────────────
     float f[19];
     for (uint q = 0; q < 19; q++) {
-        // Source cell: where the distribution is coming FROM
         int sx = int(x) - e[q].x;
         int sy = int(y) - e[q].y;
         int sz = int(z) - e[q].z;
 
-        // Boundary handling: periodic or inlet/outlet
-        if (sx < 0) {
-            // Left boundary (inlet): use Zou-He velocity boundary
-            sx = 0;
-        } else if (sx >= int(pc.gridX)) {
-            // Right boundary (outlet): extrapolate (copy from last interior cell)
-            sx = int(pc.gridX) - 1;
-        }
+        // X: inlet at 0, outlet at gridX-1
+        if      (sx < 0)           sx = 0;
+        else if (sx >= int(pc.gridX)) sx = int(pc.gridX)-1;
 
-        if (sy < 0)               sy = int(pc.gridY) - 1;  // Periodic top/bottom
-        if (sy >= int(pc.gridY))   sy = 0;
-        if (sz < 0)               sz = int(pc.gridZ) - 1;  // Periodic front/back
-        if (sz >= int(pc.gridZ))   sz = 0;
+        // Y/Z: periodic
+        if      (sy < 0)           sy += int(pc.gridY);
+        else if (sy >= int(pc.gridY)) sy -= int(pc.gridY);
+        if      (sz < 0)           sz += int(pc.gridZ);
+        else if (sz >= int(pc.gridZ)) sz -= int(pc.gridZ);
 
-        uint srcIdx = cellIndex(uint(sx), uint(sy), uint(sz));
-        f[q] = f_in[distIndex(q, srcIdx)];
+        f[q] = f_in[distIdx(q, cellIdx(uint(sx),uint(sy),uint(sz)))];
     }
 
-    // ── Step 2: Boundary Conditions ─────────────────────────────────
-    // Bounce-back for solid obstacles
-    if (isSolid(idx)) {
-        // Simple bounce-back: swap incoming/outgoing directions
-        for (uint q = 0; q < 19; q++) {
-            f_out[distIndex(q, idx)] = f[opposite[q]];
-        }
-        // Write zero velocity for solid cells
-        macro_out[idx * 4 + 0] = 1.0;  // density
-        macro_out[idx * 4 + 1] = 0.0;  // vx
-        macro_out[idx * 4 + 2] = 0.0;  // vy
-        macro_out[idx * 4 + 3] = 0.0;  // vz
+    // ── Bounce-back for solid cells ────────────────────────────────────────
+    if (obstacle[idx] != 0u) {
+        for (uint q = 0; q < 19; q++)
+            f_out[distIdx(q, idx)] = f[opp[q]];
+        macro[idx*4+0] = 1.0;
+        macro[idx*4+1] = macro[idx*4+2] = macro[idx*4+3] = 0.0;
         return;
     }
 
-    // ── Step 3: Compute macroscopic quantities ──────────────────────
+    // ── Macroscopic quantities ─────────────────────────────────────────────
     float rho = 0.0;
-    vec3  u   = vec3(0.0);
+    vec3  u   = vec3(0);
     for (uint q = 0; q < 19; q++) {
-        rho += f[q];
-        u.x += float(e[q].x) * f[q];
-        u.y += float(e[q].y) * f[q];
-        u.z += float(e[q].z) * f[q];
+        rho   += f[q];
+        u.x   += float(e[q].x)*f[q];
+        u.y   += float(e[q].y)*f[q];
+        u.z   += float(e[q].z)*f[q];
     }
-    
-    // STABILITY LIMITER: Prevent divide-by-zero or NaNs
-    if (rho < 0.1 || rho > 10.0 || isnan(rho)) rho = 1.0;
+    rho = clamp(rho, 0.5, 2.0);
     u /= rho;
+    // Lattice Mach limit: |u| < 0.577*c_s ≈ 0.4 for stability
+    float umag = length(u);
+    if (umag > 0.45) u *= 0.45/umag;
 
-    // STABILITY LIMITER: Clamp velocity magnitude to physically valid lattice range (< 1.0)
-    // Most LBM models diverge above Mach 0.7 (u ~ 0.4)
-    float u_mag = length(u);
-    if (u_mag > 0.5 || isnan(u_mag)) {
-        if (u_mag > 0.0001) u = (u / u_mag) * 0.5;
-        else u = vec3(0.0);
-    }
-
-    // ── Step 4: Inlet boundary (Zou-He style) ───────────────────────
-    if (x == 0) {
-        vec3 targetU = vec3(pc.inletVelX, pc.inletVelY, pc.inletVelZ);
-        
+    // ── Zou-He inlet (x=0) ────────────────────────────────────────────────
+    if (x == 0u) {
+        vec3 tu = vec3(pc.inletVelX, pc.inletVelY, pc.inletVelZ);
         if (pc.turbulence > 0.0) {
-            float t = pc.time * 0.1;
-            float noiseY = sin(float(y) * 0.5 + t) * cos(float(z) * 0.3 + t * 0.5);
-            float noiseZ = cos(float(y) * 0.4 - t * 0.8) * sin(float(z) * 0.6 - t * 1.2);
-            targetU.y += noiseY * pc.turbulence;
-            targetU.z += noiseZ * pc.turbulence;
+            float t  = pc.time * 0.08;
+            float ny = hash(float(y)*13.7 + t) * 2.0 - 1.0;
+            float nz = hash(float(z)*17.3 + t*1.3) * 2.0 - 1.0;
+            tu.y += ny * pc.turbulence;
+            tu.z += nz * pc.turbulence;
         }
-
-        u   = targetU;
-        rho = 1.0;  // Fixed density at inlet
-        // Recompute distributions to equilibrium at inlet
-        for (uint q = 0; q < 19; q++) {
-            f[q] = feq(q, rho, u);
-        }
+        u = tu; rho = 1.0;
+        for (uint q = 0; q < 19; q++) f[q] = feq(q, rho, u);
     }
 
-    // ── Step 5: Outlet boundary (extrapolation) ─────────────────────
-    if (x == pc.gridX - 1) {
-        // Copy from one cell upstream to allow free outflow
-        uint upstreamIdx = cellIndex(x - 1, y, z);
-        rho = 0.0;
-        u = vec3(0.0);
-        for (uint q = 0; q < 19; q++) {
-            float fu = f_in[distIndex(q, upstreamIdx)];
-            f[q] = fu;
-            rho += fu;
-            u.x += float(e[q].x) * fu;
-            u.y += float(e[q].y) * fu;
-            u.z += float(e[q].z) * fu;
+    // ── Zero-gradient outlet (x=gridX-1) ──────────────────────────────────
+    if (x == pc.gridX - 1u) {
+        uint up = cellIdx(x-1u, y, z);
+        float r2=0; vec3 u2=vec3(0);
+        for (uint q=0;q<19;q++){
+            float fv=f_in[distIdx(q,up)];
+            f[q]=fv; r2+=fv;
+            u2.x+=float(e[q].x)*fv;
+            u2.y+=float(e[q].y)*fv;
+            u2.z+=float(e[q].z)*fv;
         }
-        if (rho > 0.01) u /= rho;
-        else { rho = 1.0; u = vec3(0.0); }
+        rho = (r2>0.01) ? r2 : 1.0;
+        u   = (r2>0.01) ? u2/r2 : vec3(0);
     }
 
-    // ── Step 6: Collision ───────────────────────────────────────────
-    if (pc.lbmMode == 1) { // ADVANCED STABILITY MODE (Recursive Regularized / MRT Hybrid)
-        // 1. Compute non-equilibrium distribution (f_neq = f - f_eq)
-        float f_neq[19];
-        float rho_val = rho;
-        vec3 u_val = u;
-        for (int q = 0; q < 19; q++) {
-            f_neq[q] = f[q] - feq(q, rho_val, u_val);
+    // ── Collision ─────────────────────────────────────────────────────────
+    if (pc.lbmMode == 1u) {
+        // MRT-Regularized (RLB): projects f_neq onto stress tensor, then relaxes
+        float s_v = 1.0 / pc.tau;
+        float s_g = pc.s_ghost;
+        float Pxx=0,Pyy=0,Pzz=0,Pxy=0,Pyz=0,Pzx=0;
+        for (int q=0;q<19;q++) {
+            float fn = f[q] - feq(q, rho, u);
+            Pxx += fn * float(e[q].x*e[q].x);
+            Pyy += fn * float(e[q].y*e[q].y);
+            Pzz += fn * float(e[q].z*e[q].z);
+            Pxy += fn * float(e[q].x*e[q].y);
+            Pyz += fn * float(e[q].y*e[q].z);
+            Pzx += fn * float(e[q].z*e[q].x);
         }
-
-        // 2. Project onto Stress Tensor (Non-equilibrium momentum flux)
-        // This is the core of MRT: we treat the physical stress and ghost noise separately.
-        float Pixx = 0, Piyy = 0, Pizz = 0, Pixy = 0, Piyz = 0, Pizx = 0;
-        for (int q = 0; q < 19; q++) {
-            float fn = f_neq[q];
-            Pixx += fn * float(e[q].x * e[q].x);
-            Piyy += fn * float(e[q].y * e[q].y);
-            Pizz += fn * float(e[q].z * e[q].z);
-            Pixy += fn * float(e[q].x * e[q].y);
-            Piyz += fn * float(e[q].y * e[q].z);
-            Pizx += fn * float(e[q].z * e[q].x);
+        for (uint q=0;q<19;q++) {
+            float feqv = feq(q,rho,u);
+            float Qq = (float(e[q].x*e[q].x)-1.0/3.0)*Pxx
+                     + (float(e[q].y*e[q].y)-1.0/3.0)*Pyy
+                     + (float(e[q].z*e[q].z)-1.0/3.0)*Pzz
+                     + 2.0*(float(e[q].x*e[q].y)*Pxy + float(e[q].y*e[q].z)*Pyz + float(e[q].z*e[q].x)*Pzx);
+            float freg  = w[q]*1.5*Qq;
+            float fneqv = f[q] - feqv;
+            float fv    = feqv + (1.0-s_v)*freg + (1.0-s_g)*(fneqv-freg);
+            f_out[distIdx(q,idx)] = isnan(fv) ? w[q]*rho : fv;
         }
-
-        // 3. Relax Stress and Ghost moments independently
-        float s_v = 1.0 / pc.tau;      // Relaxation for stress (viscosity)
-        float s_g = pc.s_ghost;        // Relaxation for ghost moments (noise damping)
-        float s_b = pc.s_bulk;         // Relaxation for bulk/energy
-
-        // Reconstruct f_out using the Regularized form
-        // This is much more stable than raw MRT matrix multiplication
-        for (uint q = 0; q < 19; q++) {
-            float f_eq = feq(q, rho_val, u_val);
-            
-            // Physical stress contribution (relaxed by s_v)
-            float Qq = (float(e[q].x * e[q].x) - 1.0/3.0) * Pixx + 
-                       (float(e[q].y * e[q].y) - 1.0/3.0) * Piyy + 
-                       (float(e[q].z * e[q].z) - 1.0/3.0) * Pizz +
-                       2.0 * (float(e[q].x * e[q].y) * Pixy + 
-                              float(e[q].y * e[q].z) * Piyz + 
-                              float(e[q].z * e[q].x) * Pizx);
-            
-            float f_reg = w[q] * 1.5 * Qq;
-            
-            // Final distribution: f_eq + (1-s_v)*f_reg + (1-s_g)*f_remainder
-            float f_new = f_eq + (1.0 - s_v) * f_reg + (1.0 - s_g) * (f_neq[q] - f_reg);
-            
-            if (isnan(f_new)) f_new = w[q] * rho_val;
-            f_out[distIndex(q, idx)] = f_new;
-        }
-
-    } else { // BGK MODE (Legacy)
+    } else {
+        // BGK
         float omega = 1.0 / pc.tau;
-        for (uint q = 0; q < 19; q++) {
-            float f_eq = feq(q, rho, u);
-            float f_new = f[q] - omega * (f[q] - f_eq);
-            if (isnan(f_new)) f_new = w[q] * rho;
-            f_out[distIndex(q, idx)] = f_new;
+        for (uint q=0;q<19;q++) {
+            float fv = f[q] - omega*(f[q]-feq(q,rho,u));
+            f_out[distIdx(q,idx)] = isnan(fv) ? w[q]*rho : fv;
         }
     }
 
-    // ── Step 7: Write macroscopic output ────────────────────────────
-    macro_out[idx * 4 + 0] = rho;
-    macro_out[idx * 4 + 1] = u.x;
-    macro_out[idx * 4 + 2] = u.y;
-    macro_out[idx * 4 + 3] = u.z;
+    macro[idx*4+0] = rho;
+    macro[idx*4+1] = u.x;
+    macro[idx*4+2] = u.y;
+    macro[idx*4+3] = u.z;
 }

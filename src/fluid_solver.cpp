@@ -1,5 +1,5 @@
 // ============================================================================
-// fluid_solver.cpp — GPU-accelerated D3Q19 LBM Fluid Solver (Vulkan Compute)
+// fluid_solver.cpp — GPU D3Q19 LBM + Aero Force Integration
 // ============================================================================
 
 #include "fluid_solver.h"
@@ -9,39 +9,13 @@
 
 namespace vwt {
 
-// ════════════════════════════════════════════════════════════════════════
-// Helper: Create a GPU buffer via VMA
-// ════════════════════════════════════════════════════════════════════════
-static AllocatedBuffer createBuffer(VmaAllocator allocator, VkDeviceSize size,
-                                     VkBufferUsageFlags usage,
-                                     VmaMemoryUsage memUsage)
-{
-    VkBufferCreateInfo bufferInfo{};
-    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferInfo.size  = size;
-    bufferInfo.usage = usage;
-
-    VmaAllocationCreateInfo allocInfo{};
-    allocInfo.usage = memUsage;
-
-    AllocatedBuffer buf;
-    buf.size = size;
-    VkResult res = vmaCreateBuffer(allocator, &bufferInfo, &allocInfo,
-                                    &buf.buffer, &buf.allocation, nullptr);
-    if (res != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create buffer (VMA)");
-    }
-    return buf;
-}
-
-// ════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
 // Initialization
-// ════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
 
 void FluidSolver::init(VkDevice device, VmaAllocator allocator,
-                        VkQueue computeQueue, uint32_t computeQueueFamily,
-                        VkPipelineCache pipelineCache,
-                        const SimParams& params)
+                       VkQueue computeQueue, uint32_t computeQueueFamily,
+                       VkPipelineCache pipelineCache, const SimParams& params)
 {
     device_        = device;
     allocator_     = allocator;
@@ -52,351 +26,395 @@ void FluidSolver::init(VkDevice device, VmaAllocator allocator,
     gridY_         = params.gridY;
     gridZ_         = params.gridZ;
 
+    // Query timestamp period
+    VkPhysicalDevice physDev;
+    {
+        VmaAllocatorInfo info;
+        vmaGetAllocatorInfo(allocator_, &info);
+        physDev = info.physicalDevice;
+    }
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(physDev, &props);
+    timestampPeriodNs_ = props.limits.timestampPeriod;
+
     createCommandPool();
     createBuffers();
     createDescriptorSets();
-    createPipeline();
+    createLBMPipeline();
+    createAeroPipeline();
+    createTimestampPool();
     resetToEquilibrium();
 
-    std::cout << "[FluidSolver] Initialized Grid: " << gridX_ << "x" << gridY_ << "x" << gridZ_ << "\n";
-
-    size_t totalMB = (fBufferA_.size + fBufferB_.size + obstacleBuffer_.size
-                     + macroBuffer_.size) / (1024 * 1024);
-    std::cout << "[FluidSolver] GPU memory allocated: ~" << totalMB << " MB\n";
+    size_t totalMB = (fBufferA_.size + fBufferB_.size +
+                      obstacleBuffer_.size + macroBuffer_.size) / (1024*1024);
+    std::cout << "[FluidSolver] Grid " << gridX_ << "x" << gridY_ << "x" << gridZ_
+              << "  GPU mem ~" << totalMB << " MB\n";
 }
 
-void FluidSolver::destroy() {
-    deletionQueue_.flush();
-}
+void FluidSolver::destroy() { deletionQueue_.flush(); }
 
-void FluidSolver::createCommandPool() {
-    VkCommandPoolCreateInfo poolInfo{};
-    poolInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO; // WRONG sType detected below, fixing
-    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    poolInfo.queueFamilyIndex = queueFamily_;
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    vkCreateCommandPool(device_, &poolInfo, nullptr, &transferPool_);
+// ════════════════════════════════════════════════════════════════════════════
+// One-shot command helper
+// ════════════════════════════════════════════════════════════════════════════
 
-    deletionQueue_.push([this]() {
-        vkDestroyCommandPool(device_, transferPool_, nullptr);
-    });
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// Buffer Creation
-// ════════════════════════════════════════════════════════════════════════
-
-void FluidSolver::createBuffers() {
-    size_t cells = totalCells();
-    
-    // Distribution functions: 19 floats per cell
-    VkDeviceSize fSize = cells * 19 * sizeof(float);
-    
-    // Obstacle map: 1 uint32 per cell
-    VkDeviceSize obsSize = cells * sizeof(uint32_t);
-    
-    // Macroscopic output: 4 floats (rho, ux, uy, uz) per cell
-    VkDeviceSize macroSize = cells * 4 * sizeof(float);
-
-    VkBufferUsageFlags storageUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-                                    | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-
-    fBufferA_       = createBuffer(allocator_, fSize, storageUsage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
-    fBufferB_       = createBuffer(allocator_, fSize, storageUsage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
-    obstacleBuffer_ = createBuffer(allocator_, obsSize, storageUsage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
-    macroBuffer_    = createBuffer(allocator_, macroSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
-
-    // Staging buffer: HOST_ACCESS_SEQUENTIAL_WRITE is the correct flag for write-once staging
-    VkBufferCreateInfo stagingBufInfo{};
-    stagingBufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    stagingBufInfo.size  = std::max({fSize, obsSize, macroSize});
-    stagingBufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-
-    VmaAllocationCreateInfo stagingAllocInfo{};
-    stagingAllocInfo.usage = VMA_MEMORY_USAGE_AUTO;
-    stagingAllocInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
-                           | VMA_ALLOCATION_CREATE_MAPPED_BIT;
-    stagingBuffer_.size = stagingBufInfo.size;
-    vmaCreateBuffer(allocator_, &stagingBufInfo, &stagingAllocInfo,
-                    &stagingBuffer_.buffer, &stagingBuffer_.allocation, nullptr);
-
-    deletionQueue_.push([this]() {
-        vmaDestroyBuffer(allocator_, fBufferA_.buffer, fBufferA_.allocation);
-        vmaDestroyBuffer(allocator_, fBufferB_.buffer, fBufferB_.allocation);
-        vmaDestroyBuffer(allocator_, obstacleBuffer_.buffer, obstacleBuffer_.allocation);
-        vmaDestroyBuffer(allocator_, macroBuffer_.buffer, macroBuffer_.allocation);
-        vmaDestroyBuffer(allocator_, stagingBuffer_.buffer, stagingBuffer_.allocation);
-    });
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// Descriptor Sets (for ping-pong buffer binding)
-// ════════════════════════════════════════════════════════════════════════
-
-void FluidSolver::createDescriptorSets() {
-    // Bindings: 0 = f_in, 1 = f_out, 2 = obstacle, 3 = macro_out
-    std::array<VkDescriptorSetLayoutBinding, 4> bindings{};
-    for (uint32_t i = 0; i < 4; ++i) {
-        bindings[i].binding         = i;
-        bindings[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        bindings[i].descriptorCount = 1;
-        bindings[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-    }
-
-    VkDescriptorSetLayoutCreateInfo layoutInfo{};
-    layoutInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
-    layoutInfo.pBindings    = bindings.data();
-    vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &descriptorLayout_);
-
-    // Pool: 2 sets, 8 storage buffer descriptors total
-    VkDescriptorPoolSize poolSize{};
-    poolSize.type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = 8;
-
-    VkDescriptorPoolCreateInfo poolInfo{};
-    poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.maxSets       = 2;
-    poolInfo.poolSizeCount = 1;
-    poolInfo.pPoolSizes    = &poolSize;
-    vkCreateDescriptorPool(device_, &poolInfo, nullptr, &descriptorPool_);
-
-    // Allocate 2 descriptor sets
-    VkDescriptorSetLayout layouts[2] = { descriptorLayout_, descriptorLayout_ };
-    VkDescriptorSetAllocateInfo allocInfo{};
-    allocInfo.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    allocInfo.descriptorPool     = descriptorPool_;
-    allocInfo.descriptorSetCount = 2;
-    allocInfo.pSetLayouts        = layouts;
-
-    VkDescriptorSet sets[2];
-    vkAllocateDescriptorSets(device_, &allocInfo, sets);
-    descriptorSetA_ = sets[0]; // A=in,  B=out
-    descriptorSetB_ = sets[1]; // B=in,  A=out
-
-    // Write descriptor set A: f_in=A, f_out=B
-    auto writeBufferDescriptor = [&](VkDescriptorSet set, uint32_t binding,
-                                     VkBuffer buffer, VkDeviceSize size) {
-        VkDescriptorBufferInfo bufInfo{};
-        bufInfo.buffer = buffer;
-        bufInfo.offset = 0;
-        bufInfo.range  = size;
-
-        VkWriteDescriptorSet write{};
-        write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write.dstSet          = set;
-        write.dstBinding      = binding;
-        write.descriptorCount = 1;
-        write.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        write.pBufferInfo     = &bufInfo;
-        vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
-    };
-
-    size_t cells = totalCells();
-    VkDeviceSize fSize    = cells * 19 * sizeof(float);
-    VkDeviceSize obsSize  = cells * sizeof(uint32_t);
-    VkDeviceSize macSize  = cells * 4 * sizeof(float);
-
-    // Set A: in=A, out=B
-    writeBufferDescriptor(descriptorSetA_, 0, fBufferA_.buffer, fSize);
-    writeBufferDescriptor(descriptorSetA_, 1, fBufferB_.buffer, fSize);
-    writeBufferDescriptor(descriptorSetA_, 2, obstacleBuffer_.buffer, obsSize);
-    writeBufferDescriptor(descriptorSetA_, 3, macroBuffer_.buffer, macSize);
-
-    // Set B: in=B, out=A (swapped)
-    writeBufferDescriptor(descriptorSetB_, 0, fBufferB_.buffer, fSize);
-    writeBufferDescriptor(descriptorSetB_, 1, fBufferA_.buffer, fSize);
-    writeBufferDescriptor(descriptorSetB_, 2, obstacleBuffer_.buffer, obsSize);
-    writeBufferDescriptor(descriptorSetB_, 3, macroBuffer_.buffer, macSize);
-
-    deletionQueue_.push([this]() {
-        vkDestroyDescriptorPool(device_, descriptorPool_, nullptr);
-        vkDestroyDescriptorSetLayout(device_, descriptorLayout_, nullptr);
-    });
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// Compute Pipeline
-// ════════════════════════════════════════════════════════════════════════
-
-void FluidSolver::createPipeline() {
-    // Load SPIR-V
-    auto spirv = loadShaderModule("shaders/fluid_lbm.comp.spv");
-
-    VkShaderModuleCreateInfo shaderInfo{};
-    shaderInfo.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    shaderInfo.codeSize = spirv.size() * sizeof(uint32_t);
-    shaderInfo.pCode    = spirv.data();
-
-    VkShaderModule shaderModule;
-    vkCreateShaderModule(device_, &shaderInfo, nullptr, &shaderModule);
-
-    // Push constant range for LBM parameters
-    VkPushConstantRange pushRange{};
-    pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    pushRange.offset     = 0;
-    pushRange.size       = sizeof(LBMPushConstants);
-
-    VkPipelineLayoutCreateInfo layoutInfo{};
-    layoutInfo.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    layoutInfo.setLayoutCount         = 1;
-    layoutInfo.pSetLayouts            = &descriptorLayout_;
-    layoutInfo.pushConstantRangeCount = 1;
-    layoutInfo.pPushConstantRanges    = &pushRange;
-    vkCreatePipelineLayout(device_, &layoutInfo, nullptr, &pipelineLayout_);
-
-    VkComputePipelineCreateInfo pipelineInfo{};
-    pipelineInfo.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    pipelineInfo.layout = pipelineLayout_;
-    pipelineInfo.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    pipelineInfo.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-    pipelineInfo.stage.module = shaderModule;
-    pipelineInfo.stage.pName  = "main";
-
-    vkCreateComputePipelines(device_, pipelineCache_, 1, &pipelineInfo, nullptr, &pipeline_);
-
-    vkDestroyShaderModule(device_, shaderModule, nullptr);
-
-    deletionQueue_.push([this]() {
-        vkDestroyPipeline(device_, pipeline_, nullptr);
-        vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
-    });
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// Upload Obstacle Map
-// ════════════════════════════════════════════════════════════════════════
-
-void FluidSolver::uploadObstacleMap(const std::vector<uint32_t>& obstacleData) {
-    VkDeviceSize dataSize = obstacleData.size() * sizeof(uint32_t);
-    assert(dataSize <= stagingBuffer_.size);
-
-    // Use the persistently-mapped pointer (VMA_ALLOCATION_CREATE_MAPPED_BIT)
-    void* mapped = nullptr;
-    vmaGetAllocationInfo(allocator_, stagingBuffer_.allocation,
-                         reinterpret_cast<VmaAllocationInfo*>(&mapped));
-    VmaAllocationInfo allocInfo;
-    vmaGetAllocationInfo(allocator_, stagingBuffer_.allocation, &allocInfo);
-    std::memcpy(allocInfo.pMappedData, obstacleData.data(), dataSize);
-
-    VkCommandBufferAllocateInfo cmdAllocInfo{};
-    cmdAllocInfo.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cmdAllocInfo.commandPool        = transferPool_;
-    cmdAllocInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cmdAllocInfo.commandBufferCount = 1;
-
+void FluidSolver::submitOneShot(std::function<void(VkCommandBuffer)>&& record) {
+    VkCommandBufferAllocateInfo ai{};
+    ai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    ai.commandPool        = transferPool_;
+    ai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
     VkCommandBuffer cmd;
-    vkAllocateCommandBuffers(device_, &cmdAllocInfo, &cmd);
+    vkAllocateCommandBuffers(device_, &ai, &cmd);
 
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
-
-    VkBufferCopy copyRegion{};
-    copyRegion.size = dataSize;
-    vkCmdCopyBuffer(cmd, stagingBuffer_.buffer, obstacleBuffer_.buffer, 1, &copyRegion);
-
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+    record(cmd);
     vkEndCommandBuffer(cmd);
 
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers    = &cmd;
-
-    vkQueueSubmit(queue_, 1, &submitInfo, VK_NULL_HANDLE);
+    VkSubmitInfo si{};
+    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers    = &cmd;
+    vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
     vkQueueWaitIdle(queue_);
-
     vkFreeCommandBuffers(device_, transferPool_, 1, &cmd);
-
-    std::cout << "[FluidSolver] Obstacle map uploaded to GPU.\n";
 }
 
-// ════════════════════════════════════════════════════════════════════════
-// Reset distributions to equilibrium (rho=1, u=0)
-// ════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
+// Command pool
+// ════════════════════════════════════════════════════════════════════════════
+
+void FluidSolver::createCommandPool() {
+    VkCommandPoolCreateInfo pi{};
+    pi.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    pi.queueFamilyIndex = queueFamily_;
+    pi.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    VK_CHECK(vkCreateCommandPool(device_, &pi, nullptr, &transferPool_));
+    deletionQueue_.push([this](){ vkDestroyCommandPool(device_, transferPool_, nullptr); });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Buffers
+// ════════════════════════════════════════════════════════════════════════════
+
+void FluidSolver::createBuffers() {
+    size_t cells     = totalCells();
+    VkDeviceSize fSz = cells * 19 * sizeof(float);   // SoA f[q][cell]
+    VkDeviceSize obSz = cells * sizeof(uint32_t);
+    VkDeviceSize macSz = cells * 4 * sizeof(float);  // [rho, ux, uy, uz]
+
+    // GPU-local storage buffers
+    auto makeGpu = [&](VkDeviceSize sz, VkBufferUsageFlags extra) -> AllocatedBuffer {
+        VkBufferCreateInfo bi{};
+        bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bi.size  = sz;
+        bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | extra;
+        VmaAllocationCreateInfo ai{};
+        ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+        AllocatedBuffer buf; buf.size = sz;
+        VK_CHECK(vmaCreateBuffer(allocator_, &bi, &ai, &buf.buffer, &buf.allocation, nullptr));
+        return buf;
+    };
+
+    fBufferA_       = makeGpu(fSz,  0);
+    fBufferB_       = makeGpu(fSz,  0);
+    obstacleBuffer_ = makeGpu(obSz, 0);
+    macroBuffer_    = makeGpu(macSz, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+
+    // Aero partial sums — GPU local
+    VkDeviceSize aeroPartSz = kAeroGroups * 4 * sizeof(float);
+    aeroPartialBuffer_ = makeGpu(aeroPartSz, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+
+    // Aero readback — persistently mapped CPU-visible
+    {
+        VkBufferCreateInfo bi{};
+        bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bi.size  = aeroPartSz;
+        bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        VmaAllocationCreateInfo ai{};
+        ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VmaAllocationInfo allocInfo;
+        aeroReadbackBuffer_.size = aeroPartSz;
+        VK_CHECK(vmaCreateBuffer(allocator_, &bi, &ai,
+            &aeroReadbackBuffer_.buffer, &aeroReadbackBuffer_.allocation, &allocInfo));
+        aeroReadbackBuffer_.mappedPtr = allocInfo.pMappedData;
+    }
+
+    // Persistent-mapped staging buffer
+    VkDeviceSize stgSz = std::max({fSz, obSz, macSz});
+    {
+        VkBufferCreateInfo bi{};
+        bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bi.size  = stgSz;
+        bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        VmaAllocationCreateInfo ai{};
+        ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VmaAllocationInfo allocInfo;
+        stagingBuffer_.size = stgSz;
+        VK_CHECK(vmaCreateBuffer(allocator_, &bi, &ai,
+            &stagingBuffer_.buffer, &stagingBuffer_.allocation, &allocInfo));
+        stagingBuffer_.mappedPtr = allocInfo.pMappedData;
+    }
+
+    deletionQueue_.push([this](){
+        vmaDestroyBuffer(allocator_, fBufferA_.buffer,          fBufferA_.allocation);
+        vmaDestroyBuffer(allocator_, fBufferB_.buffer,          fBufferB_.allocation);
+        vmaDestroyBuffer(allocator_, obstacleBuffer_.buffer,    obstacleBuffer_.allocation);
+        vmaDestroyBuffer(allocator_, macroBuffer_.buffer,       macroBuffer_.allocation);
+        vmaDestroyBuffer(allocator_, aeroPartialBuffer_.buffer, aeroPartialBuffer_.allocation);
+        vmaDestroyBuffer(allocator_, aeroReadbackBuffer_.buffer,aeroReadbackBuffer_.allocation);
+        vmaDestroyBuffer(allocator_, stagingBuffer_.buffer,     stagingBuffer_.allocation);
+    });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Descriptor Sets
+// ════════════════════════════════════════════════════════════════════════════
+
+void FluidSolver::createDescriptorSets() {
+    size_t cells = totalCells();
+    VkDeviceSize fSz   = cells * 19 * sizeof(float);
+    VkDeviceSize obSz  = cells * sizeof(uint32_t);
+    VkDeviceSize macSz = cells * 4 * sizeof(float);
+    VkDeviceSize aeroSz = kAeroGroups * 4 * sizeof(float);
+
+    // ── LBM descriptor layout: 4 bindings (f_in, f_out, obstacle, macro) ──
+    {
+        std::array<VkDescriptorSetLayoutBinding, 4> b{};
+        for (uint32_t i = 0; i < 4; ++i) {
+            b[i].binding        = i;
+            b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            b[i].descriptorCount= 1;
+            b[i].stageFlags     = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo li{};
+        li.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        li.bindingCount = 4;
+        li.pBindings    = b.data();
+        VK_CHECK(vkCreateDescriptorSetLayout(device_, &li, nullptr, &lbmDescLayout_));
+    }
+    {
+        VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 };
+        VkDescriptorPoolCreateInfo pi{};
+        pi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pi.maxSets = 2; pi.poolSizeCount = 1; pi.pPoolSizes = &ps;
+        VK_CHECK(vkCreateDescriptorPool(device_, &pi, nullptr, &lbmDescPool_));
+    }
+    {
+        VkDescriptorSetLayout layouts[2] = { lbmDescLayout_, lbmDescLayout_ };
+        VkDescriptorSetAllocateInfo ai{};
+        ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool = lbmDescPool_; ai.descriptorSetCount = 2; ai.pSetLayouts = layouts;
+        VkDescriptorSet sets[2];
+        VK_CHECK(vkAllocateDescriptorSets(device_, &ai, sets));
+        lbmSetA_ = sets[0]; lbmSetB_ = sets[1];
+    }
+    // Write LBM descriptor sets once (no per-frame updates)
+    auto wb = [&](VkDescriptorSet set, uint32_t binding, VkBuffer buf, VkDeviceSize sz) {
+        VkDescriptorBufferInfo bi{ buf, 0, sz };
+        VkWriteDescriptorSet w{};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = set; w.dstBinding = binding;
+        w.descriptorCount = 1; w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w.pBufferInfo = &bi;
+        vkUpdateDescriptorSets(device_, 1, &w, 0, nullptr);
+    };
+    // SetA: f_in=A, f_out=B
+    wb(lbmSetA_, 0, fBufferA_.buffer, fSz);
+    wb(lbmSetA_, 1, fBufferB_.buffer, fSz);
+    wb(lbmSetA_, 2, obstacleBuffer_.buffer, obSz);
+    wb(lbmSetA_, 3, macroBuffer_.buffer, macSz);
+    // SetB: f_in=B, f_out=A
+    wb(lbmSetB_, 0, fBufferB_.buffer, fSz);
+    wb(lbmSetB_, 1, fBufferA_.buffer, fSz);
+    wb(lbmSetB_, 2, obstacleBuffer_.buffer, obSz);
+    wb(lbmSetB_, 3, macroBuffer_.buffer, macSz);
+
+    // ── Aero descriptor layout: 3 bindings (macro, obstacle, partial_out) ──
+    {
+        std::array<VkDescriptorSetLayoutBinding, 3> b{};
+        for (uint32_t i = 0; i < 3; ++i) {
+            b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo li{};
+        li.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        li.bindingCount = 3; li.pBindings = b.data();
+        VK_CHECK(vkCreateDescriptorSetLayout(device_, &li, nullptr, &aeroDescLayout_));
+    }
+    {
+        VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 };
+        VkDescriptorPoolCreateInfo pi{};
+        pi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pi.maxSets = 1; pi.poolSizeCount = 1; pi.pPoolSizes = &ps;
+        VK_CHECK(vkCreateDescriptorPool(device_, &pi, nullptr, &aeroDescPool_));
+    }
+    {
+        VkDescriptorSetAllocateInfo ai{};
+        ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool = aeroDescPool_; ai.descriptorSetCount = 1; ai.pSetLayouts = &aeroDescLayout_;
+        VK_CHECK(vkAllocateDescriptorSets(device_, &ai, &aeroDescSet_));
+    }
+    wb(aeroDescSet_, 0, macroBuffer_.buffer, macSz);
+    wb(aeroDescSet_, 1, obstacleBuffer_.buffer, obSz);
+    wb(aeroDescSet_, 2, aeroPartialBuffer_.buffer, aeroSz);
+
+    deletionQueue_.push([this](){
+        vkDestroyDescriptorPool(device_, lbmDescPool_,  nullptr);
+        vkDestroyDescriptorSetLayout(device_, lbmDescLayout_, nullptr);
+        vkDestroyDescriptorPool(device_, aeroDescPool_, nullptr);
+        vkDestroyDescriptorSetLayout(device_, aeroDescLayout_, nullptr);
+    });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Pipelines
+// ════════════════════════════════════════════════════════════════════════════
+
+void FluidSolver::createLBMPipeline() {
+    auto spirv = loadShaderModule("shaders/fluid_lbm.comp.spv");
+    VkShaderModuleCreateInfo smi{};
+    smi.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    smi.codeSize = spirv.size() * sizeof(uint32_t); smi.pCode = spirv.data();
+    VkShaderModule sm;
+    VK_CHECK(vkCreateShaderModule(device_, &smi, nullptr, &sm));
+
+    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(LBMPushConstants) };
+    VkPipelineLayoutCreateInfo pli{};
+    pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pli.setLayoutCount = 1; pli.pSetLayouts = &lbmDescLayout_;
+    pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcr;
+    VK_CHECK(vkCreatePipelineLayout(device_, &pli, nullptr, &lbmLayout_));
+
+    VkComputePipelineCreateInfo ci{};
+    ci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    ci.layout = lbmLayout_;
+    ci.stage  = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", nullptr };
+    VK_CHECK(vkCreateComputePipelines(device_, pipelineCache_, 1, &ci, nullptr, &lbmPipeline_));
+    vkDestroyShaderModule(device_, sm, nullptr);
+
+    deletionQueue_.push([this](){
+        vkDestroyPipeline(device_, lbmPipeline_, nullptr);
+        vkDestroyPipelineLayout(device_, lbmLayout_, nullptr);
+    });
+}
+
+void FluidSolver::createAeroPipeline() {
+    auto spirv = loadShaderModule("shaders/aero_forces.comp.spv");
+    VkShaderModuleCreateInfo smi{};
+    smi.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    smi.codeSize = spirv.size() * sizeof(uint32_t); smi.pCode = spirv.data();
+    VkShaderModule sm;
+    VK_CHECK(vkCreateShaderModule(device_, &smi, nullptr, &sm));
+
+    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(AeroPushConstants) };
+    VkPipelineLayoutCreateInfo pli{};
+    pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pli.setLayoutCount = 1; pli.pSetLayouts = &aeroDescLayout_;
+    pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcr;
+    VK_CHECK(vkCreatePipelineLayout(device_, &pli, nullptr, &aeroLayout_));
+
+    VkComputePipelineCreateInfo ci{};
+    ci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    ci.layout = aeroLayout_;
+    ci.stage  = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", nullptr };
+    VK_CHECK(vkCreateComputePipelines(device_, pipelineCache_, 1, &ci, nullptr, &aeroPipeline_));
+    vkDestroyShaderModule(device_, sm, nullptr);
+
+    deletionQueue_.push([this](){
+        vkDestroyPipeline(device_, aeroPipeline_, nullptr);
+        vkDestroyPipelineLayout(device_, aeroLayout_, nullptr);
+    });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Timestamp query pool
+// ════════════════════════════════════════════════════════════════════════════
+
+void FluidSolver::createTimestampPool() {
+    VkQueryPoolCreateInfo qi{};
+    qi.sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    qi.queryType  = VK_QUERY_TYPE_TIMESTAMP;
+    qi.queryCount = 4;  // 0=preLBM, 1=postLBM, 2=preAero, 3=postAero
+    VK_CHECK(vkCreateQueryPool(device_, &qi, nullptr, &timestampPool_));
+    deletionQueue_.push([this](){ vkDestroyQueryPool(device_, timestampPool_, nullptr); });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Upload obstacle map
+// ════════════════════════════════════════════════════════════════════════════
+
+void FluidSolver::uploadObstacleMap(const std::vector<uint32_t>& data) {
+    VkDeviceSize sz = data.size() * sizeof(uint32_t);
+    assert(sz <= stagingBuffer_.size);
+    std::memcpy(stagingBuffer_.mappedPtr, data.data(), sz);
+    vmaFlushAllocation(allocator_, stagingBuffer_.allocation, 0, sz);
+
+    submitOneShot([&](VkCommandBuffer cmd) {
+        VkBufferCopy cr{ 0, 0, sz };
+        vkCmdCopyBuffer(cmd, stagingBuffer_.buffer, obstacleBuffer_.buffer, 1, &cr);
+    });
+    std::cout << "[FluidSolver] Obstacle map uploaded.\n";
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Reset to equilibrium
+// ════════════════════════════════════════════════════════════════════════════
 
 void FluidSolver::resetToEquilibrium() {
     size_t cells = totalCells();
-    VkDeviceSize fSize = cells * 19 * sizeof(float);
+    VkDeviceSize fSz = cells * 19 * sizeof(float);
 
-    // D3Q19 weights for equilibrium at rho=1, u=0: f_eq = w_i * rho
-    const float weights[19] = {
-        1.0f/3.0f,
-        1.0f/18.0f, 1.0f/18.0f, 1.0f/18.0f, 1.0f/18.0f, 1.0f/18.0f, 1.0f/18.0f,
-        1.0f/36.0f, 1.0f/36.0f, 1.0f/36.0f, 1.0f/36.0f,
-        1.0f/36.0f, 1.0f/36.0f, 1.0f/36.0f, 1.0f/36.0f,
-        1.0f/36.0f, 1.0f/36.0f, 1.0f/36.0f, 1.0f/36.0f,
+    // D3Q19 equilibrium weights at rho=1, u=0 → f_i = w_i
+    static const float w[19] = {
+        1.f/3.f,
+        1.f/18.f,1.f/18.f,1.f/18.f,1.f/18.f,1.f/18.f,1.f/18.f,
+        1.f/36.f,1.f/36.f,1.f/36.f,1.f/36.f,
+        1.f/36.f,1.f/36.f,1.f/36.f,1.f/36.f,
+        1.f/36.f,1.f/36.f,1.f/36.f,1.f/36.f,
     };
 
-    // Build the initial distribution function array
-    std::vector<float> initialF(cells * 19);
-    for (size_t c = 0; c < cells; ++c) {
-        for (int q = 0; q < 19; ++q) {
-            initialF[q * cells + c] = weights[q]; // Structure-of-Arrays layout
-        }
-    }
+    // SoA: all f[q=0] first, then f[q=1], ..., f[q=18]
+    std::vector<float> init(cells * 19);
+    for (size_t c = 0; c < cells; ++c)
+        for (int q = 0; q < 19; ++q)
+            init[q * cells + c] = w[q];
 
-    // Upload via persistently-mapped staging buffer
-    VmaAllocationInfo allocInfo;
-    vmaGetAllocationInfo(allocator_, stagingBuffer_.allocation, &allocInfo);
-    std::memcpy(allocInfo.pMappedData, initialF.data(), fSize);
+    assert(fSz <= stagingBuffer_.size);
+    std::memcpy(stagingBuffer_.mappedPtr, init.data(), fSz);
+    vmaFlushAllocation(allocator_, stagingBuffer_.allocation, 0, fSz);
 
-    VkCommandBufferAllocateInfo cmdAllocInfo{};
-    cmdAllocInfo.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cmdAllocInfo.commandPool        = transferPool_;
-    cmdAllocInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cmdAllocInfo.commandBufferCount = 1;
-
-    VkCommandBuffer cmd;
-    vkAllocateCommandBuffers(device_, &cmdAllocInfo, &cmd);
-
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
-
-    VkBufferCopy copyRegion{};
-    copyRegion.size = fSize;
-
-    // Copy to both A and B buffers
-    vkCmdCopyBuffer(cmd, stagingBuffer_.buffer, fBufferA_.buffer, 1, &copyRegion);
-    vkCmdCopyBuffer(cmd, stagingBuffer_.buffer, fBufferB_.buffer, 1, &copyRegion);
-
-    // Clear macroscopic output buffer to prevent stale artifacts from previous runs
-    vkCmdFillBuffer(cmd, macroBuffer_.buffer, 0, VK_WHOLE_SIZE, 0);
-
-    vkEndCommandBuffer(cmd);
-
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers    = &cmd;
-
-    vkQueueSubmit(queue_, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue_);
-
-    vkFreeCommandBuffers(device_, transferPool_, 1, &cmd);
+    submitOneShot([&](VkCommandBuffer cmd) {
+        VkBufferCopy cr{ 0, 0, fSz };
+        vkCmdCopyBuffer(cmd, stagingBuffer_.buffer, fBufferA_.buffer, 1, &cr);
+        vkCmdCopyBuffer(cmd, stagingBuffer_.buffer, fBufferB_.buffer, 1, &cr);
+        vkCmdFillBuffer(cmd, macroBuffer_.buffer, 0, VK_WHOLE_SIZE, 0);
+    });
 
     pingPong_ = false;
-    std::cout << "[FluidSolver] Distributions reset to equilibrium.\n";
+    std::cout << "[FluidSolver] Reset to equilibrium.\n";
 }
 
-// ════════════════════════════════════════════════════════════════════════
-// Execute one LBM timestep
-// ════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
+// LBM step
+// ════════════════════════════════════════════════════════════════════════════
 
 void FluidSolver::step(VkCommandBuffer cmd, const SimParams& params, uint32_t timeStep) {
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+    // Timestamp: before LBM
+    vkCmdResetQueryPool(cmd, timestampPool_, 0, 2);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestampPool_, 0);
 
-    // Bind the correct descriptor set based on ping-pong state
-    VkDescriptorSet currentSet = pingPong_ ? descriptorSetB_ : descriptorSetA_;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, lbmPipeline_);
+    VkDescriptorSet cur = pingPong_ ? lbmSetB_ : lbmSetA_;
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipelineLayout_, 0, 1, &currentSet, 0, nullptr);
+                            lbmLayout_, 0, 1, &cur, 0, nullptr);
 
-    // Push constants
     LBMPushConstants pc{};
     pc.gridX      = params.gridX;
     pc.gridY      = params.gridY;
@@ -410,17 +428,15 @@ void FluidSolver::step(VkCommandBuffer cmd, const SimParams& params, uint32_t ti
     pc.s_bulk     = params.s_bulk;
     pc.s_ghost    = params.s_ghost;
     pc.lbmMode    = static_cast<uint32_t>(params.lbmMode);
-
-    vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+    vkCmdPushConstants(cmd, lbmLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(LBMPushConstants), &pc);
 
-    // Dispatch: workgroup size is (8, 8, 4) = 256 threads per group
-    uint32_t groupsX = (params.gridX + 7) / 8;
-    uint32_t groupsY = (params.gridY + 7) / 8;
-    uint32_t groupsZ = (params.gridZ + 3) / 4;
-    vkCmdDispatch(cmd, groupsX, groupsY, groupsZ);
+    uint32_t gx = (params.gridX + 7) / 8;
+    uint32_t gy = (params.gridY + 7) / 8;
+    uint32_t gz = (params.gridZ + 3) / 4;
+    vkCmdDispatch(cmd, gx, gy, gz);
 
-    // Memory barrier: ensure compute writes are visible before next step/read
+    // Barrier: ensure compute writes visible before next read
     VkMemoryBarrier barrier{};
     barrier.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -430,8 +446,78 @@ void FluidSolver::step(VkCommandBuffer cmd, const SimParams& params, uint32_t ti
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, 1, &barrier, 0, nullptr, 0, nullptr);
 
-    // Swap ping-pong
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestampPool_, 1);
+
     pingPong_ = !pingPong_;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Aero force integration dispatch
+// ════════════════════════════════════════════════════════════════════════════
+
+void FluidSolver::dispatchAeroForces(VkCommandBuffer cmd, const SimParams& params) {
+    vkCmdResetQueryPool(cmd, timestampPool_, 2, 2);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestampPool_, 2);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, aeroPipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            aeroLayout_, 0, 1, &aeroDescSet_, 0, nullptr);
+
+    AeroPushConstants pc{};
+    pc.gridX      = params.gridX;
+    pc.gridY      = params.gridY;
+    pc.gridZ      = params.gridZ;
+    pc.inletVelX  = params.inletVelX;
+    vkCmdPushConstants(cmd, aeroLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(AeroPushConstants), &pc);
+
+    vkCmdDispatch(cmd, kAeroGroups, 1, 1);
+
+    // Barrier: aero writes done, then copy partial sums to readback buffer
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 1, &mb, 0, nullptr, 0, nullptr);
+
+    VkBufferCopy cr{ 0, 0, kAeroGroups * 4 * sizeof(float) };
+    vkCmdCopyBuffer(cmd, aeroPartialBuffer_.buffer, aeroReadbackBuffer_.buffer, 1, &cr);
+
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestampPool_, 3);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// CPU readbacks
+// ════════════════════════════════════════════════════════════════════════════
+
+AeroForces FluidSolver::readAeroForces() const {
+    if (!aeroReadbackBuffer_.mappedPtr) return {};
+    vmaInvalidateAllocation(allocator_, aeroReadbackBuffer_.allocation, 0, VK_WHOLE_SIZE);
+
+    const float* partial = static_cast<const float*>(aeroReadbackBuffer_.mappedPtr);
+    double drag = 0, lift = 0, side = 0;
+    for (uint32_t i = 0; i < kAeroGroups; ++i) {
+        drag += partial[i * 4 + 0];
+        lift += partial[i * 4 + 1];
+        side += partial[i * 4 + 2];
+    }
+    return { static_cast<float>(drag), static_cast<float>(lift), static_cast<float>(side), 0.f };
+}
+
+GpuTimings FluidSolver::readTimings() const {
+    uint64_t ts[4] = {};
+    VkResult r = vkGetQueryPoolResults(device_, timestampPool_, 0, 4,
+        sizeof(ts), ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+    if (r != VK_SUCCESS) return {};
+    float ns = timestampPeriodNs_;
+    return {
+        static_cast<float>((ts[1] - ts[0]) * ns) / 1e6f,
+        0.f,
+        static_cast<float>((ts[3] - ts[2]) * ns) / 1e6f
+    };
 }
 
 } // namespace vwt

@@ -1,97 +1,142 @@
 #version 450
 // ============================================================================
-// Velocity Field Visualization — Compute Shader
-// ============================================================================
-// Reads macroscopic LBM output and writes a 2D RGBA slice texture.
-// Supports velocity-magnitude and pressure vis modes.
-// Colormap: inferno (perceptually uniform, OLED-friendly).
+// Visualization Compute Shader — 4 vis modes
+// 0: velocity magnitude (inferno)
+// 1: pressure / density (cool-warm diverging)
+// 2: vorticity magnitude (viridis-like)
+// 3: Q-criterion (highlights vortex cores, thresholded)
 // ============================================================================
 
-layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(local_size_x=16, local_size_y=16, local_size_z=1) in;
 
-layout(push_constant) uniform PushConstants {
-    uint  gridX;
-    uint  gridY;
-    uint  gridZ;
-    uint  sliceAxis;     // 0 = XY, 1 = XZ, 2 = YZ
+layout(push_constant) uniform PC {
+    uint  gridX, gridY, gridZ;
+    uint  sliceAxis;
     uint  sliceIndex;
-    float maxVelocity;   // colour-map normalisation
-    uint  visMode;       // 0 = velocity magnitude, 1 = pressure (density deviation)
+    float maxVelocity;
+    uint  visMode;
+    float maxVorticity;
 } pc;
 
-// Macroscopic field: [rho, ux, uy, uz] per cell (AoS, 4 floats per cell)
-layout(std430, set = 0, binding = 0) readonly buffer MacroIn { float macro_in[]; };
+layout(std430, set=0, binding=0) readonly buffer Mac { float macro[]; };
+layout(rgba8,  set=0, binding=1) uniform writeonly image2D outImg;
 
-// Output image for display
-layout(rgba8, set = 0, binding = 1) uniform writeonly image2D outputImage;
+// ── Colormaps ─────────────────────────────────────────────────────────────
 
-// ─── Inferno colormap (perceptually uniform, black → purple → orange → white) ─
+// Inferno (velocity)
 vec3 inferno(float t) {
     t = clamp(t, 0.0, 1.0);
-    const vec3 c0 = vec3(0.0002, 0.0016, 0.0138);
-    const vec3 c1 = vec3(0.2401, 0.0593, 0.4415);
-    const vec3 c2 = vec3(0.5765, 0.1117, 0.4815);
-    const vec3 c3 = vec3(0.8530, 0.2597, 0.3068);
-    const vec3 c4 = vec3(0.9876, 0.5564, 0.0778);
-    const vec3 c5 = vec3(0.9922, 0.9977, 0.6445);
-    if (t < 0.2) return mix(c0, c1, t * 5.0);
-    if (t < 0.4) return mix(c1, c2, (t - 0.2) * 5.0);
-    if (t < 0.6) return mix(c2, c3, (t - 0.4) * 5.0);
-    if (t < 0.8) return mix(c3, c4, (t - 0.6) * 5.0);
-    return mix(c4, c5, (t - 0.8) * 5.0);
+    vec3 c0={0.0002,0.0016,0.0138}, c1={0.2401,0.0593,0.4415}, c2={0.5765,0.1117,0.4815};
+    vec3 c3={0.8530,0.2597,0.3068}, c4={0.9876,0.5564,0.0778}, c5={0.9922,0.9977,0.6445};
+    if(t<0.2) return mix(c0,c1,t*5.0);
+    if(t<0.4) return mix(c1,c2,(t-0.2)*5.0);
+    if(t<0.6) return mix(c2,c3,(t-0.4)*5.0);
+    if(t<0.8) return mix(c3,c4,(t-0.6)*5.0);
+    return mix(c4,c5,(t-0.8)*5.0);
 }
 
-// ─── Cool-warm diverging map (for pressure) ──────────────────────────────────
+// Cool-warm (pressure)
 vec3 coolwarm(float t) {
     t = clamp(t, 0.0, 1.0);
-    // blue → white → red
-    const vec3 blue  = vec3(0.085, 0.532, 0.201) * 0.0 + vec3(0.23, 0.30, 0.75);
-    const vec3 white = vec3(0.86, 0.86, 0.86);
-    const vec3 red   = vec3(0.71, 0.016, 0.15);
-    if (t < 0.5) return mix(blue, white, t * 2.0);
-    return mix(white, red, (t - 0.5) * 2.0);
+    vec3 blue={0.23,0.30,0.75}, white={0.86,0.86,0.86}, red={0.71,0.016,0.15};
+    return t<0.5 ? mix(blue,white,t*2.0) : mix(white,red,(t-0.5)*2.0);
+}
+
+// Viridis-like (vorticity)
+vec3 viridis(float t) {
+    t = clamp(t, 0.0, 1.0);
+    vec3 c0={0.267,0.005,0.329}, c1={0.282,0.341,0.608}, c2={0.129,0.567,0.551};
+    vec3 c3={0.369,0.788,0.384}, c4={0.993,0.906,0.144};
+    if(t<0.25) return mix(c0,c1,t*4.0);
+    if(t<0.50) return mix(c1,c2,(t-0.25)*4.0);
+    if(t<0.75) return mix(c2,c3,(t-0.50)*4.0);
+    return mix(c3,c4,(t-0.75)*4.0);
+}
+
+// ── Macro buffer helpers ───────────────────────────────────────────────────
+
+uint cIdx(uint x, uint y, uint z) {
+    return clamp(z,0u,pc.gridZ-1u)*pc.gridX*pc.gridY
+         + clamp(y,0u,pc.gridY-1u)*pc.gridX
+         + clamp(x,0u,pc.gridX-1u);
+}
+
+vec3 vel(uint x, uint y, uint z) {
+    uint i = cIdx(x,y,z)*4u;
+    return vec3(macro[i+1], macro[i+2], macro[i+3]);
+}
+
+float rho(uint x, uint y, uint z) { return macro[cIdx(x,y,z)*4u]; }
+
+// Compute vorticity magnitude at cell (x,y,z) using central differences
+float vorticity(uint x, uint y, uint z) {
+    // ωx = duz/dy - duy/dz
+    float wx = (vel(x,y+1u,z).z - vel(x,y-1u>10000u?0u:y-1u,z).z) * 0.5
+             - (vel(x,y,z+1u).y - vel(x,y,z-1u>10000u?0u:z-1u).y) * 0.5;
+    // ωy = dux/dz - duz/dx
+    float wy = (vel(x,y,z+1u).x - vel(x,y,z-1u>10000u?0u:z-1u).x) * 0.5
+             - (vel(x+1u,y,z).z - vel(x-1u>10000u?0u:x-1u,y,z).z) * 0.5;
+    // ωz = duy/dx - dux/dy
+    float wz = (vel(x+1u,y,z).y - vel(x-1u>10000u?0u:x-1u,y,z).y) * 0.5
+             - (vel(x,y+1u,z).x - vel(x,y-1u>10000u?0u:y-1u,z).x) * 0.5;
+    return length(vec3(wx,wy,wz));
+}
+
+// Q-criterion: Q = 0.5*(|Omega|^2 - |S|^2), >0 = vortex core
+float qcriterion(uint x, uint y, uint z) {
+    // Velocity gradient tensor (central differences)
+    vec3 dxu = (vel(x+1u,y,z) - vel(x-1u>10000u?0u:x-1u,y,z)) * 0.5;
+    vec3 dyu = (vel(x,y+1u,z) - vel(x,y-1u>10000u?0u:y-1u,z)) * 0.5;
+    vec3 dzu = (vel(x,y,z+1u) - vel(x,y,z-1u>10000u?0u:z-1u)) * 0.5;
+
+    // Strain rate S_ij = 0.5*(dui/xj + duj/xi)
+    float Sxx=dxu.x, Syy=dyu.y, Szz=dzu.z;
+    float Sxy=0.5*(dxu.y+dyu.x), Syz=0.5*(dyu.z+dzu.y), Szx=0.5*(dzu.x+dxu.z);
+    float normS2 = Sxx*Sxx + Syy*Syy + Szz*Szz + 2.0*(Sxy*Sxy+Syz*Syz+Szx*Szx);
+
+    // Rotation rate Omega_ij = 0.5*(dui/xj - duj/xi)
+    float Oxy=0.5*(dxu.y-dyu.x), Oyz=0.5*(dyu.z-dzu.y), Ozx=0.5*(dzu.x-dxu.z);
+    float normO2 = 2.0*(Oxy*Oxy + Oyz*Oyz + Ozx*Ozx);
+
+    return 0.5*(normO2 - normS2);
 }
 
 void main() {
     uvec2 gid = gl_GlobalInvocationID.xy;
+    uint cx,cy,cz,imgW,imgH;
+    if      (pc.sliceAxis==0u) { cx=gid.x; cy=gid.y; cz=pc.sliceIndex; imgW=pc.gridX; imgH=pc.gridY; }
+    else if (pc.sliceAxis==1u) { cx=gid.x; cy=pc.sliceIndex; cz=gid.y; imgW=pc.gridX; imgH=pc.gridZ; }
+    else { cx=pc.sliceIndex; cy=pc.gridY-1u-gid.y; cz=gid.x; imgW=pc.gridZ; imgH=pc.gridY; }
 
-    uint cx, cy, cz, imgW, imgH;
-    if (pc.sliceAxis == 0) {
-        cx = gid.x; cy = gid.y; cz = pc.sliceIndex;
-        imgW = pc.gridX; imgH = pc.gridY;
-    } else if (pc.sliceAxis == 1) {
-        cx = gid.x; cy = pc.sliceIndex; cz = gid.y;
-        imgW = pc.gridX; imgH = pc.gridZ;
-    } else {
-        cx = pc.sliceIndex;
-        cy = pc.gridY - 1 - gid.y;
-        cz = gid.x;
-        imgW = pc.gridZ; imgH = pc.gridY;
-    }
-
-    if (gid.x >= imgW || gid.y >= imgH) {
-        imageStore(outputImage, ivec2(gid), vec4(0.031, 0.031, 0.039, 1.0));
+    if (gid.x>=imgW || gid.y>=imgH) {
+        imageStore(outImg, ivec2(gid), vec4(0.051,0.051,0.067,1.0));
         return;
     }
 
-    uint cellIdx = cz * pc.gridX * pc.gridY + cy * pc.gridX + cx;
+    uint i = cIdx(cx,cy,cz);
+    float r = macro[i*4+0];
+    vec3  u = vec3(macro[i*4+1],macro[i*4+2],macro[i*4+3]);
+    vec3  col;
 
-    float rho = macro_in[cellIdx * 4 + 0];
-    float ux  = macro_in[cellIdx * 4 + 1];
-    float uy  = macro_in[cellIdx * 4 + 2];
-    float uz  = macro_in[cellIdx * 4 + 3];
-
-    vec3 col;
-    if (pc.visMode == 1) {
-        // Pressure (density deviation from 1.0), mapped to diverging colormap
-        float rhoNorm = clamp((rho - 0.85) / 0.30, 0.0, 1.0); // 0.85–1.15 → 0–1
-        col = coolwarm(rhoNorm);
+    if (pc.visMode == 0u) {
+        // Velocity magnitude — inferno
+        float spd = length(u) / max(pc.maxVelocity, 0.0001);
+        col = inferno(spd);
+    } else if (pc.visMode == 1u) {
+        // Pressure (density deviation) — cool-warm
+        float rn = clamp((r - 0.85) / 0.30, 0.0, 1.0);
+        col = coolwarm(rn);
+    } else if (pc.visMode == 2u) {
+        // Vorticity magnitude — viridis
+        float vm = vorticity(cx,cy,cz) / max(pc.maxVorticity, 0.0001);
+        col = viridis(clamp(vm, 0.0, 1.0));
     } else {
-        // Velocity magnitude
-        float speed      = length(vec3(ux, uy, uz));
-        float normalized = speed / max(pc.maxVelocity, 0.0001);
-        col = inferno(normalized);
+        // Q-criterion — threshold at 0, map positive range to inferno
+        float Q = qcriterion(cx,cy,cz);
+        float Qn = clamp(Q / max(pc.maxVorticity*pc.maxVorticity, 1e-8), 0.0, 1.0);
+        // Black for Q<=0, inferno for Q>0
+        col = Q > 0.0 ? inferno(Qn) : vec3(0.031,0.031,0.039);
     }
 
-    imageStore(outputImage, ivec2(gid), vec4(col, 1.0));
+    imageStore(outImg, ivec2(gid), vec4(col, 1.0));
 }
