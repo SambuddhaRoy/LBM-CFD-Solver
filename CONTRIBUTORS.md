@@ -14,4 +14,5 @@
 
 ---
 
+*Contributions are listed in no particular order of importance.*  
 *To contribute, open an issue or pull request on [GitHub](https://github.com/SambuddhaRoy/VirtualWindTunnel).*
