@@ -405,7 +405,8 @@ void FluidSolver::resetToEquilibrium() {
 // LBM step
 // ════════════════════════════════════════════════════════════════════════════
 
-void FluidSolver::step(VkCommandBuffer cmd, const SimParams& params, uint32_t timeStep) {
+void FluidSolver::step(VkCommandBuffer cmd, const SimParams& params, uint32_t timeStep, bool recordTimings) {
+    (void)recordTimings;
     // Timestamp: before LBM
     vkCmdResetQueryPool(cmd, timestampPool_, 0, 2);
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestampPool_, 0);
@@ -455,7 +456,8 @@ void FluidSolver::step(VkCommandBuffer cmd, const SimParams& params, uint32_t ti
 // Aero force integration dispatch
 // ════════════════════════════════════════════════════════════════════════════
 
-void FluidSolver::dispatchAeroForces(VkCommandBuffer cmd, const SimParams& params) {
+void FluidSolver::dispatchAeroForces(VkCommandBuffer cmd, const SimParams& params, bool recordTimings) {
+    (void)recordTimings;
     vkCmdResetQueryPool(cmd, timestampPool_, 2, 2);
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestampPool_, 2);
 

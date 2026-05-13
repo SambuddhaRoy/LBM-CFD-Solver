@@ -21,11 +21,11 @@ public:
     void resetToEquilibrium();
 
     // Record one LBM step into cmd
-    void step(VkCommandBuffer cmd, const SimParams& params, uint32_t timeStep);
+    void step(VkCommandBuffer cmd, const SimParams& params, uint32_t timeStep, bool recordTimings = true);
 
     // Record aero force integration dispatch into cmd
     // Results readable after GPU-CPU sync via readAeroForces()
-    void dispatchAeroForces(VkCommandBuffer cmd, const SimParams& params);
+    void dispatchAeroForces(VkCommandBuffer cmd, const SimParams& params, bool recordTimings = true);
 
     // CPU readback of last aero force dispatch (call after fence wait)
     AeroForces readAeroForces() const;
