@@ -1,0 +1,111 @@
+#version 450
+// ============================================================================
+// analysis.comp — fused field analysis in a single grid pass
+//
+// Per fluid cell it accumulates, into one workgroup-level reduction:
+//   0  sumDelta   Σ|u − u_prev|²        (convergence residual numerator)
+//   1  sumU2      Σ|u|²                 (residual normalizer)
+//   2  Fx         pressure force, +X    (drag, pressure component)
+//   3  Fy         pressure force, +Y    (lift)
+//   4  Fz         pressure force, +Z    (side force)
+//   5  mass       Σρ
+//   6  maxU       max|u|                (max-reduced, not summed)
+//   7  ke         Σ ½ρ|u|²
+//   8  count      fluid-cell count
+//   9  surfCount  obstacle surface-face count
+//
+// Output: partial[group*12 + value]; 256 workgroups, grid-stride loop.
+// Also stores the current velocity into prev[] for the next sample.
+// ============================================================================
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint gx, gy, gz, pad;
+} pc;
+
+layout(std430, set=0, binding=0) readonly  buffer Mac  { float macro[]; };
+layout(std430, set=0, binding=1) readonly  buffer Obs  { uint  solid[]; };
+layout(std430, set=0, binding=2)           buffer Prev { float prev[];  };
+layout(std430, set=0, binding=3) writeonly buffer Out  { float partial_out[]; };
+
+const uint kVals = 12u;
+shared float sdat[256];
+
+const ivec3 faceDir[6] = ivec3[6](
+    ivec3(-1,0,0), ivec3(1,0,0),
+    ivec3(0,-1,0), ivec3(0,1,0),
+    ivec3(0,0,-1), ivec3(0,0,1)
+);
+
+uint cellIdx(uint x, uint y, uint z) { return (z*pc.gy + y)*pc.gx + x; }
+
+void main() {
+    uint tid    = gl_LocalInvocationIndex;
+    uint gid    = gl_WorkGroupID.x;
+    uint total  = pc.gx * pc.gy * pc.gz;
+    uint stride = gl_NumWorkGroups.x * 256u;
+
+    float v[kVals];
+    for (uint i = 0u; i < kVals; ++i) v[i] = 0.0;
+
+    for (uint cell = gid*256u + tid; cell < total; cell += stride) {
+        if (solid[cell] != 0u) continue;
+
+        float rho = macro[cell*4u + 0u];
+        vec3  u   = vec3(macro[cell*4u+1u], macro[cell*4u+2u], macro[cell*4u+3u]);
+        vec3  up  = vec3(prev[cell*4u+0u],  prev[cell*4u+1u],  prev[cell*4u+2u]);
+
+        vec3 du = u - up;
+        v[0] += dot(du, du);
+        v[1] += dot(u, u);
+        v[5] += rho;
+        v[6]  = max(v[6], length(u));
+        v[7] += 0.5*rho*dot(u, u);
+        v[8] += 1.0;
+
+        prev[cell*4u+0u] = u.x;
+        prev[cell*4u+1u] = u.y;
+        prev[cell*4u+2u] = u.z;
+        prev[cell*4u+3u] = 0.0;
+
+        // Pressure force on adjacent solid faces. Gauge (ρ−1)/3 keeps the
+        // closed-surface integral identical while avoiding FP cancellation.
+        uint z = cell / (pc.gx*pc.gy);
+        uint r = cell % (pc.gx*pc.gy);
+        uint y = r / pc.gx;
+        uint x = r % pc.gx;
+        float p = (rho - 1.0) / 3.0;
+
+        for (int fc = 0; fc < 6; ++fc) {
+            int nx = int(x) + faceDir[fc].x;
+            int ny = int(y) + faceDir[fc].y;
+            int nz = int(z) + faceDir[fc].z;
+            if (nx<0 || ny<0 || nz<0 ||
+                nx>=int(pc.gx) || ny>=int(pc.gy) || nz>=int(pc.gz)) continue;
+            if (solid[cellIdx(uint(nx),uint(ny),uint(nz))] == 0u) continue;
+
+            // faceDir points fluid → solid; pressure pushes on the body
+            // along that direction.
+            v[2] += p * float(faceDir[fc].x);
+            v[3] += p * float(faceDir[fc].y);
+            v[4] += p * float(faceDir[fc].z);
+            v[9] += 1.0;
+        }
+    }
+
+    // One shared-memory tree reduction per value (max for slot 6, sum else).
+    for (uint c = 0u; c < kVals; ++c) {
+        sdat[tid] = v[c];
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (tid < s) {
+                sdat[tid] = (c == 6u) ? max(sdat[tid], sdat[tid+s])
+                                      : sdat[tid] + sdat[tid+s];
+            }
+            barrier();
+        }
+        if (tid == 0u) partial_out[gid*kVals + c] = sdat[0];
+        barrier();
+    }
+}

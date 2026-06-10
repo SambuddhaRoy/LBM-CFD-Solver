@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(VirtualWindTunnel LANGUAGES CXX)
+project(VirtualWindTunnel VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,50 +9,33 @@ if(UNIX AND NOT APPLE)
 endif()
 
 if(MSVC)
-    add_compile_options(/W4 /permissive- /wd4100 /wd4201)
+    add_compile_options(/W4 /permissive- /utf-8)
     add_link_options(/LARGEADDRESSAWARE)
-    # Suppress console window on Windows release builds
-    if(CMAKE_BUILD_TYPE STREQUAL "Release")
-        add_link_options(/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
-    endif()
 elseif(LINUX)
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-find_package(Vulkan 1.3 REQUIRED)
+# ─── Dependencies (vcpkg) ───────────────────────────────────────────────────
+find_package(Vulkan REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
 find_package(assimp CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
 find_package(vk-bootstrap CONFIG REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
-find_path(XLSXWRITER_INCLUDE_DIR NAMES xlsxwriter.h)
-find_library(XLSXWRITER_LIBRARY NAMES xlsxwriter)
 
-set(SOURCES
+# ─── Target ─────────────────────────────────────────────────────────────────
+add_executable(${PROJECT_NAME}
     src/main.cpp
-    src/mesh_loader.cpp
-    src/fluid_solver.cpp
-    src/renderer.cpp
-    src/vk_engine.cpp
-    src/benchmark/auto_benchmark.cpp
+    src/gpu.cpp
+    src/sim.cpp
+    src/mesh.cpp
+    src/viz.cpp
+    src/ui.cpp
+    src/app.cpp
 )
 
-set(HEADERS
-    src/mesh_loader.h
-    src/fluid_solver.h
-    src/renderer.h
-    src/vk_engine.h
-    src/vk_types.h
-    src/environment.h
-    src/sim_scaler.h
-    src/logger.h
-    src/benchmark/auto_benchmark.h
-    src/benchmark/benchmark_config.h
-    src/benchmark/model_selector.h
-)
-
-add_executable(${PROJECT_NAME} ${SOURCES} ${HEADERS})
+target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
     Vulkan::Vulkan
@@ -62,7 +45,6 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     glm::glm
     vk-bootstrap::vk-bootstrap
     GPUOpen::VulkanMemoryAllocator
-    ${XLSXWRITER_LIBRARY}
 )
 
 if(WIN32)
@@ -70,7 +52,6 @@ if(WIN32)
 endif()
 
 if(LINUX)
-    # Vulkan_LIBRARIES is set by find_package(Vulkan); fall back to Vulkan_LIBRARY
     set(_VK_LIB "${Vulkan_LIBRARIES}")
     if(NOT _VK_LIB)
         set(_VK_LIB "${Vulkan_LIBRARY}")
@@ -81,23 +62,14 @@ if(LINUX)
     endif()
 endif()
 
-target_include_directories(${PROJECT_NAME} PRIVATE 
-    ${CMAKE_SOURCE_DIR}/src
-    ${XLSXWRITER_INCLUDE_DIR}
-)
-
-# ─── Compile shaders ────────────────────────────────────────────────────────
+# ─── Shader compilation (GLSL → SPIR-V) ─────────────────────────────────────
 if(Vulkan_GLSLC_EXECUTABLE)
     set(GLSLC ${Vulkan_GLSLC_EXECUTABLE})
 else()
-    find_program(GLSLC glslc HINTS
-        "$ENV{VULKAN_SDK}/Bin"
-        "$ENV{VULKAN_SDK}/bin"
-    )
+    find_program(GLSLC glslc HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
 endif()
-
 if(NOT GLSLC)
-    message(WARNING "glslc not found — shaders will not be recompiled.")
+    message(FATAL_ERROR "glslc not found — install the Vulkan SDK or vcpkg shaderc.")
 endif()
 message(STATUS "glslc: ${GLSLC}")
 
@@ -105,23 +77,17 @@ set(SHADER_DIR ${CMAKE_SOURCE_DIR}/shaders)
 set(SPIRV_DIR  ${CMAKE_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${SPIRV_DIR})
 
-file(GLOB SHADER_SOURCES
-    "${SHADER_DIR}/*.comp"
-    "${SHADER_DIR}/*.vert"
-    "${SHADER_DIR}/*.frag"
-)
+file(GLOB SHADER_SOURCES "${SHADER_DIR}/*.comp")
 
 foreach(SRC ${SHADER_SOURCES})
     get_filename_component(NAME ${SRC} NAME)
     set(SPV "${SPIRV_DIR}/${NAME}.spv")
-    if(GLSLC)
-        add_custom_command(
-            OUTPUT  ${SPV}
-            COMMAND ${GLSLC} -O ${SRC} -o ${SPV}
-            DEPENDS ${SRC}
-            COMMENT "Compiling shader: ${NAME}"
-        )
-    endif()
+    add_custom_command(
+        OUTPUT  ${SPV}
+        COMMAND ${GLSLC} -O ${SRC} -o ${SPV}
+        DEPENDS ${SRC}
+        COMMENT "Compiling shader: ${NAME}"
+    )
     list(APPEND SPV_OUTPUTS ${SPV})
 endforeach()
 

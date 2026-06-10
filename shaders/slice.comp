@@ -1,0 +1,130 @@
+#version 450
+// ============================================================================
+// slice.comp — 2D field slice visualization
+//
+// Modes:
+//   0  velocity magnitude            → inferno
+//   1  pressure coefficient C_p      → diverging cool-warm, centred on 0
+//   2  vorticity magnitude |∇×u|     → viridis
+//   3  Q-criterion (vortex cores)    → inferno where Q>0, near-black else
+//
+// Axes:  0 = XY plane (z fixed)   1 = XZ plane (y fixed)   2 = ZY plane (x fixed)
+// Obstacle cells render as neutral slate so the model silhouette is visible.
+// ============================================================================
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint  gx, gy, gz;
+    uint  axis;
+    uint  index;
+    uint  mode;
+    float scaleVel;     // colormap max for |u| (lattice units)
+    float uIn;          // inlet speed, for C_p normalization
+    float maxVort;      // colormap max for |ω|
+} pc;
+
+layout(std430, set=0, binding=0) readonly buffer Mac { float macro[]; };
+layout(std430, set=0, binding=1) readonly buffer Obs { uint  solid[]; };
+layout(set=0, binding=2, rgba8) uniform writeonly image2D outImg;
+
+uint cellIdx(uint x, uint y, uint z) { return (z*pc.gy + y)*pc.gx + x; }
+
+vec3 velAt(ivec3 p) {
+    p = clamp(p, ivec3(0), ivec3(int(pc.gx)-1, int(pc.gy)-1, int(pc.gz)-1));
+    uint c = cellIdx(uint(p.x), uint(p.y), uint(p.z));
+    return vec3(macro[c*4u+1u], macro[c*4u+2u], macro[c*4u+3u]);
+}
+
+// ─── Colormaps (polynomial fits, Zucker) ────────────────────────────────────
+vec3 inferno(float t) {
+    t = clamp(t, 0.0, 1.0);
+    const vec3 c0 = vec3( 0.0002189403, 0.0016510046, -0.0194808984);
+    const vec3 c1 = vec3( 0.1065134195, 0.5639564368,  3.9327123889);
+    const vec3 c2 = vec3(11.6024930825,-3.9728539657, -15.9423941063);
+    const vec3 c3 = vec3(-41.7039961314,17.4363988821, 44.3541451987);
+    const vec3 c4 = vec3(77.1629356994,-33.4023589421,-81.8073092574);
+    const vec3 c5 = vec3(-71.3194282450,32.6260642640, 73.2095198580);
+    const vec3 c6 = vec3(25.1311262248,-12.2426689524,-23.0703250029);
+    return c0+t*(c1+t*(c2+t*(c3+t*(c4+t*(c5+t*c6)))));
+}
+
+vec3 viridis(float t) {
+    t = clamp(t, 0.0, 1.0);
+    const vec3 c0 = vec3( 0.2777273272, 0.0054073445,  0.3340998053);
+    const vec3 c1 = vec3( 0.1050930431, 1.4046135299,  1.3845901626);
+    const vec3 c2 = vec3(-0.3308618287, 0.2148475595,  0.0950951630);
+    const vec3 c3 = vec3(-4.6342304990,-5.7991009734, -19.3324409563);
+    const vec3 c4 = vec3( 6.2282699363,14.1799333668,  56.6905526007);
+    const vec3 c5 = vec3( 4.7763849977,-13.7451453777,-65.3530326334);
+    const vec3 c6 = vec3(-5.4354558559, 4.6458526122,  26.3124352495);
+    return c0+t*(c1+t*(c2+t*(c3+t*(c4+t*(c5+t*c6)))));
+}
+
+vec3 coolwarm(float t) {  // t in [0,1], 0.5 = neutral
+    t = clamp(t, 0.0, 1.0);
+    const vec3 cold = vec3(0.230, 0.299, 0.754);
+    const vec3 mid  = vec3(0.865, 0.865, 0.865);
+    const vec3 warm = vec3(0.706, 0.016, 0.150);
+    return (t < 0.5) ? mix(cold, mid, t*2.0) : mix(mid, warm, t*2.0 - 1.0);
+}
+
+void main() {
+    uvec2 px = gl_GlobalInvocationID.xy;
+    ivec2 dim = imageSize(outImg);
+    if (px.x >= uint(dim.x) || px.y >= uint(dim.y)) return;
+
+    // Map pixel → grid cell for the selected plane
+    ivec3 p;
+    if      (pc.axis == 0u) p = ivec3(int(px.x), int(px.y), int(pc.index));  // XY
+    else if (pc.axis == 1u) p = ivec3(int(px.x), int(pc.index), int(px.y));  // XZ
+    else                    p = ivec3(int(pc.index), int(px.y), int(px.x));  // ZY
+
+    p = clamp(p, ivec3(0), ivec3(int(pc.gx)-1, int(pc.gy)-1, int(pc.gz)-1));
+    uint c = cellIdx(uint(p.x), uint(p.y), uint(p.z));
+
+    if (solid[c] != 0u) {
+        imageStore(outImg, ivec2(px), vec4(0.16, 0.17, 0.21, 1.0));
+        return;
+    }
+
+    vec3 col;
+    if (pc.mode == 0u) {
+        // Velocity magnitude
+        vec3 u = velAt(p);
+        col = inferno(length(u) / max(pc.scaleVel, 1e-5));
+    }
+    else if (pc.mode == 1u) {
+        // Pressure coefficient: C_p = (p−p∞)/(½ρU²), p = ρ/3 in lattice units
+        float rho = macro[c*4u+0u];
+        float cp  = ((rho - 1.0)/3.0) / max(0.5*pc.uIn*pc.uIn, 1e-7);
+        col = coolwarm(0.5 + cp*0.25);   // map C_p ∈ [−2,+2] → [0,1]
+    }
+    else {
+        // Velocity gradient by central differences for ω and Q
+        vec3 dudx = (velAt(p+ivec3(1,0,0)) - velAt(p-ivec3(1,0,0))) * 0.5;
+        vec3 dudy = (velAt(p+ivec3(0,1,0)) - velAt(p-ivec3(0,1,0))) * 0.5;
+        vec3 dudz = (velAt(p+ivec3(0,0,1)) - velAt(p-ivec3(0,0,1))) * 0.5;
+
+        if (pc.mode == 2u) {
+            vec3 omega = vec3(dudy.z - dudz.y,
+                              dudz.x - dudx.z,
+                              dudx.y - dudy.x);
+            col = viridis(length(omega) / max(pc.maxVort, 1e-6));
+        } else {
+            // Q = ½(|Ω|² − |S|²): positive where rotation beats strain
+            mat3 J = mat3(dudx, dudy, dudz);   // columns = ∂u/∂x_i
+            mat3 S = 0.5*(J + transpose(J));
+            mat3 W = 0.5*(J - transpose(J));
+            float s2 = 0.0, w2 = 0.0;
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j) { s2 += S[i][j]*S[i][j]; w2 += W[i][j]*W[i][j]; }
+            float Q = 0.5*(w2 - s2);
+            float qn = Q / max(pc.maxVort*pc.maxVort, 1e-9);
+            col = (qn > 0.0) ? inferno(clamp(qn, 0.0, 1.0))
+                             : vec3(0.05, 0.05, 0.07);
+        }
+    }
+
+    imageStore(outImg, ivec2(px), vec4(col, 1.0));
+}

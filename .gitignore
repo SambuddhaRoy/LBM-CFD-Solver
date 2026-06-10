@@ -1,12 +1,31 @@
 # Build directories
 build/
+build_*/
 bin/
 out/
+dist/
 .vs/
 .vscode/
+.idea/
+.claude/
 
 # Dependency managers
 vcpkg_installed/
+
+# Runtime artifacts
+*.spv
+vwt_pipeline.bin
+pipeline_cache*.bin
+snapshots/
+vwt2.ini
+vwt_config.ini
+imgui.ini
+*.log
+
+# Packaged binaries
+*.zip
+*.exe
+*.dll
 
 # OS specific
 Thumbs.db
@@ -14,4 +33,7 @@ Thumbs.db
 
 # Temporary files
 *.swp
-*.log
+benchmark_output/
+temp_models/
+build_log.txt
+debug_log.txt

@@ -1,0 +1,194 @@
+#version 450
+// ============================================================================
+// lbm.comp — D3Q19 Lattice Boltzmann step (pull scheme, SoA layout)
+//
+//   Collision   : BGK or regularized BGK (Latt & Chopard projection)
+//   Turbulence  : optional Smagorinsky LES — effective tau from the local
+//                 non-equilibrium stress magnitude
+//   Boundaries  : equilibrium velocity inlet (x=0), zero-gradient outlet
+//                 (x=gx-1), free-slip (specular) tunnel walls in Y and Z,
+//                 halfway bounce-back at obstacle cells
+//
+// f is stored SoA:  f[q * nCells + cell]  for coalesced streaming access.
+// ============================================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
+
+layout(push_constant) uniform PC {
+    uint  gx, gy, gz;
+    float tau;          // base relaxation time
+    float uIn;          // inlet velocity, lattice units (+X)
+    float time;         // step index, for inlet noise
+    float turb;         // inlet perturbation amplitude (fraction of uIn)
+    uint  collision;    // 0 = BGK, 1 = regularized
+    uint  les;          // 1 = Smagorinsky subgrid model on
+    float csSmago;      // Smagorinsky constant (~0.1–0.2)
+} pc;
+
+layout(std430, set=0, binding=0) readonly  buffer FIn  { float fIn[];  };
+layout(std430, set=0, binding=1) writeonly buffer FOut { float fOut[]; };
+layout(std430, set=0, binding=2) readonly  buffer Obs  { uint  solid[]; };
+layout(std430, set=0, binding=3) writeonly buffer Mac  { float macro[]; };
+
+const ivec3 e[19] = ivec3[19](
+    ivec3( 0, 0, 0),
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1, 1, 0), ivec3(-1, 1, 0),
+    ivec3( 1,-1, 0), ivec3(-1,-1, 0),
+    ivec3( 1, 0, 1), ivec3(-1, 0, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0,-1),
+    ivec3( 0, 1, 1), ivec3( 0,-1, 1),
+    ivec3( 0, 1,-1), ivec3( 0,-1,-1)
+);
+
+const float w[19] = float[19](
+    1.0/3.0,
+    1.0/18.0, 1.0/18.0, 1.0/18.0, 1.0/18.0, 1.0/18.0, 1.0/18.0,
+    1.0/36.0, 1.0/36.0, 1.0/36.0, 1.0/36.0,
+    1.0/36.0, 1.0/36.0, 1.0/36.0, 1.0/36.0,
+    1.0/36.0, 1.0/36.0, 1.0/36.0, 1.0/36.0
+);
+
+const int opp[19]  = int[19](0, 2,1, 4,3, 6,5, 10,9,8,7, 14,13,12,11, 18,17,16,15);
+// Direction with e_y sign flipped (specular reflection off Y walls)
+const int mirY[19] = int[19](0, 1,2, 4,3, 5,6, 9,10,7,8, 11,12,13,14, 16,15,18,17);
+// Direction with e_z sign flipped (specular reflection off Z walls)
+const int mirZ[19] = int[19](0, 1,2, 3,4, 6,5, 7,8,9,10, 13,14,11,12, 17,18,15,16);
+
+uint cellIdx(uint x, uint y, uint z) { return (z*pc.gy + y)*pc.gx + x; }
+uint distIdx(uint q, uint cell)      { return q*pc.gx*pc.gy*pc.gz + cell; }
+
+float feq(uint q, float rho, vec3 u) {
+    float eu = dot(vec3(e[q]), u);
+    return w[q]*rho*(1.0 + 3.0*eu + 4.5*eu*eu - 1.5*dot(u,u));
+}
+
+float hash(float n) { return fract(sin(n)*43758.5453123); }
+
+void main() {
+    uvec3 gid = gl_GlobalInvocationID;
+    if (gid.x >= pc.gx || gid.y >= pc.gy || gid.z >= pc.gz) return;
+
+    uint x = gid.x, y = gid.y, z = gid.z;
+    uint idx = cellIdx(x, y, z);
+
+    // ── Pull / stream with free-slip Y/Z walls ────────────────────────────
+    float f[19];
+    for (uint q = 0u; q < 19u; ++q) {
+        int sx = int(x) - e[q].x;
+        int sy = int(y) - e[q].y;
+        int sz = int(z) - e[q].z;
+        uint qs = q;
+
+        // X clamped; inlet/outlet rows are overwritten below anyway.
+        sx = clamp(sx, 0, int(pc.gx) - 1);
+
+        // Specular reflection: pull the Y/Z-mirrored population from the
+        // boundary-adjacent cell. Corner hits compose both mirrors.
+        if      (sy < 0)            { sy = 0;              qs = uint(mirY[qs]); }
+        else if (sy >= int(pc.gy))  { sy = int(pc.gy) - 1; qs = uint(mirY[qs]); }
+        if      (sz < 0)            { sz = 0;              qs = uint(mirZ[qs]); }
+        else if (sz >= int(pc.gz))  { sz = int(pc.gz) - 1; qs = uint(mirZ[qs]); }
+
+        f[q] = fIn[distIdx(qs, cellIdx(uint(sx), uint(sy), uint(sz)))];
+    }
+
+    // ── Obstacle: halfway bounce-back ─────────────────────────────────────
+    if (solid[idx] != 0u) {
+        for (uint q = 0u; q < 19u; ++q)
+            fOut[distIdx(q, idx)] = f[opp[q]];
+        macro[idx*4u+0u] = 1.0;
+        macro[idx*4u+1u] = 0.0;
+        macro[idx*4u+2u] = 0.0;
+        macro[idx*4u+3u] = 0.0;
+        return;
+    }
+
+    // ── Macroscopic moments ───────────────────────────────────────────────
+    float rho = 0.0;
+    vec3  u   = vec3(0.0);
+    for (uint q = 0u; q < 19u; ++q) {
+        rho += f[q];
+        u   += vec3(e[q]) * f[q];
+    }
+    rho = clamp(rho, 0.5, 2.0);
+    u  /= rho;
+    float umag = length(u);
+    if (umag > 0.45) u *= 0.45 / umag;   // lattice Mach safety clamp
+
+    // ── Inlet: equilibrium velocity with optional perturbation ───────────
+    if (x == 0u) {
+        vec3 ui = vec3(pc.uIn, 0.0, 0.0);
+        if (pc.turb > 0.0) {
+            float t = pc.time * 0.08;
+            ui.y += (hash(float(y)*13.7 + t)      *2.0 - 1.0) * pc.turb * pc.uIn;
+            ui.z += (hash(float(z)*17.3 + t*1.31) *2.0 - 1.0) * pc.turb * pc.uIn;
+        }
+        rho = 1.0; u = ui;
+        for (uint q = 0u; q < 19u; ++q) f[q] = feq(q, rho, u);
+    }
+
+    // ── Outlet: zero-gradient copy from the upstream neighbour ───────────
+    if (x == pc.gx - 1u) {
+        uint up = cellIdx(x - 1u, y, z);
+        rho = 0.0; u = vec3(0.0);
+        for (uint q = 0u; q < 19u; ++q) {
+            float fv = fIn[distIdx(q, up)];
+            f[q] = fv;
+            rho += fv;
+            u   += vec3(e[q]) * fv;
+        }
+        if (rho > 0.01) u /= rho; else { rho = 1.0; u = vec3(0.0); }
+    }
+
+    // ── Collision ─────────────────────────────────────────────────────────
+    // Non-equilibrium stress tensor (needed by both LES and regularization)
+    bool needPi = (pc.collision == 1u) || (pc.les == 1u);
+    float Pxx=0.0, Pyy=0.0, Pzz=0.0, Pxy=0.0, Pyz=0.0, Pzx=0.0;
+    if (needPi) {
+        for (uint q = 0u; q < 19u; ++q) {
+            float fn = f[q] - feq(q, rho, u);
+            vec3 ev = vec3(e[q]);
+            Pxx += fn*ev.x*ev.x;  Pyy += fn*ev.y*ev.y;  Pzz += fn*ev.z*ev.z;
+            Pxy += fn*ev.x*ev.y;  Pyz += fn*ev.y*ev.z;  Pzx += fn*ev.z*ev.x;
+        }
+    }
+
+    // Smagorinsky: tau_eff = (tau + sqrt(tau² + 18√2·C²·|Π|/ρ)) / 2
+    float tauEff = pc.tau;
+    if (pc.les == 1u) {
+        float Q = sqrt(2.0*(Pxx*Pxx + Pyy*Pyy + Pzz*Pzz)
+                     + 4.0*(Pxy*Pxy + Pyz*Pyz + Pzx*Pzx));
+        tauEff = 0.5*(pc.tau + sqrt(pc.tau*pc.tau
+                     + 25.455844*pc.csSmago*pc.csSmago*Q/max(rho, 0.5)));
+    }
+    float omega = 1.0 / tauEff;
+
+    if (pc.collision == 1u) {
+        // Regularized BGK: project f_neq onto the second-order Hermite basis,
+        // discard ghost modes, relax the hydrodynamic part.
+        for (uint q = 0u; q < 19u; ++q) {
+            vec3 ev = vec3(e[q]);
+            float Qq = (ev.x*ev.x - 1.0/3.0)*Pxx
+                     + (ev.y*ev.y - 1.0/3.0)*Pyy
+                     + (ev.z*ev.z - 1.0/3.0)*Pzz
+                     + 2.0*(ev.x*ev.y*Pxy + ev.y*ev.z*Pyz + ev.z*ev.x*Pzx);
+            float f1 = w[q] * 4.5 * Qq;
+            float fv = feq(q, rho, u) + (1.0 - omega)*f1;
+            fOut[distIdx(q, idx)] = isnan(fv) ? w[q] : fv;
+        }
+    } else {
+        // Plain BGK
+        for (uint q = 0u; q < 19u; ++q) {
+            float fv = f[q] - omega*(f[q] - feq(q, rho, u));
+            fOut[distIdx(q, idx)] = isnan(fv) ? w[q] : fv;
+        }
+    }
+
+    macro[idx*4u+0u] = rho;
+    macro[idx*4u+1u] = u.x;
+    macro[idx*4u+2u] = u.y;
+    macro[idx*4u+3u] = u.z;
+}

@@ -1,103 +1,82 @@
 // ============================================================================
-// main.cpp — Virtual Wind Tunnel Entry Point
+// main.cpp — Virtual Wind Tunnel v2 entry point
 // ============================================================================
 
-#include "vk_engine.h"
-#include "logger.h"
-#include <iostream>
-#include <stdexcept>
-#include <cstdlib>
-#include <csignal>
+#include "app.h"
 
-#ifdef _WIN32
-#include <windows.h>
-BOOL WINAPI consoleCtrlHandler(DWORD dwCtrlType) {
-    if (dwCtrlType == CTRL_C_EVENT || dwCtrlType == CTRL_BREAK_EVENT) {
-        std::cout << "\n[INFO] Received Ctrl+C. Shutting down...\n";
-        vwt::Logger::log("Shutdown requested via Ctrl+C");
-        exit(0);  // does not return
-    }
-    return FALSE;
-}
-#else
-#include <unistd.h>
-#include <signal.h>
-void signalHandler(int sig) {
-    std::cout << "\n[INFO] Received signal " << sig << ". Shutting down...\n";
-    vwt::Logger::log("Shutdown requested via signal");
-    exit(0);
-}
-#endif
+#include <cstdio>
+#include <cstring>
+#include <exception>
+#include <string>
 
-void printUsage(const char* progName) {
-    std::cout << "Usage: " << progName << " [options]\n";
-    std::cout << "Options:\n";
-    std::cout << "  --help            Show this help message\n";
-    std::cout << "  --grid <X> <Y> <Z>  Set grid resolution (default: 128 64 64)\n";
-    std::cout << "  --resolution <W> <H>  Set window resolution (default: 1600 900)\n";
-    std::cout << "  --mesh <path>     Load a mesh file on startup\n";
-    std::cout << "  --no-gui          Run in headless mode (no window)\n";
+namespace {
+
+void printUsage(const char* prog) {
+    std::printf(
+        "Virtual Wind Tunnel v2 — real-time GPU LBM aerodynamics\n\n"
+        "Usage: %s [options]\n\n"
+        "  --mesh <path>        load a model file on startup\n"
+        "  --grid <X> <Y> <Z>   lattice resolution (default 128 80 80)\n"
+        "  --no-les             disable the Smagorinsky subgrid model\n"
+        "  --headless           run without a window and self-validate\n"
+        "  --steps <N>          headless: number of LBM steps (default 240)\n"
+        "  --shape <name>       headless: sphere | cube | cylinder | wing\n"
+        "  --aoa <deg>          headless: angle of attack (default 0)\n"
+        "  --help               this message\n",
+        prog);
 }
+
+int parseShape(const std::string& s) {
+    if (s == "sphere")   return 0;
+    if (s == "cube")     return 1;
+    if (s == "cylinder") return 2;
+    if (s == "wing")     return 3;
+    return -1;
+}
+
+} // namespace
 
 int main(int argc, char* argv[]) {
-    // Parse CLI arguments
-    bool headless = false;
-    uint32_t gridX = 128, gridY = 64, gridZ = 64;
-    uint32_t resW = 1600, resH = 900;
-    std::string meshPath;
+    vwt::StartOptions opts;
 
     for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
+        const std::string arg = argv[i];
         if (arg == "--help") {
             printUsage(argv[0]);
             return 0;
+        } else if (arg == "--headless") {
+            opts.headless = true;
+        } else if (arg == "--no-les") {
+            opts.lesOff = true;
+        } else if (arg == "--steps" && i + 1 < argc) {
+            opts.steps = uint32_t(std::strtoul(argv[++i], nullptr, 10));
+        } else if (arg == "--aoa" && i + 1 < argc) {
+            opts.aoaDeg = std::strtof(argv[++i], nullptr);
+        } else if (arg == "--shape" && i + 1 < argc) {
+            const int s = parseShape(argv[++i]);
+            if (s < 0) {
+                std::fprintf(stderr, "Unknown shape '%s'\n", argv[i]);
+                return 2;
+            }
+            opts.shape = s;
         } else if (arg == "--grid" && i + 3 < argc) {
-            gridX = std::stoi(argv[++i]);
-            gridY = std::stoi(argv[++i]);
-            gridZ = std::stoi(argv[++i]);
-        } else if (arg == "--resolution" && i + 2 < argc) {
-            resW = std::stoi(argv[++i]);
-            resH = std::stoi(argv[++i]);
+            opts.gx = uint32_t(std::strtoul(argv[++i], nullptr, 10));
+            opts.gy = uint32_t(std::strtoul(argv[++i], nullptr, 10));
+            opts.gz = uint32_t(std::strtoul(argv[++i], nullptr, 10));
         } else if (arg == "--mesh" && i + 1 < argc) {
-            meshPath = argv[++i];
-        } else if (arg == "--no-gui") {
-            headless = true;
+            opts.meshPath = argv[++i];
         } else {
-            std::cerr << "[ERROR] Unknown option: " << arg << "\n";
+            std::fprintf(stderr, "Unknown option '%s'\n", arg.c_str());
             printUsage(argv[0]);
-            return EXIT_FAILURE;
+            return 2;
         }
     }
-
-    // Set up signal handling
-#ifdef _WIN32
-    SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
-#else
-    std::signal(SIGINT, signalHandler);
-    std::signal(SIGTERM, signalHandler);
-#endif
-
-    vwt::Logger::init("vwt_session.log");
-    vwt::Logger::log("Virtual Wind Tunnel starting up...");
-
-    std::cout << "╔═══════════════════════════════════════════════════╗\n";
-    std::cout << "║   Virtual Wind Tunnel — D3Q19 LBM Simulation    ║\n";
-    std::cout << "║   GPU-Accelerated via Vulkan Compute Shaders    ║\n";
-    std::cout << "╚═══════════════════════════════════════════════════╝\n\n";
-
-    vwt::VulkanEngine engine;
 
     try {
-        engine.init();
-        engine.run();
-        engine.cleanup();
+        vwt::App app;
+        return app.run(opts);
     } catch (const std::exception& e) {
-        std::cerr << "\n[FATAL] " << e.what() << "\n";
-        if (engine.isInitialized()) {
-            engine.cleanup();
-        }
-        return EXIT_FAILURE;
+        std::fprintf(stderr, "\n[FATAL] %s\n", e.what());
+        return 1;
     }
-
-    return EXIT_SUCCESS;
 }
