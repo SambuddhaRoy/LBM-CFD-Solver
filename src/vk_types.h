@@ -62,11 +62,16 @@ struct AllocatedImage {
 
 // ─── Per-frame GPU resources ──────────────────────────────────────────────────
 struct FrameData {
-    VkCommandPool   commandPool    = VK_NULL_HANDLE;
-    VkCommandBuffer commandBuffer  = VK_NULL_HANDLE;
+    VkCommandPool   commandPool      = VK_NULL_HANDLE;
+    VkCommandBuffer commandBuffer    = VK_NULL_HANDLE;
     VkSemaphore     presentSemaphore = VK_NULL_HANDLE;
     VkSemaphore     renderSemaphore  = VK_NULL_HANDLE;
-    VkFence         renderFence    = VK_NULL_HANDLE;
+    VkFence         renderFence      = VK_NULL_HANDLE;
+
+    // Dedicated async-compute resources (valid only when hasAsyncCompute_ is true)
+    VkCommandPool   computePool     = VK_NULL_HANDLE;
+    VkCommandBuffer computeCmd      = VK_NULL_HANDLE;
+    VkSemaphore     computeFinished = VK_NULL_HANDLE;
 };
 
 // ─── GPU timing readback ──────────────────────────────────────────────────────
@@ -148,6 +153,13 @@ struct AeroPushConstants {
     uint32_t gridY;
     uint32_t gridZ;
     float    inletVelX;
+};
+
+// ─── Convergence residual push constants ─────────────────────────────────────
+struct ResidualPushConstants {
+    uint32_t gridX;
+    uint32_t gridY;
+    uint32_t gridZ;
 };
 
 // ─── SPIR-V loader ────────────────────────────────────────────────────────────

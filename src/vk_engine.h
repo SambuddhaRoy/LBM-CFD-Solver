@@ -42,7 +42,7 @@ private:
 
     // ── Per-frame ─────────────────────────────────────────────────────────
     void drawFrame();
-    void buildCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex);
+    void buildCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex, bool asyncComputeMode = false);
     void drawImGui();
 
     // ── UI panels ─────────────────────────────────────────────────────────
@@ -140,6 +140,9 @@ private:
     GpuTimings gpuTimings_;
     uint64_t   aeroUpdateInterval_    = 30;
     bool       aeroDispatchThisFrame_ = false;
+    // Reference area: projected obstacle silhouette in the YZ plane, in
+    // lattice units². Replaces the previous magic A=0.05 in C_D / C_L.
+    uint32_t   frontalCells_ = 0;
 
     // ── Viewport ─────────────────────────────────────────────────────────
     float    zoomLevel_  = 1.0f;
@@ -177,12 +180,18 @@ private:
     float    avgFrameMs_             = 16.6f;
     float    lastResidualLog_        = 0.f;
 
+    // ── Aero history (advances only when aero is dispatched) ─────────────
+    float    aeroCdHistory_[kHist]   = {};
+    float    aeroClHistory_[kHist]   = {};
+    int      aeroHistIdx_            = 0;
+
     // ── VRAM ──────────────────────────────────────────────────────────────
     uint64_t vramBudget_ = 0;
     uint64_t vramUsage_  = 0;
 
     // ── GPU info ──────────────────────────────────────────────────────────
-    char gpuName_[256] = "Unknown";
+    char     gpuName_[256]  = "Unknown";
+    uint32_t memHeapCount_  = 0;     // actual VkPhysicalDeviceMemoryProperties heap count
 
     bool benchmarkMode_ = false;
 

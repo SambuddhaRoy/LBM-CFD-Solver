@@ -1,0 +1,78 @@
+#version 450
+// ============================================================================
+// Convergence Residual Compute Shader
+// ============================================================================
+// Measures how much the velocity field has changed since the previous sample.
+// For every fluid cell it accumulates:
+//     sumDelta = Σ |u_now - u_prev|²
+//     sumVel   = Σ |u_now|²
+// then stores the current velocity into prev_vel[] for the next comparison.
+//
+// The L2 residual is computed on the CPU as sqrt(sumDelta / sumVel), which is
+// the standard normalised convergence metric: it falls toward zero as the flow
+// reaches steady state. This is a real measured quantity, not a model.
+//
+// Two-level parallel reduction identical to aero_forces.comp:
+//   - Each workgroup (256 threads) reduces a grid-stride chunk via shared mem.
+//   - 256 partial results written to partial_out[], summed on CPU.
+//
+// Output layout: partial_out[groupIdx * 2 + {0,1}] = {sumDelta, sumVel}
+// ============================================================================
+
+layout(local_size_x=256, local_size_y=1, local_size_z=1) in;
+
+layout(push_constant) uniform PC {
+    uint gridX, gridY, gridZ;
+} pc;
+
+layout(std430, set=0, binding=0) readonly  buffer Mac     { float macro[]; };
+layout(std430, set=0, binding=1) readonly  buffer Obs     { uint  obstacle[]; };
+layout(std430, set=0, binding=2)           buffer Prev    { float prev_vel[]; };
+layout(std430, set=0, binding=3) writeonly buffer PartOut { float partial_out[]; };
+
+shared vec2 sData[256];  // (sumDelta, sumVel)
+
+void main() {
+    uint tid    = gl_LocalInvocationIndex;
+    uint gid    = gl_WorkGroupID.x;
+    uint total  = pc.gridX * pc.gridY * pc.gridZ;
+    uint stride = gl_NumWorkGroups.x * 256u;
+
+    vec2 local = vec2(0.0);
+
+    for (uint cell = gid*256u + tid; cell < total; cell += stride) {
+        // Solid cells carry no meaningful velocity — exclude them so the
+        // residual reflects the fluid field only.
+        if (obstacle[cell] != 0u) continue;
+
+        vec3 u = vec3(macro[cell*4u + 1u],
+                      macro[cell*4u + 2u],
+                      macro[cell*4u + 3u]);
+        vec3 up = vec3(prev_vel[cell*4u + 0u],
+                       prev_vel[cell*4u + 1u],
+                       prev_vel[cell*4u + 2u]);
+
+        vec3 du = u - up;
+        local.x += dot(du, du);
+        local.y += dot(u,  u);
+
+        // Store current velocity for the next sample.
+        prev_vel[cell*4u + 0u] = u.x;
+        prev_vel[cell*4u + 1u] = u.y;
+        prev_vel[cell*4u + 2u] = u.z;
+        prev_vel[cell*4u + 3u] = 0.0;
+    }
+
+    sData[tid] = local;
+    barrier();
+
+    for (uint s=128u; s>0u; s>>=1u) {
+        if (tid < s) sData[tid] += sData[tid+s];
+        barrier();
+    }
+
+    if (tid == 0u) {
+        partial_out[gid*2u + 0u] = sData[0].x;
+        partial_out[gid*2u + 1u] = sData[0].y;
+    }
+}

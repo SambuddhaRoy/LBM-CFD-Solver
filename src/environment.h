@@ -1,6 +1,8 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <cstdint>
 
 namespace vwt {
 
@@ -28,6 +30,23 @@ public:
         };
         return profiles;
     }
+
+    // Safe lookup that clamps the index to the valid range.
+    static const EnvironmentProfile& get(uint32_t idx) {
+        const auto& p = getProfiles();
+        uint32_t i = (p.empty() ? 0u : std::min(idx, uint32_t(p.size() - 1)));
+        return p[i];
+    }
 };
+
+// ─── Unit conversion ────────────────────────────────────────────────────────
+// LBM lattice speed of sound c_s_lat = 1/√3. Holding Mach number constant
+// between lattice and physical worlds gives  u_phys = u_lat · c_s_phys · √3.
+// Earth: 343 m/s · 1.732 ≈ 594.05 m/s per lattice unit  (the magic number
+// previously hard-coded throughout the UI).
+inline float latticeToMps(const EnvironmentProfile& env) {
+    constexpr float kSqrt3 = 1.7320508075688772f;
+    return env.speedOfSound * kSqrt3;
+}
 
 } // namespace vwt

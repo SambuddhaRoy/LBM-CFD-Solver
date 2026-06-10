@@ -36,6 +36,13 @@ public:
         float            marginFraction = 0.1f   // 10% margin around the mesh
     );
 
+    /// Count voxels in the projected YZ frontal plane (looking along +X — the
+    /// flow direction). Used as the reference area for C_D / C_L
+    /// computation; returns frontal area expressed in lattice units squared.
+    static uint32_t computeFrontalArea(
+        const std::vector<uint32_t>& obstacle,
+        uint32_t gridX, uint32_t gridY, uint32_t gridZ);
+
 private:
     /// Triangle-AABB overlap test (Separating Axis Theorem)
     bool triangleAABBOverlap(

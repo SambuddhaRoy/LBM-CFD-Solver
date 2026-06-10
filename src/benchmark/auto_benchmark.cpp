@@ -206,27 +206,27 @@ void AutoBenchmark::writeExcel() {
 
     // Summary Header
     const char* summaryHeaders[] = {"Model", "Grid", "Operator", "Inlet Vel", "Avg MLUPS", "Peak MLUPS", "Avg LBM ms", "Final Drag", "Final Lift", "Final Residual", "VRAM Used (GB)", "GPU"};
-    for (int i = 0; i < 12; ++i) worksheet_write_string(wsSummary, 0, i, summaryHeaders[i], fmtHeader);
+    for (lxw_col_t i = 0; i < 12; ++i) worksheet_write_string(wsSummary, 0, i, summaryHeaders[i], fmtHeader);
 
     // Convergence Header
     const char* convHeaders[] = {"Run ID", "Model", "Grid", "Operator", "Inlet Vel", "Step", "Residual (log10)"};
-    for (int i = 0; i < 7; ++i) worksheet_write_string(wsConv, 0, i, convHeaders[i], fmtHeader);
+    for (lxw_col_t i = 0; i < 7; ++i) worksheet_write_string(wsConv, 0, i, convHeaders[i], fmtHeader);
 
     // Throughput Header
     const char* tpHeaders[] = {"Run ID", "Model", "Grid", "Operator", "Inlet Vel", "Step", "MLUPS", "LBM ms", "Aero ms"};
-    for (int i = 0; i < 9; ++i) worksheet_write_string(wsTP, 0, i, tpHeaders[i], fmtHeader);
+    for (lxw_col_t i = 0; i < 9; ++i) worksheet_write_string(wsTP, 0, i, tpHeaders[i], fmtHeader);
 
     // Aero Headers
     const char* aeroHeaders[] = {"Run ID", "Model", "Grid", "Operator", "Step", "Raw Drag", "Raw Lift"};
-    for (int i = 0; i < 7; ++i) worksheet_write_string(wsAero, 0, i, aeroHeaders[i], fmtHeader);
+    for (lxw_col_t i = 0; i < 7; ++i) worksheet_write_string(wsAero, 0, i, aeroHeaders[i], fmtHeader);
 
     // Memory Headers
     const char* memHeaders[] = {"Run ID", "Grid", "Step", "VRAM Used (GB)", "VRAM Budget (GB)", "Usage %"};
-    for (int i = 0; i < 6; ++i) worksheet_write_string(wsMem, 0, i, memHeaders[i], fmtHeader);
+    for (lxw_col_t i = 0; i < 6; ++i) worksheet_write_string(wsMem, 0, i, memHeaders[i], fmtHeader);
 
     // Raw Data Header
     const char* rawHeaders[] = {"Step", "BatchTimeMs", "MLUPS", "LBM ms", "Aero ms", "Drag", "Lift", "Residual", "VRAM Used", "VRAM Budget", "GPU", "Model", "Grid", "Operator", "Velocity"};
-    for (int i = 0; i < 15; ++i) worksheet_write_string(wsRaw, 0, i, rawHeaders[i], fmtHeader);
+    for (lxw_col_t i = 0; i < 15; ++i) worksheet_write_string(wsRaw, 0, i, rawHeaders[i], fmtHeader);
 
     // Write Data
     uint32_t rowRaw = 1;

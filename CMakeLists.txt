@@ -19,7 +19,7 @@ elseif(LINUX)
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-find_package(Vulkan REQUIRED)
+find_package(Vulkan 1.3 REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
 find_package(assimp CONFIG REQUIRED)

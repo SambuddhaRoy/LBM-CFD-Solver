@@ -15,8 +15,7 @@ BOOL WINAPI consoleCtrlHandler(DWORD dwCtrlType) {
     if (dwCtrlType == CTRL_C_EVENT || dwCtrlType == CTRL_BREAK_EVENT) {
         std::cout << "\n[INFO] Received Ctrl+C. Shutting down...\n";
         vwt::Logger::log("Shutdown requested via Ctrl+C");
-        exit(0);
-        return TRUE;
+        exit(0);  // does not return
     }
     return FALSE;
 }

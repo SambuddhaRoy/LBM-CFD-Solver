@@ -4,6 +4,7 @@
 #include <string>
 #include <chrono>
 #include <iomanip>
+#include <ctime>
 
 namespace vwt {
 
@@ -19,8 +20,16 @@ public:
         auto time = std::chrono::system_clock::to_time_t(now);
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
 
+        // Thread-safe, cross-platform local time conversion.
+        std::tm tmBuf{};
+#ifdef _WIN32
+        localtime_s(&tmBuf, &time);
+#else
+        localtime_r(&time, &tmBuf);
+#endif
+
         std::stringstream ss;
-        ss << "[" << std::put_time(std::localtime(&time), "%H:%M:%S") 
+        ss << "[" << std::put_time(&tmBuf, "%H:%M:%S")
            << "." << std::setfill('0') << std::setw(3) << ms.count() << "] " 
            << message;
 

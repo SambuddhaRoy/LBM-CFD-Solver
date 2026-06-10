@@ -4,7 +4,7 @@
 <img src="https://img.shields.io/badge/C%2B%2B-23-00599C?style=for-the-badge&logo=c%2B%2B" />
 <img src="https://img.shields.io/badge/Vulkan-1.3-AD1F1F?style=for-the-badge&logo=vulkan" />
 <img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" />
-<img src="https://img.shields.io/badge/Platform-Windows-0078D4?style=for-the-badge&logo=windows" />
+<img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-0078D4?style=for-the-badge&logo=windows" />
 
 <br /><br />
 
@@ -32,7 +32,7 @@ The entire solver and visualization pipeline lives in Vulkan compute shaders. Th
 
 ## What's new in v0.1.0-dev
 
-This release is a complete rewrite of the engine and UI. The main branch (`main`) contains the stable v0.0.2-alpha. All active development is on the `rewrite-windows` branch.
+This release is a complete rewrite of the engine and UI, now merged into `main`. Native Linux support (with its UI refinements) lives on the `linux-native` branch.
 
 **Engine & Performance**
 - **Frames-in-flight (2)** — each frame has its own command pool, buffers, and sync primitives, eliminating CPU-GPU stalls and enabling true double-buffering
@@ -146,7 +146,7 @@ $buildRoot = "$env:USERPROFILE\Documents\VirtualWindTunnel-build"
 New-Item -ItemType Directory -Force -Path $buildRoot | Out-Null
 
 # Clone repo
-git clone https://github.com/SambuddhaRoy/VirtualWindTunnel.git "$buildRoot\VirtualWindTunnel"
+git clone https://github.com/SambuddhaRoy/LBM-CFD-Solver.git "$buildRoot\VirtualWindTunnel"
 
 # Bootstrap vcpkg
 git clone https://github.com/microsoft/vcpkg.git "$buildRoot\vcpkg"
@@ -174,24 +174,14 @@ Write-Host "`nDone. EXE at: $buildRoot\install" -ForegroundColor Green
 
 The output is in `Documents\VirtualWindTunnel-build\install\` — everything needed to run is there including the compiled shaders and all DLLs.
 
-### Building the rewrite branch
-
-To build the latest development code:
+### Branches
 
 ```powershell
-Set-Location "$env:USERPROFILE\Documents\VirtualWindTunnel-build\VirtualWindTunnel"
-git fetch origin
-git checkout rewrite-windows
+git checkout main          # current engine + UI (Windows)
+git checkout linux-native  # native Linux build with UI refinements
 ```
 
-Then re-run the cmake configure and build steps above.
-
-### Switching branches
-
-```powershell
-git checkout main            # stable v0.0.2-alpha
-git checkout rewrite-windows # active development
-```
+For the native Linux build, see [`INSTALL_ARCH.md`](INSTALL_ARCH.md).
 
 <br />
 
@@ -219,11 +209,13 @@ VirtualWindTunnel/
 │   ├── vk_types.h          — Shared structs, VK_CHECK, DeletionQueue
 │   ├── environment.h       — Fluid environment profiles (Earth, Mars, ...)
 │   ├── sim_scaler.h        — Lattice ↔ physical unit conversion
-│   └── logger.h            — Simple file + console logger
+│   ├── logger.h            — Simple file + console logger
+│   └── benchmark/          — Automated benchmark harness + xlsx report export
 ├── shaders/
 │   ├── fluid_lbm.comp      — D3Q19 collision-and-stream (BGK + MRT)
 │   ├── velocity_slice.comp — 4-mode visualization (velocity/pressure/vorticity/Q)
-│   └── aero_forces.comp    — Parallel pressure-force integration
+│   ├── aero_forces.comp    — Parallel pressure-force integration
+│   └── residual.comp       — Parallel convergence-residual reduction
 ├── CMakeLists.txt
 └── vcpkg.json
 ```

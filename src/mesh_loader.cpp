@@ -182,10 +182,36 @@ std::vector<uint32_t> MeshLoader::voxelizeSurface(
     }
 
     std::cout << "[Voxelizer] Marked " << solidCount << " / " << totalCells
-              << " cells as solid (" 
+              << " cells as solid ("
               << (100.0f * solidCount / totalCells) << "%)\n";
 
     return obstacleMap;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Frontal area projection (looking along +X — the flow direction)
+// ════════════════════════════════════════════════════════════════════════
+//
+// Reference area for the drag/lift coefficients. We project the obstacle
+// onto the YZ plane and count cells that are solid in at least one X-slice;
+// that's the silhouette the flow "sees" head-on. Returned in lattice units²
+// — physical dx cancels out of C_D / C_L so no further scaling is needed.
+// ════════════════════════════════════════════════════════════════════════
+
+uint32_t MeshLoader::computeFrontalArea(const std::vector<uint32_t>& obstacle,
+                                        uint32_t gridX, uint32_t gridY, uint32_t gridZ)
+{
+    if (obstacle.empty()) return 0;
+    uint32_t cells = 0;
+    for (uint32_t z = 0; z < gridZ; ++z) {
+        for (uint32_t y = 0; y < gridY; ++y) {
+            const size_t row = size_t(z) * gridX * gridY + size_t(y) * gridX;
+            for (uint32_t x = 0; x < gridX; ++x) {
+                if (obstacle[row + x] != 0u) { ++cells; break; }
+            }
+        }
+    }
+    return cells;
 }
 
 // ════════════════════════════════════════════════════════════════════════

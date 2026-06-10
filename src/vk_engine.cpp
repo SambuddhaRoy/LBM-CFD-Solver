@@ -24,6 +24,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cmath>
+#include <cfloat>
 #include <cstring>
 #include <stdarg.h>
 
@@ -68,47 +69,6 @@ static std::string openFileDialog() {
 
 namespace vwt {
 
-// ─── UI helpers ──────────────────────────────────────────────────────────────
-
-static bool SectionHeader(const char* label, bool open = true) {
-    ImGui::PushStyleColor(ImGuiCol_Header,        {0.07f,0.07f,0.10f,1.f});
-    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, {0.10f,0.10f,0.14f,1.f});
-    ImGui::PushStyleColor(ImGuiCol_HeaderActive,  {0.12f,0.12f,0.17f,1.f});
-    bool r = ImGui::CollapsingHeader(label, open ? ImGuiTreeNodeFlags_DefaultOpen : 0);
-    ImGui::PopStyleColor(3);
-    return r;
-}
-
-static void Sep() {
-    ImGui::PushStyleColor(ImGuiCol_Separator, {0.12f,0.12f,0.17f,1.f});
-    ImGui::Separator();
-    ImGui::PopStyleColor();
-}
-
-static void LabelValue(const char* label, const char* fmt, ...) {
-    va_list a; va_start(a,fmt); char buf[64]; vsnprintf(buf,64,fmt,a); va_end(a);
-    ImGui::PushStyleColor(ImGuiCol_Text, {0.40f,0.40f,0.52f,1.f});
-    ImGui::TextUnformatted(label);
-    ImGui::PopStyleColor();
-    float rw = ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(buf).x;
-    ImGui::SameLine(rw > 0 ? ImGui::GetCursorPosX() + rw : 0);
-    ImGui::PushStyleColor(ImGuiCol_Text, {0.82f,0.82f,0.90f,1.f});
-    ImGui::TextUnformatted(buf);
-    ImGui::PopStyleColor();
-}
-
-static void TinyBar(float frac, ImVec4 col, float h = 3.f) {
-    ImVec2 p = ImGui::GetCursorScreenPos();
-    float  w = ImGui::GetContentRegionAvail().x;
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(p, {p.x+w, p.y+h}, IM_COL32(24,24,34,255), 1.f);
-    float fill = std::clamp(frac, 0.f, 1.f);
-    if (fill > 0)
-        dl->AddRectFilled(p, {p.x+w*fill, p.y+h},
-                          ImGui::ColorConvertFloat4ToU32(col), 1.f);
-    ImGui::Dummy({w, h+2});
-}
-
 // ════════════════════════════════════════════════════════════════════════════
 // Init / cleanup
 // ════════════════════════════════════════════════════════════════════════════
@@ -142,6 +102,10 @@ void VulkanEngine::cleanup() {
         vkDestroySemaphore(device_, f.presentSemaphore, nullptr);
         vkDestroySemaphore(device_, f.renderSemaphore, nullptr);
         vkDestroyFence(device_, f.renderFence, nullptr);
+        if (hasAsyncCompute_) {
+            vkDestroyCommandPool(device_, f.computePool, nullptr);   // also frees computeCmd
+            vkDestroySemaphore(device_, f.computeFinished, nullptr);
+        }
     }
     ImGui_ImplVulkan_Shutdown();
     ImGui_ImplGlfw_Shutdown();
@@ -150,7 +114,9 @@ void VulkanEngine::cleanup() {
     vmaDestroyAllocator(allocator_);
     vkDestroyDevice(device_, nullptr);
     vkDestroySurfaceKHR(instance_, surface_, nullptr);
+#ifndef NDEBUG
     vkb::destroy_debug_utils_messenger(instance_, debugMessenger_);
+#endif
     vkDestroyInstance(instance_, nullptr);
     glfwDestroyWindow(window_);
     glfwTerminate();
@@ -187,19 +153,21 @@ void VulkanEngine::run() {
         avgFrameMs_ = avgFrameMs_*0.95f + ms*0.05f;
 
         float fps = avgFrameMs_ > 0 ? 1000.f / avgFrameMs_ : 0;
-        fpsHistory_[fpsHistIdx_++ % kHist] = fps;
 
-        if (simRunning_ && meshLoaded_) {
-            float target = 1e-5f + std::exp(-float(totalSteps_)*0.00015f)*0.9f;
-            simResidual_ = simResidual_*0.97f + target*0.03f;
-        }
-        residualHistory_[fpsHistIdx_ % kHist] = std::log10(std::max(simResidual_, 1e-9f));
+        // simResidual_ is updated from a real GPU reduction in drawFrame() on
+        // each aero/residual sample frame; here we only record it to history.
+
+        // Write both ring buffers at the same slot, then advance modularly.
+        // Plain post-increment on an int would overflow after ~2.3B frames (UB).
+        fpsHistory_[fpsHistIdx_]      = fps;
+        residualHistory_[fpsHistIdx_] = std::log10(std::max(simResidual_, 1e-9f));
+        fpsHistIdx_ = (fpsHistIdx_ + 1) % kHist;
 
         // VRAM budget
         VmaBudget budgets[VK_MAX_MEMORY_HEAPS];
         vmaGetHeapBudgets(allocator_, budgets);
         vramBudget_ = 0; vramUsage_ = 0;
-        for (int i = 0; i < 8; ++i) {
+        for (uint32_t i = 0; i < memHeapCount_; ++i) {  // Fix 2: use actual heap count
             vramBudget_ = std::max(vramBudget_, budgets[i].budget);
             vramUsage_  = std::max(vramUsage_,  budgets[i].usage);
         }
@@ -286,11 +254,14 @@ void VulkanEngine::dropCallback(GLFWwindow* w, int n, const char** paths) {
 
 void VulkanEngine::initVulkan() {
     vkb::InstanceBuilder ib;
-    auto ir = ib.set_app_name("VirtualWindTunnel")
-               .request_validation_layers(true)
-               .use_default_debug_messenger()
-               .require_api_version(1,3,0)
-               .build();
+    ib.set_app_name("VirtualWindTunnel")
+      .require_api_version(1, 3, 0);
+#ifndef NDEBUG
+    // Validation layers are useful in development but cost noticeable per-frame
+    // overhead in Release; only enable them when building Debug.
+    ib.request_validation_layers(true).use_default_debug_messenger();
+#endif
+    auto ir = ib.build();
     if (!ir) throw std::runtime_error("Vulkan instance: " + ir.error().message());
     instance_       = ir.value().instance;
     debugMessenger_ = ir.value().debug_messenger;
@@ -307,6 +278,12 @@ void VulkanEngine::initVulkan() {
     vkGetPhysicalDeviceProperties(physDevice_, &props);
     snprintf(gpuName_, sizeof(gpuName_), "%s", props.deviceName);
     Logger::log("GPU: " + std::string(gpuName_));
+
+    // Store actual memory heap count for VRAM budget polling (Fix 2).
+    // VK_MAX_MEMORY_HEAPS is 16 but most GPUs expose 2-4; hardcoding 8 was wrong.
+    VkPhysicalDeviceMemoryProperties memProps;
+    vkGetPhysicalDeviceMemoryProperties(physDevice_, &memProps);
+    memHeapCount_ = memProps.memoryHeapCount;
 
     vkb::DeviceBuilder db(pr.value());
     auto dr = db.build();
@@ -327,7 +304,10 @@ void VulkanEngine::initVulkan() {
     }
 
     VmaAllocatorCreateInfo vai{};
-    vai.physicalDevice = physDevice_; vai.device = device_; vai.instance = instance_;
+    vai.physicalDevice   = physDevice_;
+    vai.device           = device_;
+    vai.instance         = instance_;
+    vai.vulkanApiVersion = VK_API_VERSION_1_3;  // Fix 1: unlock Vulkan 1.3 allocation paths
     vmaCreateAllocator(&vai, &allocator_);
 }
 
@@ -395,6 +375,24 @@ void VulkanEngine::initFrameData() {
         si.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
         VK_CHECK(vkCreateSemaphore(device_, &si, nullptr, &f.presentSemaphore));
         VK_CHECK(vkCreateSemaphore(device_, &si, nullptr, &f.renderSemaphore));
+
+        // ── Fix 5: dedicated async-compute resources ──────────────────────────
+        if (hasAsyncCompute_) {
+            VkCommandPoolCreateInfo cpi{};
+            cpi.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            cpi.queueFamilyIndex = computeQueueFamily_;
+            cpi.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+            VK_CHECK(vkCreateCommandPool(device_, &cpi, nullptr, &f.computePool));
+
+            VkCommandBufferAllocateInfo cai{};
+            cai.sType               = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cai.commandPool         = f.computePool;
+            cai.level               = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cai.commandBufferCount  = 1;
+            VK_CHECK(vkAllocateCommandBuffers(device_, &cai, &f.computeCmd));
+
+            VK_CHECK(vkCreateSemaphore(device_, &si, nullptr, &f.computeFinished));
+        }
     }
 }
 
@@ -597,12 +595,24 @@ void VulkanEngine::loadMesh(const std::string& path) {
         auto mesh = meshLoader_.loadMesh(path);
         auto obs  = meshLoader_.voxelizeSurface(mesh,
                         simParams_.gridX, simParams_.gridY, simParams_.gridZ);
+        // Reference area for C_D / C_L. dx² cancels out of the coefficients
+        // so the cell count alone is enough.
+        frontalCells_ = MeshLoader::computeFrontalArea(obs,
+                            simParams_.gridX, simParams_.gridY, simParams_.gridZ);
         fluidSolver_.uploadObstacleMap(obs);
         fluidSolver_.resetToEquilibrium();
         meshLoaded_   = true;
         totalSteps_   = 0;
         simResidual_  = 1.f;
-        Logger::log("Mesh loaded: " + path);
+        // Reset aero history so the new mesh isn't compared against the old one
+        for (int i = 0; i < kHist; ++i) {
+            aeroCdHistory_[i] = 0.f;
+            aeroClHistory_[i] = 0.f;
+        }
+        aeroHistIdx_ = 0;
+        aeroCD_ = aeroCL_ = aeroCDPrev_ = aeroCLPrev_ = 0.f;
+        Logger::log("Mesh loaded: " + path + "  (frontal area: "
+                    + std::to_string(frontalCells_) + " cells)");
     } catch (const std::exception& e) {
         Logger::error("Mesh load failed: " + std::string(e.what()));
     }
@@ -673,10 +683,30 @@ void VulkanEngine::drawFrame() {
     if (totalSteps_ > 0) {
         auto t = fluidSolver_.readTimings();
         gpuTimings_.lbmMs  = gpuTimings_.lbmMs  * 0.9f + t.lbmMs  * 0.1f;
-        gpuTimings_.aeroMs = gpuTimings_.aeroMs * 0.9f + t.aeroMs * 0.1f;
+        // aeroMs slots are only written on dispatch frames; otherwise the query
+        // pool returns the stale last value. Blend only when fresh.
         if (aeroDispatchThisFrame_) {
+            gpuTimings_.aeroMs = gpuTimings_.aeroMs * 0.9f + t.aeroMs * 0.1f;
             aeroForces_ = fluidSolver_.readAeroForces();
+            // Real measured convergence residual from the velocity-field delta.
+            simResidual_ = fluidSolver_.readResidual();
             aeroDispatchThisFrame_ = false;
+
+            // Refresh coefficients and push to history. With the reference
+            // area expressed in lattice cells, dx² cancels out of C_D / C_L
+            // and we only need lattice U and the cell-count area.
+            //   C_D = F_drag / (½ U² A)
+            const float v   = simParams_.inletVelX;
+            const float q   = 0.5f * v * v;
+            const float A   = frontalCells_ > 0 ? float(frontalCells_) : 1.f;
+            const float den = (q * A > 1e-8f) ? q * A : 1.f;
+            aeroCDPrev_ = aeroCD_;
+            aeroCLPrev_ = aeroCL_;
+            aeroCD_     = aeroForces_.drag / den;
+            aeroCL_     = aeroForces_.lift / den;
+            aeroCdHistory_[aeroHistIdx_] = aeroCD_;
+            aeroClHistory_[aeroHistIdx_] = aeroCL_;
+            aeroHistIdx_ = (aeroHistIdx_ + 1) % kHist;
         }
     }
 
@@ -685,16 +715,80 @@ void VulkanEngine::drawFrame() {
                        fr.presentSemaphore, VK_NULL_HANDLE, &imageIndex);
     if (acq == VK_ERROR_OUT_OF_DATE_KHR) { recreateSwapchain(); return; }
 
-    VK_CHECK(vkResetCommandBuffer(fr.commandBuffer, 0));
-    buildCommandBuffer(fr.commandBuffer, imageIndex);
+    // ── Fix 5: async compute path ─────────────────────────────────────────
+    // When a dedicated compute queue is available, record all LBM work into a
+    // separate command buffer and submit it to computeQueue_ before the
+    // graphics submission.  The graphics queue then waits on computeFinished
+    // (which guarantees the macroBuffer_ release barrier has executed) before
+    // running the visualisation pass.
+    const bool useAsyncCompute = hasAsyncCompute_ && simRunning_ && meshLoaded_;
+    if (useAsyncCompute) {
+        VK_CHECK(vkResetCommandBuffer(fr.computeCmd, 0));
+        VkCommandBufferBeginInfo cbi{};
+        cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VK_CHECK(vkBeginCommandBuffer(fr.computeCmd, &cbi));
 
-    VkPipelineStageFlags ws = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        for (int i = 0; i < stepsPerFrame_; ++i) {
+            bool last = (i == stepsPerFrame_ - 1);
+            fluidSolver_.step(fr.computeCmd, simParams_, uint32_t(totalSteps_), last);
+            ++totalSteps_;
+        }
+        aeroDispatchThisFrame_ = (totalSteps_ % aeroUpdateInterval_ == 0);
+        if (aeroDispatchThisFrame_) {
+            fluidSolver_.dispatchAeroForces(fr.computeCmd, simParams_, true);
+            fluidSolver_.dispatchResidual(fr.computeCmd, simParams_);
+        }
+
+        // Release macroBuffer_ ownership to the graphics queue.
+        VkBufferMemoryBarrier bmb{};
+        bmb.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        bmb.srcAccessMask       = VK_ACCESS_SHADER_WRITE_BIT;
+        bmb.dstAccessMask       = 0;
+        bmb.srcQueueFamilyIndex = computeQueueFamily_;
+        bmb.dstQueueFamilyIndex = graphicsQueueFamily_;
+        bmb.buffer              = fluidSolver_.getMacroBuffer();
+        bmb.offset              = 0;
+        bmb.size                = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(fr.computeCmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            0, 0, nullptr, 1, &bmb, 0, nullptr);
+
+        VK_CHECK(vkEndCommandBuffer(fr.computeCmd));
+
+        VkSubmitInfo compSI{};
+        compSI.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        compSI.commandBufferCount   = 1;
+        compSI.pCommandBuffers      = &fr.computeCmd;
+        compSI.signalSemaphoreCount = 1;
+        compSI.pSignalSemaphores    = &fr.computeFinished;
+        VK_CHECK(vkQueueSubmit(computeQueue_, 1, &compSI, VK_NULL_HANDLE));
+    }
+
+    // ── Graphics command buffer ───────────────────────────────────────────
+    VK_CHECK(vkResetCommandBuffer(fr.commandBuffer, 0));
+    buildCommandBuffer(fr.commandBuffer, imageIndex, useAsyncCompute);
+
+    // ── Graphics submission ───────────────────────────────────────────────
+    // Non-async: wait only on the swapchain image semaphore.
+    // Async:     also wait on computeFinished so the graphics queue acquires
+    //            macroBuffer_ ownership before the visualisation shader reads it.
+    const VkPipelineStageFlags waitMasks[2] = {
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+    };
+    const VkSemaphore waitSems[2] = { fr.presentSemaphore, fr.computeFinished };
+
     VkSubmitInfo si{};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.waitSemaphoreCount   = 1; si.pWaitSemaphores   = &fr.presentSemaphore;
-    si.pWaitDstStageMask    = &ws;
-    si.commandBufferCount   = 1; si.pCommandBuffers   = &fr.commandBuffer;
-    si.signalSemaphoreCount = 1; si.pSignalSemaphores = &fr.renderSemaphore;
+    si.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.waitSemaphoreCount   = useAsyncCompute ? 2u : 1u;
+    si.pWaitSemaphores      = waitSems;
+    si.pWaitDstStageMask    = waitMasks;
+    si.commandBufferCount   = 1;
+    si.pCommandBuffers      = &fr.commandBuffer;
+    si.signalSemaphoreCount = 1;
+    si.pSignalSemaphores    = &fr.renderSemaphore;
     VK_CHECK(vkQueueSubmit(graphicsQueue_, 1, &si, fr.renderFence));
 
     VkPresentInfoKHR pres{};
@@ -707,23 +801,46 @@ void VulkanEngine::drawFrame() {
     currentFrame_ = (currentFrame_ + 1) % FRAMES_IN_FLIGHT;
 }
 
-void VulkanEngine::buildCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
+void VulkanEngine::buildCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex, bool asyncComputeMode) {
     VkCommandBufferBeginInfo bi{};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
 
-    // LBM steps
-    if (simRunning_ && meshLoaded_) {
+    // In the non-async path, LBM runs here on the graphics queue.
+    // In the async path, LBM was already submitted to computeQueue_ in drawFrame().
+    if (!asyncComputeMode && simRunning_ && meshLoaded_) {
+        // Only the last step of the batch records GPU timestamps —
+        // they share two query-pool slots, so writing every step would race.
         for (int i = 0; i < stepsPerFrame_; ++i) {
-            fluidSolver_.step(cmd, simParams_, uint32_t(totalSteps_));
+            bool last = (i == stepsPerFrame_ - 1);
+            fluidSolver_.step(cmd, simParams_, uint32_t(totalSteps_), last);
             ++totalSteps_;
         }
-        // Dispatch aero forces every N frames
         aeroDispatchThisFrame_ = (totalSteps_ % aeroUpdateInterval_ == 0);
         if (aeroDispatchThisFrame_) {
-            fluidSolver_.dispatchAeroForces(cmd, simParams_);
+            fluidSolver_.dispatchAeroForces(cmd, simParams_, true);
+            fluidSolver_.dispatchResidual(cmd, simParams_);
         }
+    }
+
+    // Fix 5: acquire macroBuffer_ ownership from the compute queue before the
+    // visualisation shader reads it.  The graphics queue already waited on
+    // computeFinished, which ordered the release barrier on the compute side.
+    if (asyncComputeMode && simRunning_ && meshLoaded_) {
+        VkBufferMemoryBarrier bmb{};
+        bmb.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        bmb.srcAccessMask       = 0;
+        bmb.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
+        bmb.srcQueueFamilyIndex = computeQueueFamily_;
+        bmb.dstQueueFamilyIndex = graphicsQueueFamily_;
+        bmb.buffer              = fluidSolver_.getMacroBuffer();
+        bmb.offset              = 0;
+        bmb.size                = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 1, &bmb, 0, nullptr);
     }
 
     // Visualization slice
@@ -813,43 +930,6 @@ static void CardAccent(ImVec4 col) {
     ImGui::GetWindowDrawList()->AddRectFilled(
         {p.x+1, p.y+4}, {p.x+3, p.y + ImGui::GetWindowHeight()-4},
         ImGui::ColorConvertFloat4ToU32(col), 2.f);
-}
-
-// Big headline metric: large number + unit + optional delta badge
-static void BigMetric(const char* label, const char* valFmt, float val,
-                      const char* unit = "",
-                      float deltaPercent = 0.f, bool showDelta = false) {
-    ImGui::PushStyleColor(ImGuiCol_Text, {0.38f,0.38f,0.50f,1.f});
-    ImGui::Text("%s", label);
-    ImGui::PopStyleColor();
-
-    char vbuf[32]; snprintf(vbuf, sizeof(vbuf), valFmt, val);
-    ImGui::PushStyleColor(ImGuiCol_Text, {0.92f,0.92f,0.98f,1.f});
-    ImGui::SetWindowFontScale(1.35f);
-    ImGui::TextUnformatted(vbuf);
-    ImGui::SetWindowFontScale(1.f);
-    ImGui::PopStyleColor();
-
-    if (unit[0]) {
-        ImGui::SameLine(0,4);
-        ImGui::PushStyleColor(ImGuiCol_Text, {0.38f,0.38f,0.50f,1.f});
-        ImGui::TextUnformatted(unit);
-        ImGui::PopStyleColor();
-    }
-
-    if (showDelta && deltaPercent != 0.f) {
-        char db[16]; snprintf(db, sizeof(db), "%+.1f%%", deltaPercent);
-        bool pos = deltaPercent > 0.f;
-        ImVec4 dc = pos ? ImVec4{1.f,0.52f,0.52f,1.f} : ImVec4{0.11f,0.82f,0.63f,1.f};
-        ImVec4 bg = pos ? ImVec4{0.20f,0.04f,0.04f,1.f} : ImVec4{0.04f,0.18f,0.12f,1.f};
-        ImGui::SameLine(0,6);
-        ImGui::PushStyleColor(ImGuiCol_Button,        bg);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, bg);
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  bg);
-        ImGui::PushStyleColor(ImGuiCol_Text,          dc);
-        ImGui::SmallButton(db);
-        ImGui::PopStyleColor(4);
-    }
 }
 
 // Gradient bar (mini sparkline height indicator + label on same row)
@@ -1505,6 +1585,8 @@ void VulkanEngine::drawUI_Left() {
                     fluidSolver_.uploadObstacleMap(empty);
                     fluidSolver_.resetToEquilibrium();
                     meshLoaded_ = false; memset(meshPath_, 0, 512);
+                    frontalCells_ = 0;
+                    aeroCD_ = aeroCL_ = aeroCDPrev_ = aeroCLPrev_ = 0.f;
                 }
                 ImGui::PopStyleColor(2);
             } else {
@@ -1550,7 +1632,16 @@ void VulkanEngine::drawUI_Left() {
             ImGui::Dummy({0, s(6.f)});
 
             static const char* uNames[] = {"m/s", "km/h", "mph", "kn"};
-            static const float uScale[] = {594.45f, 2140.f, 1329.f, 1155.f};
+            // Conversion factors from m/s into the displayed unit.
+            // (We derive m/s from the current environment's speed of sound below.)
+            constexpr float kMpsToKmh = 3.6f;
+            constexpr float kMpsToMph = 2.2369363f;
+            constexpr float kMpsToKn  = 1.9438445f;
+            const auto& env  = EnvironmentRegistry::get(simParams_.currentEnvironmentIndex);
+            const float mps  = latticeToMps(env);            // lattice → m/s
+            const float uScale[4] = {
+                mps, mps * kMpsToKmh, mps * kMpsToMph, mps * kMpsToKn
+            };
             float tabW = (ImGui::GetContentRegionAvail().x - s(6.f)) / 4.f;
             for (int i = 0; i < 4; ++i) {
                 if (ToggleBtn(uNames[i], velocityUnit_ == i, {tabW, s(22.f)}))
@@ -1580,8 +1671,14 @@ void VulkanEngine::drawUI_Left() {
             ImGui::Dummy({0, s(2.f)});
             SliderPill("##turb", "Turbulence", &simParams_.turbulence, 0.f, 0.1f, "%.3f");
 
-            float vPhys = simParams_.inletVelX * 594.45f;
-            float Re    = std::abs(vPhys) * 0.3f / 1.5e-5f;
+            // Reynolds number uses the current environment's kinematic
+            // viscosity instead of being pinned to Earth air. The 0.3 m
+            // characteristic length is still a placeholder until the mesh
+            // exposes a real reference length.
+            constexpr float kCharLength = 0.3f;
+            float vPhys = simParams_.inletVelX * mps;
+            float nu    = std::max(env.getKinematicViscosity(), 1e-12f);
+            float Re    = std::abs(vPhys) * kCharLength / nu;
             ImGui::Dummy({0, s(4.f)});
             StatRow("Reynolds number", "%.2e", Re);
             ImGui::Dummy({0, s(6.f)});
@@ -1656,6 +1753,10 @@ void VulkanEngine::drawUI_Left() {
             ImGui::Dummy({0, s(4.f)});
 
             SliderPill("##tau", "Relaxation \xCF\x84", &simParams_.tau, 0.501f, 2.f, "%.4f");
+            {   // Fix 4: show implied lattice kinematic viscosity so tau is meaningful
+                float nuLB = (simParams_.tau - 0.5f) / 3.0f;
+                StatRow("Nu (lattice)", "%.5f", nuLB);
+            }
             if (simParams_.lbmMode == 1) {
                 SliderPill("##sb", "s_bulk",  &simParams_.s_bulk,  0.5f, 2.f, "%.2f");
                 SliderPill("##sg", "s_ghost", &simParams_.s_ghost, 0.5f, 2.f, "%.2f");
@@ -1786,7 +1887,10 @@ void VulkanEngine::drawViewportColorbar(ImDrawList* dl, ImVec2 vpMin, ImVec2 vpM
     }
     dl->AddRect({x0, y0}, {x0 + cbW, y0 + cbH}, IM_COL32(40, 40, 56, 200), 2.f);
 
-    float maxV = simParams_.maxVelocity * 594.45f;
+    // Velocity colorbar maximum reflects the current environment's sound
+    // speed (was previously pinned to Earth via the magic 594.45 constant).
+    const auto& env = EnvironmentRegistry::get(simParams_.currentEnvironmentIndex);
+    float maxV = simParams_.maxVelocity * latticeToMps(env);
     for (int i = 0; i < 5; ++i) {
         float t   = float(i) / 4.f;
         float yt  = y0 + cbH * (1.f - t) - s(5.f);
@@ -2027,12 +2131,10 @@ void VulkanEngine::drawCard_Aero() {
     ImGui::Dummy({0, s(6.f)});
 
     if (hasData) {
-        float v   = simParams_.inletVelX;
-        float q   = 0.5f * v * v;
-        float A   = 0.05f;
-        float den = (q * A > 1e-8f) ? q * A : 1.f;
-        aeroCD_   = aeroForces_.drag / den;
-        aeroCL_   = aeroForces_.lift / den;
+        // C_D / C_L are refreshed in drawFrame() when a new aero readback
+        // lands; here we just read the cached values and the delta vs the
+        // previous sample. Reference area comes from frontalCells_ which
+        // is computed from the voxelised mesh in loadMesh().
         float dCD = aeroCDPrev_ != 0.f ? (aeroCD_ - aeroCDPrev_) / std::abs(aeroCDPrev_) * 100.f : 0.f;
         float dCL = aeroCLPrev_ != 0.f ? (aeroCL_ - aeroCLPrev_) / std::abs(aeroCLPrev_) * 100.f : 0.f;
 
@@ -2076,15 +2178,24 @@ void VulkanEngine::drawCard_Aero() {
 
         ImGui::Dummy({0, s(6.f)});
         float LD = std::abs(aeroCL_) / std::max(std::abs(aeroCD_), 0.001f);
-        StatRow("L/D ratio", "%.2f", LD);
-        StatRow("Raw drag",  "%.5f lat", aeroForces_.drag);
-        StatRow("Raw lift",  "%.5f lat", aeroForces_.lift);
+        StatRow("L/D ratio",  "%.2f",       LD);
+        StatRow("Ref area",   "%u cells",   float(frontalCells_));
+        StatRow("Raw drag",   "%.5f lat",   aeroForces_.drag);
+        StatRow("Raw lift",   "%.5f lat",   aeroForces_.lift);
 
+        // C_D history. Using FLT_MAX for both bounds tells ImGui to autoscale
+        // from the data — far more useful than the previous fixed (0, 200)
+        // range that also happened to be plotting FPS by mistake.
         ImGui::Dummy({0, s(4.f)});
         ImGui::PushStyleColor(ImGuiCol_FrameBg,  ImVec4{0.04f,0.04f,0.06f,1.f});
         ImGui::PushStyleColor(ImGuiCol_PlotLines, kBlue);
-        ImGui::PlotLines("##cdl", fpsHistory_, kHist,
-            fpsHistIdx_ % kHist, nullptr, 0.f, 200.f, {-1, s(34.f)});
+        ImGui::PlotLines("##cdH", aeroCdHistory_, kHist,
+            aeroHistIdx_, "C_D", FLT_MAX, FLT_MAX, {-1, s(34.f)});
+        ImGui::PopStyleColor(2);
+        ImGui::PushStyleColor(ImGuiCol_FrameBg,  ImVec4{0.04f,0.04f,0.06f,1.f});
+        ImGui::PushStyleColor(ImGuiCol_PlotLines, kAccent);
+        ImGui::PlotLines("##clH", aeroClHistory_, kHist,
+            aeroHistIdx_, "C_L", FLT_MAX, FLT_MAX, {-1, s(34.f)});
         ImGui::PopStyleColor(2);
     } else {
         ImGui::PushStyleColor(ImGuiCol_Text, kTextMuted);
@@ -2130,8 +2241,15 @@ void VulkanEngine::drawCard_FlowStats() {
     CardHeader("Flow Statistics");
     ImGui::Dummy({0, s(6.f)});
 
-    float vPhys = simParams_.inletVelX * 594.45f;
-    float Re    = std::abs(vPhys) * 0.3f / 1.5e-5f;
+    // Both velocity and Reynolds now derive from the active environment, so
+    // switching Earth → Mars / Venus / Water updates the displayed units
+    // consistently with the solver.
+    const auto& env = EnvironmentRegistry::get(simParams_.currentEnvironmentIndex);
+    constexpr float kCharLength = 0.3f;
+    float mps   = latticeToMps(env);
+    float vPhys = simParams_.inletVelX * mps;
+    float nu    = std::max(env.getKinematicViscosity(), 1e-12f);
+    float Re    = std::abs(vPhys) * kCharLength / nu;
     StatRow("Inlet velocity",   "%.2f m/s", vPhys);
     StatRow("Reynolds",         "%.2e",     Re);
     StatRow("Relaxation \xCF\x84","%.4f",   simParams_.tau);
@@ -2419,6 +2537,7 @@ void VulkanEngine::stepBenchmark(uint32_t steps) {
         ++totalSteps_;
     }
     fluidSolver_.dispatchAeroForces(fr.commandBuffer, simParams_, true);
+    fluidSolver_.dispatchResidual(fr.commandBuffer, simParams_);
 
     VK_CHECK(vkEndCommandBuffer(fr.commandBuffer));
 
@@ -2436,9 +2555,8 @@ void VulkanEngine::stepBenchmark(uint32_t steps) {
     gpuTimings_.aeroMs = t.aeroMs;
     aeroForces_ = fluidSolver_.readAeroForces();
 
-    // Update residual with same EMA formula used in the interactive loop
-    float target = 1e-5f + std::exp(-float(totalSteps_) * 0.00015f) * 0.9f;
-    simResidual_ = simResidual_ * 0.97f + target * 0.03f;
+    // Real measured convergence residual from the velocity-field delta.
+    simResidual_ = fluidSolver_.readResidual();
 
     // Query VRAM so recordMetrics() sees live values
     VmaBudget budgets[VK_MAX_MEMORY_HEAPS];
