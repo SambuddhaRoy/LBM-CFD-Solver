@@ -166,7 +166,26 @@ void main() {
     }
     float omega = 1.0 / tauEff;
 
-    if (pc.collision == 1u) {
+    if (pc.collision == 2u) {
+        // TRT: split each population into symmetric/antisymmetric parts and
+        // relax with two rates. omega+ sets the viscosity; omega- is fixed by
+        // the magic parameter Lambda = (tau+ - 1/2)(tau- - 1/2) = 3/16, which
+        // makes the half-way bounce-back wall sit at the link midpoint
+        // independent of viscosity — removing the Reynolds-number offset that
+        // plain BGK/regularized bounce-back suffers on staircased bodies.
+        float omegaP = omega;
+        float tauM   = 0.5 + 0.1875 / max(tauEff - 0.5, 1e-4);
+        float omegaM = 1.0 / tauM;
+        for (uint q = 0u; q < 19u; ++q) {
+            uint qb = uint(opp[q]);
+            float feqP = 0.5*(feq(q, rho, u) + feq(qb, rho, u));
+            float feqM = 0.5*(feq(q, rho, u) - feq(qb, rho, u));
+            float fP   = 0.5*(f[q] + f[qb]);
+            float fM   = 0.5*(f[q] - f[qb]);
+            float fv = f[q] - omegaP*(fP - feqP) - omegaM*(fM - feqM);
+            fOut[distIdx(q, idx)] = isnan(fv) ? w[q] : fv;
+        }
+    } else if (pc.collision == 1u) {
         // Regularized BGK: project f_neq onto the second-order Hermite basis,
         // discard ghost modes, relax the hydrodynamic part.
         for (uint q = 0u; q < 19u; ++q) {

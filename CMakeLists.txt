@@ -33,6 +33,7 @@ add_executable(${PROJECT_NAME}
     src/viz.cpp
     src/ui.cpp
     src/app.cpp
+    src/validate.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/src)

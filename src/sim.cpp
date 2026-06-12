@@ -28,7 +28,8 @@ void Solver::init(GpuContext& ctx, const SimParams& p) {
     fA_       = ctx.createBuffer(fSz,  ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, MemLoc::Device);
     fB_       = ctx.createBuffer(fSz,  ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, MemLoc::Device);
     obstacle_ = ctx.createBuffer(obSz, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, MemLoc::Device);
-    macro_    = ctx.createBuffer(macSz, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, MemLoc::Device);
+    macro_    = ctx.createBuffer(macSz, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                                            | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemLoc::Device);
     prev_     = ctx.createBuffer(macSz, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, MemLoc::Device);
     staging_  = ctx.createBuffer(fSz,  VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemLoc::HostWrite);
     for (uint32_t s = 0; s < kSlots; ++s) {
