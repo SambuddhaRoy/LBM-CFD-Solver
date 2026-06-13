@@ -96,6 +96,9 @@ public:
     void destroy();
 
     void uploadObstacles(const std::vector<uint32_t>& occupancy);
+    // Override the signed-distance field (lattice units, >0 in fluid) used by
+    // the Bouzidi interpolated bounce-back. Call after uploadObstacles().
+    void setSDF(const std::vector<float>& phi);
     void reset();   // distributions to equilibrium, history cleared
 
     // Records n collide-stream steps; timestamps bracket the whole batch.
@@ -125,7 +128,7 @@ private:
     uint32_t gx_ = 0, gy_ = 0, gz_ = 0;
     bool pingPong_ = false;
 
-    GpuBuffer fA_, fB_, obstacle_, macro_, prev_, staging_;
+    GpuBuffer fA_, fB_, obstacle_, sdf_, macro_, prev_, staging_;
     GpuBuffer partial_[kSlots], readback_[kSlots];
 
     VkDescriptorPool      descPool_   = VK_NULL_HANDLE;

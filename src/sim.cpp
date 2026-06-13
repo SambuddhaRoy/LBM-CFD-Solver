@@ -28,6 +28,7 @@ void Solver::init(GpuContext& ctx, const SimParams& p) {
     fA_       = ctx.createBuffer(fSz,  ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, MemLoc::Device);
     fB_       = ctx.createBuffer(fSz,  ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, MemLoc::Device);
     obstacle_ = ctx.createBuffer(obSz, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, MemLoc::Device);
+    sdf_      = ctx.createBuffer(macSz / 4, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, MemLoc::Device);
     macro_    = ctx.createBuffer(macSz, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT
                                             | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemLoc::Device);
     prev_     = ctx.createBuffer(macSz, ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT, MemLoc::Device);
@@ -40,6 +41,7 @@ void Solver::init(GpuContext& ctx, const SimParams& p) {
     dq_.push([this] {
         ctx_->destroyBuffer(fA_);       ctx_->destroyBuffer(fB_);
         ctx_->destroyBuffer(obstacle_); ctx_->destroyBuffer(macro_);
+        ctx_->destroyBuffer(sdf_);
         ctx_->destroyBuffer(prev_);     ctx_->destroyBuffer(staging_);
         for (uint32_t s = 0; s < kSlots; ++s) {
             ctx_->destroyBuffer(partial_[s]);
@@ -47,9 +49,9 @@ void Solver::init(GpuContext& ctx, const SimParams& p) {
         }
     });
 
-    // ── Descriptor layouts: LBM (4 SSBOs), analysis (4 SSBOs) ──────────────
+    // ── Descriptor layouts: LBM (5 SSBOs), analysis (4 SSBOs) ──────────────
     auto makeLayout = [&](uint32_t count, VkDescriptorSetLayout& out) {
-        std::array<VkDescriptorSetLayoutBinding, 4> b{};
+        std::array<VkDescriptorSetLayoutBinding, 5> b{};
         for (uint32_t i = 0; i < count; ++i)
             b[i] = { i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
                      VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
@@ -59,10 +61,10 @@ void Solver::init(GpuContext& ctx, const SimParams& p) {
         li.pBindings    = b.data();
         VK_CHECK(vkCreateDescriptorSetLayout(ctx_->device(), &li, nullptr, &out));
     };
-    makeLayout(4, lbmLayout_);
+    makeLayout(5, lbmLayout_);
     makeLayout(4, anaLayout_);
 
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 };
+    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 20 };
     VkDescriptorPoolCreateInfo pi{};
     pi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     pi.maxSets       = 4;
@@ -97,9 +99,11 @@ void Solver::init(GpuContext& ctx, const SimParams& p) {
     // A→B
     write(lbmSetA_, 0, fA_.buffer); write(lbmSetA_, 1, fB_.buffer);
     write(lbmSetA_, 2, obstacle_.buffer); write(lbmSetA_, 3, macro_.buffer);
+    write(lbmSetA_, 4, sdf_.buffer);
     // B→A
     write(lbmSetB_, 0, fB_.buffer); write(lbmSetB_, 1, fA_.buffer);
     write(lbmSetB_, 2, obstacle_.buffer); write(lbmSetB_, 3, macro_.buffer);
+    write(lbmSetB_, 4, sdf_.buffer);
     // analysis, one set per in-flight slot (independent partial buffers)
     for (uint32_t s = 0; s < kSlots; ++s) {
         write(anaSet_[s], 0, macro_.buffer); write(anaSet_[s], 1, obstacle_.buffer);
@@ -155,6 +159,24 @@ void Solver::uploadObstacles(const std::vector<uint32_t>& occ) {
     ctx_->oneShot([&](VkCommandBuffer cmd) {
         VkBufferCopy cr{ 0, 0, sz };
         vkCmdCopyBuffer(cmd, staging_.buffer, obstacle_.buffer, 1, &cr);
+    });
+
+    // Default signed-distance field: +/- half a cell from the occupancy sign.
+    // At |phi|=0.5 the Bouzidi interpolation reduces to simple halfway
+    // bounce-back, so this is a safe default for grid-aligned bodies. Callers
+    // with an exact surface (analytic primitives) override via setSDF().
+    std::vector<float> sdf(occ.size());
+    for (size_t i = 0; i < occ.size(); ++i) sdf[i] = occ[i] ? -0.5f : 0.5f;
+    setSDF(sdf);
+}
+
+void Solver::setSDF(const std::vector<float>& phi) {
+    const VkDeviceSize sz = phi.size() * sizeof(float);
+    std::memcpy(staging_.mapped, phi.data(), sz);
+    vmaFlushAllocation(ctx_->allocator(), staging_.alloc, 0, sz);
+    ctx_->oneShot([&](VkCommandBuffer cmd) {
+        VkBufferCopy cr{ 0, 0, sz };
+        vkCmdCopyBuffer(cmd, staging_.buffer, sdf_.buffer, 1, &cr);
     });
 }
 
