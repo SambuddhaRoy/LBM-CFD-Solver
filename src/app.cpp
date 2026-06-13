@@ -110,7 +110,49 @@ bool writeBmp(const std::filesystem::path& path,
 // ════════════════════════════════════════════════════════════════════════════
 
 int App::run(const StartOptions& opts) {
-    return opts.headless ? runHeadless(opts) : runGui(opts);
+    if (opts.bench)    return runBench(opts);
+    if (opts.headless) return runHeadless(opts);
+    return runGui(opts);
+}
+
+// Pure throughput benchmark: time a single submission of N collide-stream steps
+// (no analysis, no per-step CPU synchronisation), which isolates the kernel's
+// sustained throughput from command-submission and readback overhead.
+int App::runBench(const StartOptions& opts) {
+    params.gx = opts.gx ? opts.gx : 128;
+    params.gy = opts.gy ? opts.gy : 64;
+    params.gz = opts.gz ? opts.gz : 64;
+    if (opts.lesOff)         params.les = false;
+    if (opts.collision >= 0) params.collision = opts.collision;
+    const uint32_t steps = std::max(200u, opts.steps);
+
+    gpu.init(nullptr);
+    solver.init(gpu, params);
+    model = mesh::makePrimitive(Shape::Sphere, params.gx, params.gy, params.gz, 0.f, 0.f);
+    solver.uploadObstacles(model.occupancy);
+    solver.reset();
+
+    // Warm up (driver/pipeline) then time one submission of `steps` steps.
+    gpu.oneShot([&](VkCommandBuffer cmd) {
+        solver.recordSteps(cmd, params, 200, 0, false);
+    });
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    gpu.oneShot([&](VkCommandBuffer cmd) {
+        solver.recordSteps(cmd, params, steps, 0, false);
+    });
+    const auto t1 = std::chrono::high_resolution_clock::now();
+
+    const double secs    = std::chrono::duration<double>(t1 - t0).count();
+    const double mlupsVal = double(solver.cells()) * steps / secs / 1e6;
+    const char* opName = params.collision == 0 ? "BGK"
+                       : params.collision == 2 ? "TRT" : "Regularised";
+    std::printf("%ux%ux%u  %s%s  %u steps in %.4f s  ->  %.1f MLUPS\n",
+                params.gx, params.gy, params.gz, opName,
+                params.les ? "+LES" : "", steps, secs, mlupsVal);
+
+    solver.destroy();
+    gpu.destroy();
+    return 0;
 }
 
 uint32_t App::sliceMaxIndex() const {
@@ -672,6 +714,7 @@ int App::runHeadless(const StartOptions& opts) {
     params.gy = opts.gy ? opts.gy : 64;
     params.gz = opts.gz ? opts.gz : 64;
     if (opts.lesOff) params.les = false;
+    if (opts.collision >= 0) params.collision = opts.collision;
 
     gpu.init(nullptr);
     solver.init(gpu, params);
@@ -697,11 +740,12 @@ int App::runHeadless(const StartOptions& opts) {
     modelLoaded = true;
     units.compute(model.spanCellsX, params);
 
+    const char* opName = params.collision == 0 ? "BGK"
+                       : params.collision == 2 ? "TRT" : "Regularized";
     std::printf("\n  Virtual Wind Tunnel v2 — headless validation\n");
     std::printf("  model: %-18s grid: %ux%ux%u   collision: %s%s   AoA: %.1f deg\n",
                 model.name.c_str(), params.gx, params.gy, params.gz,
-                params.collision ? "Regularized" : "BGK",
-                params.les ? " + LES" : "", opts.aoaDeg);
+                opName, params.les ? " + LES" : "", opts.aoaDeg);
     std::printf("  frontal area: %u cells   fill: %.2f%%\n\n",
                 model.frontalCells, model.fillPct);
     std::printf("  %8s  %12s  %10s  %10s  %8s  %8s\n",

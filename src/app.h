@@ -21,12 +21,14 @@ constexpr int kHist           = 160;   // plot history length
 
 struct StartOptions {
     bool        headless  = false;
+    bool        bench     = false;     // pure-throughput benchmark mode
     uint32_t    steps     = 240;       // headless step count
     int         shape     = 0;         // headless: Shape enum value
     float       aoaDeg    = 0.f;       // headless: angle of attack
     uint32_t    gx = 0, gy = 0, gz = 0;   // 0 → preset default
     std::string meshPath;
     bool        lesOff    = false;
+    int         collision = -1;        // -1 = default; 0 BGK, 1 regularised, 2 TRT
 };
 
 struct FrameData {
@@ -117,6 +119,7 @@ public:
 private:
     int  runGui(const StartOptions& opts);
     int  runHeadless(const StartOptions& opts);
+    int  runBench(const StartOptions& opts);
     void initWindow();
     void initImGui();
     void frame();
