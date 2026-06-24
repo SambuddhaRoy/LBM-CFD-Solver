@@ -21,24 +21,38 @@
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
-    uint gx, gy, gz, pad;
+    uint gx, gy, gz, curF;   // curF: 0 = read fA, 1 = read fB (last-written)
 } pc;
 
 layout(std430, set=0, binding=0) readonly  buffer Mac  { float macro[]; };
 layout(std430, set=0, binding=1) readonly  buffer Obs  { uint  solid[]; };
 layout(std430, set=0, binding=2)           buffer Prev { float prev[];  };
 layout(std430, set=0, binding=3) writeonly buffer Out  { float partial_out[]; };
+layout(std430, set=0, binding=4) readonly  buffer Fa   { float fA[]; };
+layout(std430, set=0, binding=5) readonly  buffer Fb   { float fB[]; };
 
 const uint kVals = 12u;
 shared float sdat[256];
 
-const ivec3 faceDir[6] = ivec3[6](
-    ivec3(-1,0,0), ivec3(1,0,0),
-    ivec3(0,-1,0), ivec3(0,1,0),
-    ivec3(0,0,-1), ivec3(0,0,1)
+const ivec3 e[19] = ivec3[19](
+    ivec3( 0, 0, 0),
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1, 1, 0), ivec3(-1, 1, 0),
+    ivec3( 1,-1, 0), ivec3(-1,-1, 0),
+    ivec3( 1, 0, 1), ivec3(-1, 0, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0,-1),
+    ivec3( 0, 1, 1), ivec3( 0,-1, 1),
+    ivec3( 0, 1,-1), ivec3( 0,-1,-1)
 );
+const int opp[19] = int[19](0, 2,1, 4,3, 6,5, 10,9,8,7, 14,13,12,11, 18,17,16,15);
 
 uint cellIdx(uint x, uint y, uint z) { return (z*pc.gy + y)*pc.gx + x; }
+float fval(uint q, uint cell) {
+    uint i = q*(pc.gx*pc.gy*pc.gz) + cell;
+    return (pc.curF == 0u) ? fA[i] : fB[i];
+}
 
 void main() {
     uint tid    = gl_LocalInvocationIndex;
@@ -69,27 +83,30 @@ void main() {
         prev[cell*4u+2u] = u.z;
         prev[cell*4u+3u] = 0.0;
 
-        // Pressure force on adjacent solid faces. Gauge (ρ−1)/3 keeps the
-        // closed-surface integral identical while avoiding FP cancellation.
+        // Momentum-exchange force (Ladd/Mei): per boundary link a (fluid->solid),
+        // F += e_a (f_a + f_{opp a}). Captures pressure AND viscous drag, unlike
+        // the old pressure-only sum. All 18 non-rest links carry momentum.
+        // ponytail: accuracy still capped by the resolved flow (effective-Re offset).
         uint z = cell / (pc.gx*pc.gy);
         uint r = cell % (pc.gx*pc.gy);
         uint y = r / pc.gx;
         uint x = r % pc.gx;
-        float p = (rho - 1.0) / 3.0;
 
-        for (int fc = 0; fc < 6; ++fc) {
-            int nx = int(x) + faceDir[fc].x;
-            int ny = int(y) + faceDir[fc].y;
-            int nz = int(z) + faceDir[fc].z;
+        for (uint a = 1u; a < 19u; ++a) {
+            int nx = int(x) + e[a].x;
+            int ny = int(y) + e[a].y;
+            int nz = int(z) + e[a].z;
             if (nx<0 || ny<0 || nz<0 ||
                 nx>=int(pc.gx) || ny>=int(pc.gy) || nz>=int(pc.gz)) continue;
             if (solid[cellIdx(uint(nx),uint(ny),uint(nz))] == 0u) continue;
 
-            // faceDir points fluid → solid; pressure pushes on the body
-            // along that direction.
-            v[2] += p * float(faceDir[fc].x);
-            v[3] += p * float(faceDir[fc].y);
-            v[4] += p * float(faceDir[fc].z);
+            // Static-wall momentum exchange: the post-collision population
+            // heading into the wall (dir a) is bounced back, delivering
+            // 2 e_a f_a of momentum per link.
+            float m = 2.0 * fval(a, cell);
+            v[2] += float(e[a].x) * m;
+            v[3] += float(e[a].y) * m;
+            v[4] += float(e[a].z) * m;
             v[9] += 1.0;
         }
     }

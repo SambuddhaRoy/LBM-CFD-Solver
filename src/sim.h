@@ -64,7 +64,7 @@ struct UnitScale {
 // ─── Fused analysis results ──────────────────────────────────────────────────
 struct Analysis {
     float residual   = 1.f;   // sqrt(Σ|Δu|² / Σ|u|²), measured
-    float drag = 0.f, lift = 0.f, side = 0.f;   // lattice pressure forces
+    float drag = 0.f, lift = 0.f, side = 0.f;   // momentum-exchange forces (lattice)
     float massAvg    = 0.f;   // mean ρ per fluid cell (1.0 = conserved)
     float maxU       = 0.f;   // peak |u|, lattice units
     float ke         = 0.f;   // total kinetic energy, lattice units
@@ -81,7 +81,7 @@ struct LbmPush {
     float    csSmago;
 };
 
-struct AnalysisPush { uint32_t gx, gy, gz, pad; };
+struct AnalysisPush { uint32_t gx, gy, gz, curF; };  // curF: 0=fA, 1=fB (last written)
 
 struct SlicePush {
     uint32_t gx, gy, gz, axis, index, mode;

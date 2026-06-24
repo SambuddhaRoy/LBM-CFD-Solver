@@ -62,9 +62,9 @@ void Solver::init(GpuContext& ctx, const SimParams& p) {
         VK_CHECK(vkCreateDescriptorSetLayout(ctx_->device(), &li, nullptr, &out));
     };
     makeLayout(5, lbmLayout_);
-    makeLayout(4, anaLayout_);
+    makeLayout(6, anaLayout_);
 
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 20 };
+    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 24 };
     VkDescriptorPoolCreateInfo pi{};
     pi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     pi.maxSets       = 4;
@@ -104,10 +104,12 @@ void Solver::init(GpuContext& ctx, const SimParams& p) {
     write(lbmSetB_, 0, fB_.buffer); write(lbmSetB_, 1, fA_.buffer);
     write(lbmSetB_, 2, obstacle_.buffer); write(lbmSetB_, 3, macro_.buffer);
     write(lbmSetB_, 4, sdf_.buffer);
-    // analysis, one set per in-flight slot (independent partial buffers)
+    // analysis, one set per in-flight slot (independent partial buffers).
+    // Both f buffers bound; the shader reads the last-written one via curF.
     for (uint32_t s = 0; s < kSlots; ++s) {
         write(anaSet_[s], 0, macro_.buffer); write(anaSet_[s], 1, obstacle_.buffer);
         write(anaSet_[s], 2, prev_.buffer);  write(anaSet_[s], 3, partial_[s].buffer);
+        write(anaSet_[s], 4, fA_.buffer);    write(anaSet_[s], 5, fB_.buffer);
     }
 
     dq_.push([this] {
@@ -266,7 +268,8 @@ void Solver::recordAnalysis(VkCommandBuffer cmd, const SimParams& p, uint32_t sl
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             anaPipeLayout_, 0, 1, &anaSet_[slot], 0, nullptr);
 
-    AnalysisPush push{ p.gx, p.gy, p.gz, 0 };
+    // Last LBM step wrote fB if pingPong_ is true, else fA (see recordSteps).
+    AnalysisPush push{ p.gx, p.gy, p.gz, pingPong_ ? 1u : 0u };
     vkCmdPushConstants(cmd, anaPipeLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(push), &push);
     vkCmdDispatch(cmd, kGroups, 1, 1);
