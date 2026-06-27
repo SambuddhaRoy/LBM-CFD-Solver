@@ -408,7 +408,7 @@ int runValidation(const ValidateOptions& opts) {
             {   2.f,  16000,  4000, "cyl_Re2.bmp"   },
             {  40.f,  80000,  6000, "cyl_Re40.bmp"  },
             { 100.f, 130000, 70000, "cyl_Re100.bmp" },
-            { 200.f, 160000, 90000, "cyl_Re200.bmp" },
+            { 150.f, 150000, 80000, "cyl_Re150.bmp" },
         };
         std::vector<CaseResult> results;
         for (const Spec& s : specs) {
@@ -426,25 +426,21 @@ int runValidation(const ValidateOptions& opts) {
         const CaseResult& re2   = findRe(2.f);
         const CaseResult& re40  = findRe(40.f);
         const CaseResult& re100 = findRe(100.f);
-        const CaseResult& re200 = findRe(200.f);
+        const CaseResult& re150 = findRe(150.f);
 
-        const float reEff40 = re40.recircLD / 0.05f;   // L_r/D ~ 0.05 Re
-        std::printf("\n  Regime sequence: attached -> steady twin-vortex wake ->\n");
-        std::printf("  Von Karman street, reproduced qualitatively. The wake bubble\n");
-        std::printf("  at nominal Re=40 (L_r/D=%.2f) matches an effective Re ~%.0f:\n",
-                    re40.recircLD, reEff40);
-        std::printf("  the bounce-back/discretisation still damps the effective Re to\n");
-        std::printf("  ~0.5x nominal, so shedding onset and Strouhal shift down. This\n");
-        std::printf("  is reported honestly, not tuned away.\n\n");
+        std::printf("\n  Literature: attached Re<5; steady recirc 5<Re<47 with\n");
+        std::printf("  L_r/D ~ 0.05 Re (=> ~2.1 at Re=40); shedding Re>47 with\n");
+        std::printf("  St ~ 0.164 (Re=100), 0.184 (Re=150).\n\n");
 
         struct Chk { const char* name; bool ok; };
         const Chk checks[] = {
             { "Re=2 attached (no separation)",      !re2.shedding && re2.recircLD < 0.3f },
             { "Re=40 steady recirculation",         !re40.shedding && re40.separated },
-            { "recirc length grows with Re",        re100.recircLD > re40.recircLD &&
-                                                    re40.recircLD  > re2.recircLD },
-            { "high-Re Von Karman shedding",        re200.shedding && re200.clAmp > 0.04f },
-            { "shedding has finite Strouhal",       re200.strouhal > 0.05f && re200.strouhal < 0.30f },
+            { "Re=40 recirc length 1.7-2.5 D",      re40.recircLD > 1.7f && re40.recircLD < 2.5f },
+            { "Re=100 vortex shedding",             re100.shedding },
+            { "Re=100 Strouhal 0.14-0.19",          re100.strouhal > 0.14f && re100.strouhal < 0.19f },
+            { "Re=150 Strouhal 0.16-0.21",          re150.strouhal > 0.16f && re150.strouhal < 0.21f },
+            { "Strouhal rises with Re",             re150.strouhal > re100.strouhal },
         };
         for (const Chk& c : checks) {
             std::printf("    [%s] %s\n", c.ok ? "PASS":"FAIL", c.name);

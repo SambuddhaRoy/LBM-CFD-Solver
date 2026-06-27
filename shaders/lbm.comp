@@ -165,17 +165,23 @@ void main() {
         for (uint q = 0u; q < 19u; ++q) f[q] = feq(q, rho, u);
     }
 
-    // ── Outlet: zero-gradient copy from the upstream neighbour ───────────
+    // ── Outlet: pressure BC, pin ρ=1, velocity extrapolated upstream ─────
+    // A floating zero-gradient outlet reflects/accumulates pressure, which
+    // back-pressurises the domain and throttles the bulk velocity below uIn
+    // (halving the effective Reynolds number). Pinning ρ=1 here gives the
+    // standard velocity-in / pressure-out pairing and a well-posed problem.
+    // ponytail: equilibrium reconstruction, not Zou-He — upgrade if the
+    // outlet velocity profile needs to be exact.
     if (x == pc.gx - 1u) {
         uint up = cellIdx(x - 1u, y, z);
-        rho = 0.0; u = vec3(0.0);
+        float r2 = 0.0; vec3 u2 = vec3(0.0);
         for (uint q = 0u; q < 19u; ++q) {
             float fv = fIn[distIdx(q, up)];
-            f[q] = fv;
-            rho += fv;
-            u   += vec3(e[q]) * fv;
+            r2 += fv; u2 += vec3(e[q]) * fv;
         }
-        if (rho > 0.01) u /= rho; else { rho = 1.0; u = vec3(0.0); }
+        u2 = (r2 > 0.01) ? u2 / r2 : vec3(0.0);
+        rho = 1.0; u = u2;
+        for (uint q = 0u; q < 19u; ++q) f[q] = feq(q, 1.0, u2);
     }
 
     // ── Collision ─────────────────────────────────────────────────────────
