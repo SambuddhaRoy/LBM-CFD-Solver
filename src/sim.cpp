@@ -244,7 +244,8 @@ void Solver::recordSteps(VkCommandBuffer cmd, const SimParams& p,
         VkDescriptorSet set = pingPong_ ? lbmSetB_ : lbmSetA_;
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 lbmPipeLayout_, 0, 1, &set, 0, nullptr);
-        push.time = float(stepBase + i);
+        push.time       = float(stepBase + i);
+        push.writeMacro = (i == nSteps - 1) ? 1u : 0u;
         vkCmdPushConstants(cmd, lbmPipeLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(push), &push);
         vkCmdDispatch(cmd, dx, dy, dz);

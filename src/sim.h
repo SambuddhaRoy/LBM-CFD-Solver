@@ -79,6 +79,7 @@ struct LbmPush {
     float    tau, uIn, time, turb;
     uint32_t collision, les;
     float    csSmago;
+    uint32_t writeMacro;  // 1 = write rho/u to macro buffer (last step of batch only)
 };
 
 struct AnalysisPush { uint32_t gx, gy, gz, curF; };  // curF: 0=fA, 1=fB (last written)

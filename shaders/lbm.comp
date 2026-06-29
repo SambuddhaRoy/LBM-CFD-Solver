@@ -23,6 +23,7 @@ layout(push_constant) uniform PC {
     uint  collision;    // 0 = BGK, 1 = regularized
     uint  les;          // 1 = Smagorinsky subgrid model on
     float csSmago;      // Smagorinsky constant (~0.1–0.2)
+    uint  writeMacro;   // 1 = write rho/u to macro buffer (last step of batch)
 } pc;
 
 layout(std430, set=0, binding=0) readonly  buffer FIn  { float fIn[];  };
@@ -82,15 +83,18 @@ void main() {
     // self-reflection below), so just keep their buffer finite.
     if (solid[idx] != 0u) {
         for (uint q = 0u; q < 19u; ++q) fOut[distIdx(q, idx)] = w[q];
-        macro[idx*4u+0u] = 1.0;
-        macro[idx*4u+1u] = 0.0;
-        macro[idx*4u+2u] = 0.0;
-        macro[idx*4u+3u] = 0.0;
+        if (pc.writeMacro == 1u) {
+            macro[idx*4u+0u] = 1.0;
+            macro[idx*4u+1u] = 0.0;
+            macro[idx*4u+2u] = 0.0;
+            macro[idx*4u+3u] = 0.0;
+        }
         return;
     }
 
     // ── Pull / stream; free-slip Y/Z walls; Bouzidi BB at solid links ─────
-    float phiF = sdf[idx];
+    // ponytail: phiF deferred into the solid-link branch — most fluid cells
+    // have no solid neighbours, so this avoids one sdf DRAM read per bulk cell.
     float f[19];
     for (uint q = 0u; q < 19u; ++q) {
         int sx = int(x) - e[q].x;
@@ -111,6 +115,7 @@ void main() {
             // Bouzidi interpolation; q_w is the fluid-node-to-wall fraction of
             // the link, read from the signed distance field.
             int  i   = opp[int(q)];                 // outward dir (e_i = -e_q)
+            float phiF = sdf[idx];
             float phiS = sdf[srcCell];
             float qw = clamp(phiF / max(phiF - phiS, 1e-4), 0.0, 1.0);
 
@@ -247,8 +252,10 @@ void main() {
         }
     }
 
-    macro[idx*4u+0u] = rho;
-    macro[idx*4u+1u] = u.x;
-    macro[idx*4u+2u] = u.y;
-    macro[idx*4u+3u] = u.z;
+    if (pc.writeMacro == 1u) {
+        macro[idx*4u+0u] = rho;
+        macro[idx*4u+1u] = u.x;
+        macro[idx*4u+2u] = u.y;
+        macro[idx*4u+3u] = u.z;
+    }
 }
