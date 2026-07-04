@@ -281,17 +281,17 @@ void drawLeftPanel(App& app, const Layout& l) {
         ImGui::Spacing();
 
         ImGui::PushStyleColor(ImGuiCol_Text, kDim);
-        ImGui::TextUnformatted("Angle of attack");
+        ImGui::TextUnformatted("Angle of attack (pitch)");
         ImGui::PopStyleColor();
         ImGui::SetNextItemWidth(-1);
-        ImGui::SliderFloat("##aoa", &app.aoaDeg, -20.f, 20.f, "%.1f deg");
+        ImGui::SliderFloat("##aoa", &app.aoaDeg, -90.f, 90.f, "%.1f deg");
         if (ImGui::IsItemDeactivatedAfterEdit()) app.revoxelize();
 
         ImGui::PushStyleColor(ImGuiCol_Text, kDim);
-        ImGui::TextUnformatted("Yaw");
+        ImGui::TextUnformatted("Yaw (side-to-side)");
         ImGui::PopStyleColor();
         ImGui::SetNextItemWidth(-1);
-        ImGui::SliderFloat("##yaw", &app.yawDeg, -30.f, 30.f, "%.1f deg");
+        ImGui::SliderFloat("##yaw", &app.yawDeg, -180.f, 180.f, "%.1f deg");
         if (ImGui::IsItemDeactivatedAfterEdit()) app.revoxelize();
     } else {
         ImGui::PushStyleColor(ImGuiCol_Text, kDim);

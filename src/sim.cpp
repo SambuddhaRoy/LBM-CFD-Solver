@@ -49,9 +49,9 @@ void Solver::init(GpuContext& ctx, const SimParams& p) {
         }
     });
 
-    // ── Descriptor layouts: LBM (5 SSBOs), analysis (4 SSBOs) ──────────────
+    // ── Descriptor layouts: LBM (5 SSBOs), analysis (6 SSBOs) ──────────────
     auto makeLayout = [&](uint32_t count, VkDescriptorSetLayout& out) {
-        std::array<VkDescriptorSetLayoutBinding, 5> b{};
+        std::array<VkDescriptorSetLayoutBinding, 6> b{};
         for (uint32_t i = 0; i < count; ++i)
             b[i] = { i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
                      VK_SHADER_STAGE_COMPUTE_BIT, nullptr };

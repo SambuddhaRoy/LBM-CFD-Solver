@@ -5,6 +5,7 @@
 #include "app.h"
 #include "ui.h"
 
+#define GLFW_INCLUDE_NONE   // Vulkan-only: don't drag in <GL/gl.h> (absent on headless Linux)
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
@@ -217,6 +218,7 @@ void App::uploadModel() {
     modelLoaded = true;
     units.compute(model.spanCellsX, params);
     resetSim();
+    runSingleBatch = true;   // populate macro buffer so slice shows content immediately
 }
 
 void App::resetSim() {

@@ -4,6 +4,7 @@
 
 #include "gpu.h"
 
+#define GLFW_INCLUDE_NONE   // Vulkan-only: don't drag in <GL/gl.h> (absent on headless Linux)
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 #include <VkBootstrap.h>
