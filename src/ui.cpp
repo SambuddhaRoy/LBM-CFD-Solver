@@ -40,24 +40,12 @@ ImU32 u32(const ImVec4& c, float aMul = 1.f) {
 }
 
 // ─── CPU colormaps (mirror slice.comp, for the colorbar) ────────────────────
-ImVec4 cmInferno(float t) {
+ImVec4 cmJet(float t) {
     t = std::clamp(t, 0.f, 1.f);
-    auto P = [t](double a,double b,double c,double d,double e,double f,double g) {
-        return float(a+t*(b+t*(c+t*(d+t*(e+t*(f+t*g))))));
-    };
-    return { P( 0.0002189403, 0.1065134195, 11.6024930825,-41.7039961314, 77.1629356994,-71.3194282450, 25.1311262248),
-             P( 0.0016510046, 0.5639564368,-3.9728539657, 17.4363988821,-33.4023589421, 32.6260642640,-12.2426689524),
-             P(-0.0194808984, 3.9327123889,-15.9423941063, 44.3541451987,-81.8073092574, 73.2095198580,-23.0703250029),
-             1.f };
-}
-ImVec4 cmViridis(float t) {
-    t = std::clamp(t, 0.f, 1.f);
-    auto P = [t](double a,double b,double c,double d,double e,double f,double g) {
-        return float(a+t*(b+t*(c+t*(d+t*(e+t*(f+t*g))))));
-    };
-    return { P( 0.2777273272, 0.1050930431,-0.3308618287,-4.6342304990, 6.2282699363, 4.7763849977,-5.4354558559),
-             P( 0.0054073445, 1.4046135299, 0.2148475595,-5.7991009734,14.1799333668,-13.7451453777, 4.6458526122),
-             P( 0.3340998053, 1.3845901626, 0.0950951630,-19.3324409563,56.6905526007,-65.3530326334,26.3124352495),
+    auto ch = [](float v) { return std::clamp(v, 0.f, 1.f); };
+    return { ch(1.5f - std::fabs(4.f*t - 3.f)),
+             ch(1.5f - std::fabs(4.f*t - 2.f)),
+             ch(1.5f - std::fabs(4.f*t - 1.f)),
              1.f };
 }
 ImVec4 cmCoolwarm(float t) {
@@ -280,19 +268,28 @@ void drawLeftPanel(App& app, const Layout& l) {
         StatRow("Frontal area", "%u cells", app.model.frontalCells);
         ImGui::Spacing();
 
+        // Live: re-voxelise on every change and keep the flow field, so the
+        // wake reorganises as you drag instead of restarting from rest.
         ImGui::PushStyleColor(ImGuiCol_Text, kDim);
-        ImGui::TextUnformatted("Angle of attack (pitch)");
+        ImGui::TextUnformatted("Pitch — angle of attack (about Z)");
         ImGui::PopStyleColor();
         ImGui::SetNextItemWidth(-1);
-        ImGui::SliderFloat("##aoa", &app.aoaDeg, -90.f, 90.f, "%.1f deg");
-        if (ImGui::IsItemDeactivatedAfterEdit()) app.revoxelize();
+        if (ImGui::SliderFloat("##aoa", &app.aoaDeg, -90.f, 90.f, "%.1f deg"))
+            app.revoxelize(true);
 
         ImGui::PushStyleColor(ImGuiCol_Text, kDim);
-        ImGui::TextUnformatted("Yaw (side-to-side)");
+        ImGui::TextUnformatted("Yaw — side to side (about Y)");
         ImGui::PopStyleColor();
         ImGui::SetNextItemWidth(-1);
-        ImGui::SliderFloat("##yaw", &app.yawDeg, -180.f, 180.f, "%.1f deg");
-        if (ImGui::IsItemDeactivatedAfterEdit()) app.revoxelize();
+        if (ImGui::SliderFloat("##yaw", &app.yawDeg, -180.f, 180.f, "%.1f deg"))
+            app.revoxelize(true);
+
+        ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+        ImGui::TextUnformatted("Roll — about the flow axis (X)");
+        ImGui::PopStyleColor();
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::SliderFloat("##roll", &app.rollDeg, -180.f, 180.f, "%.1f deg"))
+            app.revoxelize(true);
     } else {
         ImGui::PushStyleColor(ImGuiCol_Text, kDim);
         ImGui::TextWrapped("No model loaded. Use Load model in the top bar, "
@@ -489,8 +486,7 @@ void drawColorbar(App& app, ImVec2 vpPos, ImVec2 vpSize) {
         ImVec4 c;
         switch (app.visMode) {
         case 1:  c = cmCoolwarm(t0); break;
-        case 2:  c = cmViridis(t0);  break;
-        default: c = cmInferno(t0);  break;
+        default: c = cmJet(t0);      break;
         }
         dl->AddRectFilled({p.x + barW*t0, p.y}, {p.x + barW*t1 + 1.f, p.y + barH}, u32(c));
         (void)t1;

@@ -63,7 +63,9 @@ public:
     // ── actions (invoked by UI / shortcuts) ─────────────────────────────────
     void loadPrimitive(Shape s);
     void loadMeshFile(const std::string& path);
-    void revoxelize();              // re-rasterize after AoA / yaw edits
+    // Re-rasterize after a pitch/yaw/roll edit. keepFlow leaves the
+    // distributions untouched so the wake responds live while running.
+    void revoxelize(bool keepFlow = false);
     void applyGridPreset(int preset);
     void resetSim();
     void snapshot();
@@ -83,7 +85,7 @@ public:
     VoxelModel  model;
     std::vector<Tri> meshTris;      // non-empty when loaded from file
     int         primShape = -1;     // >= 0 when model is a primitive
-    float       aoaDeg = 0.f, yawDeg = 0.f;
+    float       aoaDeg = 0.f, yawDeg = 0.f, rollDeg = 0.f;
 
     // run state
     bool     running        = false;
@@ -124,7 +126,7 @@ private:
     void initImGui();
     void frame();
     void handleShortcuts();
-    void uploadModel();
+    void uploadModel(bool keepFlow = false);
     void rebuildSliceView();
     void loadConfig();
     void saveConfig();

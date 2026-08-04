@@ -490,7 +490,7 @@ int runValidation(const ValidateOptions& opts) {
             return;
         }
         const uint32_t gx=300, gy=140, gz=140;
-        VoxelModel m = mesh::voxelizeTriangles(tris, gx, gy, gz, 0.f, 0.f, label);
+        VoxelModel m = mesh::voxelizeTriangles(tris, gx, gy, gz, 0.f, 0.f, 0.f, label);
         Extent e = measureExtent(m.occupancy, gx, gy, gz);
         const int dy = e.y1-e.y0+1, dz = e.z1-e.z0+1;
         const int spanAxis = (dy >= dz) ? 1 : 2;     // longest cross-axis = span

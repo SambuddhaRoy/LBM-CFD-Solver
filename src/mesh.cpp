@@ -25,19 +25,23 @@ constexpr float kPi = 3.14159265358979f;
 constexpr float kCenterX   = 0.34f;
 constexpr float kTargetFit = 0.34f;   // model height as fraction of min(gy,gz)
 
-glm::mat3 rotationYZ(float pitchDeg, float yawDeg) {
+glm::mat3 rotation(float pitchDeg, float yawDeg, float rollDeg) {
     // Aeronautical convention: positive angle of attack pitches the nose
     // (the -X end, facing the incoming flow) upward — clockwise in the XY
-    // plane — hence the negated pitch angle.
-    const float p = -pitchDeg * kPi / 180.f;
-    const float yw = yawDeg * kPi / 180.f;
+    // plane — hence the negated pitch angle. Roll spins about the flow axis.
+    const float p  = -pitchDeg * kPi / 180.f;
+    const float yw =  yawDeg   * kPi / 180.f;
+    const float r  =  rollDeg  * kPi / 180.f;
     const glm::mat3 rz{  std::cos(p), std::sin(p), 0.f,
                         -std::sin(p), std::cos(p), 0.f,
                          0.f,         0.f,         1.f };
     const glm::mat3 ry{  std::cos(yw), 0.f, -std::sin(yw),
                          0.f,          1.f,  0.f,
                          std::sin(yw), 0.f,  std::cos(yw) };
-    return ry * rz;   // pitch (AoA) first, then yaw
+    const glm::mat3 rx{  1.f,  0.f,          0.f,
+                         0.f,  std::cos(r),  std::sin(r),
+                         0.f, -std::sin(r),  std::cos(r) };
+    return ry * rz * rx;   // roll, then pitch (AoA), then yaw
 }
 
 // ── Separating-axis triangle/AABB overlap ───────────────────────────────────
@@ -165,7 +169,7 @@ bool loadTriangles(const std::filesystem::path& path,
 
 VoxelModel voxelizeTriangles(const std::vector<Tri>& tris,
                              uint32_t gx, uint32_t gy, uint32_t gz,
-                             float pitchDeg, float yawDeg,
+                             float pitchDeg, float yawDeg, float rollDeg,
                              const std::string& name) {
     VoxelModel m;
     m.occupancy.assign(size_t(gx) * gy * gz, 0u);
@@ -180,7 +184,7 @@ VoxelModel voxelizeTriangles(const std::vector<Tri>& tris,
             lo = glm::min(lo, v); hi = glm::max(hi, v);
         }
     const glm::vec3 mid = 0.5f * (lo + hi);
-    const glm::mat3 rot = rotationYZ(pitchDeg, yawDeg);
+    const glm::mat3 rot = rotation(pitchDeg, yawDeg, rollDeg);
 
     glm::vec3 rlo(1e30f), rhi(-1e30f);
     std::vector<Tri> rt(tris.size());
@@ -234,7 +238,7 @@ VoxelModel voxelizeTriangles(const std::vector<Tri>& tris,
 
 VoxelModel makePrimitive(Shape shape,
                          uint32_t gx, uint32_t gy, uint32_t gz,
-                         float pitchDeg, float yawDeg) {
+                         float pitchDeg, float yawDeg, float rollDeg) {
     VoxelModel m;
     m.occupancy.assign(size_t(gx) * gy * gz, 0u);
     m.name = shapeName(shape);
@@ -242,7 +246,7 @@ VoxelModel makePrimitive(Shape shape,
     const float s = float(std::min(gy, gz));
     const glm::vec3 center{ kCenterX * float(gx), 0.5f * float(gy), 0.5f * float(gz) };
     // Inverse rotation: test the cell centre in the primitive's local frame.
-    const glm::mat3 invRot = glm::transpose(rotationYZ(pitchDeg, yawDeg));
+    const glm::mat3 invRot = glm::transpose(rotation(pitchDeg, yawDeg, rollDeg));
 
     // NACA 0012 half-thickness (closed trailing edge), chord-normalized.
     auto naca = [](float xc) {

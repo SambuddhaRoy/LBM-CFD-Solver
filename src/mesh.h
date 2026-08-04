@@ -40,18 +40,18 @@ namespace mesh {
 bool loadTriangles(const std::filesystem::path& path,
                    std::vector<Tri>& out, std::string& error);
 
-// Voxelize triangles into the grid. The mesh is recentred, rotated by
-// pitch (angle of attack, about Z) and yaw (about Y), then scaled to a
-// wind-tunnel-appropriate fraction of the test section.
+// Voxelize triangles into the grid. The mesh is recentred, rotated by pitch
+// (angle of attack, about Z), yaw (about Y) and roll (about the flow axis X),
+// then scaled to a wind-tunnel-appropriate fraction of the test section.
 VoxelModel voxelizeTriangles(const std::vector<Tri>& tris,
                              uint32_t gx, uint32_t gy, uint32_t gz,
-                             float pitchDeg, float yawDeg,
+                             float pitchDeg, float yawDeg, float rollDeg,
                              const std::string& name);
 
 // Analytic primitives — exact occupancy, no mesh required.
 VoxelModel makePrimitive(Shape shape,
                          uint32_t gx, uint32_t gy, uint32_t gz,
-                         float pitchDeg, float yawDeg);
+                         float pitchDeg, float yawDeg, float rollDeg);
 
 } // namespace mesh
 } // namespace vwt

@@ -129,7 +129,7 @@ int App::runBench(const StartOptions& opts) {
 
     gpu.init(nullptr);
     solver.init(gpu, params);
-    model = mesh::makePrimitive(Shape::Sphere, params.gx, params.gy, params.gz, 0.f, 0.f);
+    model = mesh::makePrimitive(Shape::Sphere, params.gx, params.gy, params.gz, 0.f, 0.f, 0.f);
     solver.uploadObstacles(model.occupancy);
     solver.reset();
 
@@ -177,7 +177,8 @@ void App::setStatus(const std::string& msg) {
 void App::loadPrimitive(Shape s) {
     primShape = int(s);
     meshTris.clear();
-    model = mesh::makePrimitive(s, params.gx, params.gy, params.gz, aoaDeg, yawDeg);
+    model = mesh::makePrimitive(s, params.gx, params.gy, params.gz,
+                                aoaDeg, yawDeg, rollDeg);
     uploadModel();
     setStatus(std::string("Loaded ") + shapeName(s));
 }
@@ -192,33 +193,38 @@ void App::loadMeshFile(const std::string& path) {
     meshTris  = std::move(tris);
     primShape = -1;
     model = mesh::voxelizeTriangles(meshTris, params.gx, params.gy, params.gz,
-                                    aoaDeg, yawDeg,
+                                    aoaDeg, yawDeg, rollDeg,
                                     std::filesystem::path(path).filename().string());
     uploadModel();
     setStatus("Loaded " + model.name + " (" +
               std::to_string(model.triCount) + " triangles)");
 }
 
-void App::revoxelize() {
+void App::revoxelize(bool keepFlow) {
     if (primShape >= 0) {
         model = mesh::makePrimitive(Shape(primShape), params.gx, params.gy,
-                                    params.gz, aoaDeg, yawDeg);
+                                    params.gz, aoaDeg, yawDeg, rollDeg);
     } else if (!meshTris.empty()) {
+        // ponytail: full re-rasterisation per slider change. Fine for
+        // primitives and typical meshes; cache per-angle occupancy if a
+        // huge mesh ever makes dragging stutter.
         model = mesh::voxelizeTriangles(meshTris, params.gx, params.gy, params.gz,
-                                        aoaDeg, yawDeg, model.name);
+                                        aoaDeg, yawDeg, rollDeg, model.name);
     } else {
         return;
     }
-    uploadModel();
+    uploadModel(keepFlow);
 }
 
-void App::uploadModel() {
+void App::uploadModel(bool keepFlow) {
     if (window) vkDeviceWaitIdle(gpu.device());
     solver.uploadObstacles(model.occupancy);
     modelLoaded = true;
     units.compute(model.spanCellsX, params);
-    resetSim();
-    runSingleBatch = true;   // populate macro buffer so slice shows content immediately
+    // keepFlow: live rotation — the new body is dropped into the existing
+    // flow field so the wake visibly reorganises instead of restarting.
+    if (!keepFlow) resetSim();
+    runSingleBatch = true;   // refresh macro/slice even while paused
 }
 
 void App::resetSim() {
@@ -730,13 +736,13 @@ int App::runHeadless(const StartOptions& opts) {
             return 1;
         }
         model = mesh::voxelizeTriangles(tris, params.gx, params.gy, params.gz,
-                                        opts.aoaDeg, 0.f,
+                                        opts.aoaDeg, 0.f, 0.f,
                                         std::filesystem::path(opts.meshPath)
                                             .filename().string());
     } else {
         const Shape s = Shape(std::clamp(opts.shape, 0, 3));
         model = mesh::makePrimitive(s, params.gx, params.gy, params.gz,
-                                    opts.aoaDeg, 0.f);
+                                    opts.aoaDeg, 0.f, 0.f);
     }
     solver.uploadObstacles(model.occupancy);
     modelLoaded = true;

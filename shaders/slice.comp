@@ -3,10 +3,10 @@
 // slice.comp — 2D field slice visualization
 //
 // Modes:
-//   0  velocity magnitude            → inferno
+//   0  velocity magnitude            → classic false colour (blue → red)
 //   1  pressure coefficient C_p      → diverging cool-warm, centred on 0
-//   2  vorticity magnitude |∇×u|     → viridis
-//   3  Q-criterion (vortex cores)    → inferno where Q>0, near-black else
+//   2  vorticity magnitude |∇×u|     → classic false colour (blue → red)
+//   3  Q-criterion (vortex cores)    → false colour where Q>0, near-black else
 //
 // Axes:  0 = XY plane (z fixed)   1 = XZ plane (y fixed)   2 = ZY plane (x fixed)
 // Obstacle cells render as neutral slate so the model silhouette is visible.
@@ -36,29 +36,14 @@ vec3 velAt(ivec3 p) {
     return vec3(macro[c*4u+1u], macro[c*4u+2u], macro[c*4u+3u]);
 }
 
-// ─── Colormaps (polynomial fits, Zucker) ────────────────────────────────────
-vec3 inferno(float t) {
+// ─── Colormaps ──────────────────────────────────────────────────────────────
+// Classic wind-tunnel false colour: dark blue (slow/low) → cyan → green →
+// yellow → red (fast/high). Piecewise-linear in each channel.
+vec3 jet(float t) {
     t = clamp(t, 0.0, 1.0);
-    const vec3 c0 = vec3( 0.0002189403, 0.0016510046, -0.0194808984);
-    const vec3 c1 = vec3( 0.1065134195, 0.5639564368,  3.9327123889);
-    const vec3 c2 = vec3(11.6024930825,-3.9728539657, -15.9423941063);
-    const vec3 c3 = vec3(-41.7039961314,17.4363988821, 44.3541451987);
-    const vec3 c4 = vec3(77.1629356994,-33.4023589421,-81.8073092574);
-    const vec3 c5 = vec3(-71.3194282450,32.6260642640, 73.2095198580);
-    const vec3 c6 = vec3(25.1311262248,-12.2426689524,-23.0703250029);
-    return c0+t*(c1+t*(c2+t*(c3+t*(c4+t*(c5+t*c6)))));
-}
-
-vec3 viridis(float t) {
-    t = clamp(t, 0.0, 1.0);
-    const vec3 c0 = vec3( 0.2777273272, 0.0054073445,  0.3340998053);
-    const vec3 c1 = vec3( 0.1050930431, 1.4046135299,  1.3845901626);
-    const vec3 c2 = vec3(-0.3308618287, 0.2148475595,  0.0950951630);
-    const vec3 c3 = vec3(-4.6342304990,-5.7991009734, -19.3324409563);
-    const vec3 c4 = vec3( 6.2282699363,14.1799333668,  56.6905526007);
-    const vec3 c5 = vec3( 4.7763849977,-13.7451453777,-65.3530326334);
-    const vec3 c6 = vec3(-5.4354558559, 4.6458526122,  26.3124352495);
-    return c0+t*(c1+t*(c2+t*(c3+t*(c4+t*(c5+t*c6)))));
+    return clamp(vec3(1.5 - abs(4.0*t - 3.0),
+                      1.5 - abs(4.0*t - 2.0),
+                      1.5 - abs(4.0*t - 1.0)), 0.0, 1.0);
 }
 
 vec3 coolwarm(float t) {  // t in [0,1], 0.5 = neutral
@@ -92,7 +77,7 @@ void main() {
     if (pc.mode == 0u) {
         // Velocity magnitude
         vec3 u = velAt(p);
-        col = inferno(length(u) / max(pc.scaleVel, 1e-5));
+        col = jet(length(u) / max(pc.scaleVel, 1e-5));
     }
     else if (pc.mode == 1u) {
         // Pressure coefficient: C_p = (p−p∞)/(½ρU²), p = ρ/3 in lattice units
@@ -110,7 +95,7 @@ void main() {
             vec3 omega = vec3(dudy.z - dudz.y,
                               dudz.x - dudx.z,
                               dudx.y - dudy.x);
-            col = viridis(length(omega) / max(pc.maxVort, 1e-6));
+            col = jet(length(omega) / max(pc.maxVort, 1e-6));
         } else {
             // Q = ½(|Ω|² − |S|²): positive where rotation beats strain
             mat3 J = mat3(dudx, dudy, dudz);   // columns = ∂u/∂x_i
@@ -121,7 +106,7 @@ void main() {
                 for (int j = 0; j < 3; ++j) { s2 += S[i][j]*S[i][j]; w2 += W[i][j]*W[i][j]; }
             float Q = 0.5*(w2 - s2);
             float qn = Q / max(pc.maxVort*pc.maxVort, 1e-9);
-            col = (qn > 0.0) ? inferno(clamp(qn, 0.0, 1.0))
+            col = (qn > 0.0) ? jet(clamp(qn, 0.0, 1.0))
                              : vec3(0.05, 0.05, 0.07);
         }
     }
