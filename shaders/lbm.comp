@@ -56,6 +56,12 @@ const float w[19] = float[19](
     1.0/36.0, 1.0/36.0, 1.0/36.0, 1.0/36.0
 );
 
+// TRT: upper bound on the antisymmetric relaxation time (see the collision
+// block). tau- = 1 => omega- >= 1, which keeps the odd ghost modes damped
+// right down to tau = 0.505. Above tau ~ 0.875 the magic parameter already
+// asks for tau- < 1, so the bound is inactive and Lambda = 3/16 is exact.
+const float kTauMinusMax = 1.0;
+
 const int opp[19]  = int[19](0, 2,1, 4,3, 6,5, 10,9,8,7, 14,13,12,11, 18,17,16,15);
 // Direction with e_y sign flipped (specular reflection off Y walls)
 const int mirY[19] = int[19](0, 1,2, 4,3, 5,6, 9,10,7,8, 11,12,13,14, 16,15,18,17);
@@ -219,8 +225,16 @@ void main() {
         // makes the half-way bounce-back wall sit at the link midpoint
         // independent of viscosity — removing the Reynolds-number offset that
         // plain BGK/regularized bounce-back suffers on staircased bodies.
+        // Lambda = 3/16 is only usable while it leaves omega- large enough to
+        // damp the antisymmetric ghost modes. As tau+ -> 1/2 it sends
+        // tau- -> infinity (omega- -> 0), those modes stop relaxing and pile up
+        // into spurious high-speed vortices — at tau = 0.507 omega- is 0.037 and
+        // the wake blows up to ~3x the inlet speed while BGK at the same tau is
+        // fine. Bounding tau- floors omega-. Below tau ~ 0.875 that does give up
+        // the viscosity-independent wall position, which is the trade: an
+        // approximate wall beats an operator that diverges.
         float omegaP = omega;
-        float tauM   = 0.5 + 0.1875 / max(tauEff - 0.5, 1e-4);
+        float tauM   = min(0.5 + 0.1875 / max(tauEff - 0.5, 1e-4), kTauMinusMax);
         float omegaM = 1.0 / tauM;
         for (uint q = 0u; q < 19u; ++q) {
             uint qb = uint(opp[q]);

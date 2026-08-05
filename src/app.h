@@ -29,6 +29,7 @@ struct StartOptions {
     std::string meshPath;
     bool        lesOff    = false;
     int         collision = -1;        // -1 = default; 0 BGK, 1 regularised, 2 TRT
+    float       tau       = 0.f;       // 0 = use the SimParams default
 };
 
 struct FrameData {
@@ -47,14 +48,24 @@ struct Fonts {
     ImFont* big  = nullptr;
 };
 
-// Grid presets: coarse / medium / fine
+// Grid presets. Dimensions are multiples of the 8x8x4 workgroup so no lanes
+// are wasted on the edges.
 struct GridPreset { const char* name; uint32_t gx, gy, gz; };
 inline constexpr GridPreset kGrids[] = {
-    { "Coarse — 96 x 64 x 64",    96, 64, 64 },
-    { "Medium — 128 x 80 x 80",  128, 80, 80 },
-    { "Fine — 176 x 104 x 104",  176, 104, 104 },
+    { "Coarse — 96 x 64 x 64",         96,  64,  64 },
+    { "Medium — 128 x 80 x 80",       128,  80,  80 },
+    { "Fine — 176 x 104 x 104",       176, 104, 104 },
+    { "Very fine — 240 x 144 x 144",  240, 144, 144 },
+    { "Ultra — 320 x 192 x 192",      320, 192, 192 },
+    { "Extreme — 416 x 248 x 248",    416, 248, 248 },
 };
 inline constexpr int kGridCount = int(sizeof(kGrids) / sizeof(kGrids[0]));
+
+// Device-local bytes Solver::init allocates for a grid: two 19-population
+// f-buffers plus macro, prev, obstacle and sdf.
+constexpr uint64_t gridBytes(const GridPreset& g) {
+    return uint64_t(g.gx) * g.gy * g.gz * (2u * 19u * 4u + 16u + 16u + 4u + 4u);
+}
 
 class App {
 public:

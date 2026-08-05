@@ -20,6 +20,7 @@ void printUsage(const char* prog) {
         "  --grid <X> <Y> <Z>   lattice resolution (default 128 80 80)\n"
         "  --no-les             disable the Smagorinsky subgrid model\n"
         "  --collision <0|1|2>  collision operator: 0 BGK, 1 regularised, 2 TRT\n"
+        "  --tau <t>            relaxation time (default 0.56; ->0.5 = less stable)\n"
         "  --headless           run without a window and self-validate\n"
         "  --bench              pure-throughput benchmark (MLUPS), no window\n"
         "  --steps <N>          headless: number of LBM steps (default 240)\n"
@@ -66,6 +67,8 @@ int main(int argc, char* argv[]) {
             opts.lesOff = true;
         } else if (arg == "--collision" && i + 1 < argc) {
             opts.collision = int(std::strtol(argv[++i], nullptr, 10));
+        } else if (arg == "--tau" && i + 1 < argc) {
+            opts.tau = std::strtof(argv[++i], nullptr);
         } else if (arg == "--steps" && i + 1 < argc) {
             opts.steps = uint32_t(std::strtoul(argv[++i], nullptr, 10));
         } else if (arg == "--aoa" && i + 1 < argc) {

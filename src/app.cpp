@@ -125,6 +125,7 @@ int App::runBench(const StartOptions& opts) {
     params.gz = opts.gz ? opts.gz : 64;
     if (opts.lesOff)         params.les = false;
     if (opts.collision >= 0) params.collision = opts.collision;
+    if (opts.tau > 0.f)      params.tau = opts.tau;
     const uint32_t steps = std::max(200u, opts.steps);
 
     gpu.init(nullptr);
@@ -723,6 +724,7 @@ int App::runHeadless(const StartOptions& opts) {
     params.gz = opts.gz ? opts.gz : 64;
     if (opts.lesOff) params.les = false;
     if (opts.collision >= 0) params.collision = opts.collision;
+    if (opts.tau > 0.f)      params.tau = opts.tau;
 
     gpu.init(nullptr);
     solver.init(gpu, params);

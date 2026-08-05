@@ -457,9 +457,22 @@ void drawLeftPanel(App& app, const Layout& l) {
 
     FieldLabel("Grid resolution", "Changing this rebuilds the solver and restarts the flow");
     if (ImGui::BeginCombo("##grid", kGrids[app.gridPreset].name)) {
-        for (int i = 0; i < kGridCount; ++i)
-            if (ImGui::Selectable(kGrids[i].name, i == app.gridPreset) && i != app.gridPreset)
+        for (int i = 0; i < kGridCount; ++i) {
+            const double gb = double(gridBytes(kGrids[i])) / (1024.0*1024.0*1024.0);
+            // Don't offer a grid the card cannot hold — the allocation would
+            // throw rather than fail gracefully.
+            const bool fits = (app.vramBudget == 0) ||
+                              (gridBytes(kGrids[i]) < app.vramBudget * 85 / 100);
+            char lbl[128];
+            std::snprintf(lbl, sizeof(lbl), "%s   %.2f GB", kGrids[i].name, gb);
+            ImGui::BeginDisabled(!fits);
+            if (ImGui::Selectable(lbl, i == app.gridPreset) && i != app.gridPreset)
                 app.applyGridPreset(i);
+            ImGui::EndDisabled();
+            if (!fits && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Needs %.2f GB of %.2f GB VRAM", gb,
+                                  double(app.vramBudget) / (1024.0*1024.0*1024.0));
+        }
         ImGui::EndCombo();
     }
     SectionEnd();
