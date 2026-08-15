@@ -110,6 +110,42 @@ std::vector<uint32_t> makeSquare2D(uint32_t gx, uint32_t gy, uint32_t gz,
     return occ;
 }
 
+// Analytic sphere of diameter D centred at (cx,cy,cz) — the only genuinely
+// three-dimensional validation body. Everything else here is quasi-2D (gz=6),
+// which leaves the 3D path that real models actually use unmeasured.
+std::vector<uint32_t> makeSphere3D(uint32_t gx, uint32_t gy, uint32_t gz,
+                                   float cx, float cy, float cz, float D) {
+    std::vector<uint32_t> occ(size_t(gx)*gy*gz, 0u);
+    const float r2 = (D*0.5f)*(D*0.5f);
+    for (uint32_t z = 0; z < gz; ++z)
+        for (uint32_t y = 0; y < gy; ++y)
+            for (uint32_t x = 0; x < gx; ++x) {
+                const float dx = float(x)+0.5f - cx;
+                const float dy = float(y)+0.5f - cy;
+                const float dz = float(z)+0.5f - cz;
+                if (dx*dx + dy*dy + dz*dz <= r2)
+                    occ[(size_t(z)*gy + y)*gx + x] = 1u;
+            }
+    return occ;
+}
+
+// Signed distance to that sphere, so the Bouzidi wall sits on the true surface
+// instead of the voxel staircase.
+std::vector<float> sphereSDF(uint32_t gx, uint32_t gy, uint32_t gz,
+                             float cx, float cy, float cz, float D) {
+    std::vector<float> phi(size_t(gx)*gy*gz, 0.f);
+    for (uint32_t z = 0; z < gz; ++z)
+        for (uint32_t y = 0; y < gy; ++y)
+            for (uint32_t x = 0; x < gx; ++x) {
+                const float dx = float(x)+0.5f - cx;
+                const float dy = float(y)+0.5f - cy;
+                const float dz = float(z)+0.5f - cz;
+                phi[(size_t(z)*gy + y)*gx + x] =
+                    std::sqrt(dx*dx + dy*dy + dz*dz) - 0.5f*D;
+            }
+    return phi;
+}
+
 // ─── Field readback ──────────────────────────────────────────────────────────
 
 void downloadMacro(GpuContext& gpu, VkBuffer macro, size_t cells,
@@ -254,8 +290,10 @@ CaseResult runCase(GpuContext& gpu, uint32_t gx, uint32_t gy, uint32_t gz,
             }
         return f;
     }();
-    const float q = 0.5f * p.uIn * p.uIn;
-    const float A = (frontal > 0) ? float(frontal) : 1.f;
+    // Blockage-corrected, same normalisation the app reports (see sim.h).
+    auto coeff = [&](float force) {
+        return forceCoefficient(force, frontal, gy, gz, p.uIn);
+    };
 
     std::vector<float> perp;        // cross-flow force coefficient series
     perp.reserve(window / batch + 4);
@@ -271,8 +309,8 @@ CaseResult runCase(GpuContext& gpu, uint32_t gx, uint32_t gy, uint32_t gz,
         step += batch;
         const Analysis a = solver.readAnalysis(0);
         R.residual = a.residual;
-        const float cd  = a.drag / (q * A);
-        const float per = ((crossAxis == 1) ? a.lift : a.side) / (q * A);
+        const float cd  = coeff(a.drag);
+        const float per = coeff((crossAxis == 1) ? a.lift : a.side);
         if (step > warmup) { perp.push_back(per); cdAcc += cd; ++cdN; }
         R.maxU = a.maxU;
         if (!a.valid) break;
@@ -430,7 +468,16 @@ int runValidation(const ValidateOptions& opts) {
 
         std::printf("\n  Literature: attached Re<5; steady recirc 5<Re<47 with\n");
         std::printf("  L_r/D ~ 0.05 Re (=> ~2.1 at Re=40); shedding Re>47 with\n");
-        std::printf("  St ~ 0.164 (Re=100), 0.184 (Re=150).\n\n");
+        std::printf("  St ~ 0.164 (Re=100), 0.184 (Re=150).\n");
+        std::printf("  C_D ~ 1.50 (Re=40), 1.35 (Re=100), 1.33 (Re=150).\n\n");
+
+        // C_D is the number this tool exists to produce, so it is asserted here
+        // rather than merely printed. Bands are +/-25% of the literature value:
+        // wide enough for a 40-cell cylinder at 12% blockage, tight enough to
+        // catch the ~40% overprediction the uncorrected normalisation gave.
+        auto cdNear = [](float got, float lit) {
+            return got > lit * 0.75f && got < lit * 1.25f;
+        };
 
         struct Chk { const char* name; bool ok; };
         const Chk checks[] = {
@@ -441,6 +488,10 @@ int runValidation(const ValidateOptions& opts) {
             { "Re=100 Strouhal 0.14-0.19",          re100.strouhal > 0.14f && re100.strouhal < 0.19f },
             { "Re=150 Strouhal 0.16-0.21",          re150.strouhal > 0.16f && re150.strouhal < 0.21f },
             { "Strouhal rises with Re",             re150.strouhal > re100.strouhal },
+            { "Re=40 C_D within 25% of 1.50",       cdNear(re40.meanCd,  1.50f) },
+            { "Re=100 C_D within 25% of 1.35",      cdNear(re100.meanCd, 1.35f) },
+            { "Re=150 C_D within 25% of 1.33",      cdNear(re150.meanCd, 1.33f) },
+            { "C_D falls from Re=40 to Re=150",     re150.meanCd < re40.meanCd },
         };
         for (const Chk& c : checks) {
             std::printf("    [%s] %s\n", c.ok ? "PASS":"FAIL", c.name);
@@ -479,6 +530,43 @@ int runValidation(const ValidateOptions& opts) {
         std::printf("    [%s] square-body Von Karman shedding with finite Strouhal\n",
                     ok ? "PASS":"FAIL");
         allPass = allPass && ok;
+    }
+
+    // ── Sphere (analytic, fully 3D) ─────────────────────────────────────────
+    // Every case above runs at gz=6 with free-slip Z walls, i.e. quasi-2D. This
+    // is the only one that exercises the real 3D path — the same path every
+    // imported model takes — against a quantitative drag correlation.
+    {
+        const uint32_t gx=480, gy=160, gz=160;
+        const float D = 32.f;
+        const float cx = 0.28f*gx, cy = 0.5f*gy, cz = 0.5f*gz;
+        const float beta = 3.14159265f*0.25f*D*D / (float(gy)*float(gz));
+        std::printf("\n  SPHERE (3D) — diameter %.0f cells, blockage %.3f\n", D, beta);
+        std::printf("  ----------------------------------------------------------\n");
+        std::printf("    Re     tau    C_D     St      L_r/D   |C_L|    regime\n");
+
+        // Schiller-Naumann: C_D = (24/Re)(1 + 0.15 Re^0.687), the standard
+        // correlation for a smooth sphere below the drag crisis.
+        auto schillerNaumann = [](float re) {
+            return (24.f/re) * (1.f + 0.15f*std::pow(re, 0.687f));
+        };
+
+        struct Spec { float Re; uint32_t warm, win; };
+        const Spec specs[] = { { 100.f, 34000, 3000 } };
+        bool sphereOk = true;
+        for (const Spec& s : specs) {
+            auto occ = makeSphere3D(gx, gy, gz, cx, cy, cz, D);
+            auto sdf = sphereSDF(gx, gy, gz, cx, cy, cz, D);
+            CaseResult r = runCase(gpu, gx, gy, gz, std::move(occ), D, s.Re,
+                                   1, s.warm, s.win, 100, {}, &sdf);
+            printRow(r);
+            const float lit = schillerNaumann(s.Re);
+            const bool ok = r.meanCd > lit*0.75f && r.meanCd < lit*1.25f;
+            std::printf("    [%s] Re=%.0f sphere C_D %.3f vs Schiller-Naumann %.3f"
+                        " (within 25%%)\n", ok ? "PASS":"FAIL", s.Re, r.meanCd, lit);
+            sphereOk = sphereOk && ok;
+        }
+        allPass = allPass && sphereOk;
     }
 
     // ── Provided models ─────────────────────────────────────────────────────

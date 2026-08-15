@@ -61,6 +61,38 @@ struct UnitScale {
     }
 };
 
+// ─── Force normalisation ─────────────────────────────────────────────────────
+// Solid-blockage correction.
+//
+// A body of frontal area A sitting in a tunnel of cross-section C squeezes the
+// flow: by continuity the stream past it runs at roughly U/(1-beta) with
+// beta = A/C, not at the inlet speed U. Dividing the measured force by the
+// INLET dynamic pressure therefore overstates C_D by 1/(1-beta)^2 — about +29%
+// at the 12% blockage of the cylinder validation case, which was the bulk of
+// this solver's drag error. Physical wind tunnels correct their data the same
+// way; the difference here is that beta is known exactly rather than estimated.
+//
+// This is the simple continuity form. It does not model wake blockage or
+// streamline curvature, so it under-corrects slightly for bluff bodies.
+inline float blockageFactor(uint32_t frontalCells, uint32_t gy, uint32_t gz) {
+    const float C = float(gy) * float(gz);
+    if (C <= 0.f || frontalCells == 0u) return 1.f;
+    float beta = float(frontalCells) / C;
+    if (beta > 0.5f) beta = 0.5f;          // absurd blockage: stop correcting
+    const float s = 1.f - beta;
+    return s * s;
+}
+
+// Drag/lift coefficient from a lattice force. `force` is the momentum-exchange
+// sum, `A` the frontal cell count, `uIn` the inlet speed in lattice units.
+inline float forceCoefficient(float force, uint32_t frontalCells,
+                              uint32_t gy, uint32_t gz, float uIn) {
+    const float A = (frontalCells > 0u) ? float(frontalCells) : 1.f;
+    const float q = 0.5f * uIn * uIn;      // rho ~= 1, pinned by the outlet BC
+    if (q <= 0.f) return 0.f;
+    return force / (q * A) * blockageFactor(frontalCells, gy, gz);
+}
+
 // ─── Fused analysis results ──────────────────────────────────────────────────
 struct Analysis {
     float residual   = 1.f;   // sqrt(Σ|Δu|² / Σ|u|²), measured

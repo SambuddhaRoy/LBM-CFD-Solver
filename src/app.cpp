@@ -599,11 +599,11 @@ void App::frame() {
         if (ana > 0.f) tim.analysisMs = tim.analysisMs * 0.9f + ana * 0.1f;
         if (slc > 0.f) tim.sliceMs    = tim.sliceMs * 0.9f + slc * 0.1f;
         if (an.valid) {
-            const float q = 0.5f * params.uIn * params.uIn;
-            const float A = model.frontalCells > 0 ? float(model.frontalCells) : 1.f;
             cdPrev = cd; clPrev = cl;
-            cd = an.drag / (q * A);
-            cl = an.lift / (q * A);
+            cd = forceCoefficient(an.drag, model.frontalCells,
+                                  params.gy, params.gz, params.uIn);
+            cl = forceCoefficient(an.lift, model.frontalCells,
+                                  params.gy, params.gz, params.uIn);
             mlups = (frameMs > 0.01f)
                 ? float(double(solver.cells()) * fr.batchSteps / (frameMs * 1000.0))
                 : 0.f;
@@ -777,10 +777,10 @@ int App::runHeadless(const StartOptions& opts) {
         done += n;
 
         an = solver.readAnalysis(0);
-        const float q = 0.5f * params.uIn * params.uIn;
-        const float A = model.frontalCells > 0 ? float(model.frontalCells) : 1.f;
-        cd = an.drag / (q * A);
-        cl = an.lift / (q * A);
+        cd = forceCoefficient(an.drag, model.frontalCells,
+                              params.gy, params.gz, params.uIn);
+        cl = forceCoefficient(an.lift, model.frontalCells,
+                              params.gy, params.gz, params.uIn);
         if (firstRes < 0.f && an.valid && done > batch) firstRes = an.residual;
         lastRes = an.residual;
 
@@ -797,15 +797,28 @@ int App::runHeadless(const StartOptions& opts) {
                 static_cast<unsigned long long>(total), secs, mlupsAvg, gpu.gpuName());
 
     // ── Validation ──────────────────────────────────────────────────────────
-    struct Check { const char* name; bool ok; };
+    // These thresholds are calibrated against measured behaviour, not guessed.
+    // The previous "max < 0.60" bound was ~9x the inlet speed and so could not
+    // fail: it certified a TRT configuration that was running at 2.9x inlet with
+    // a stalled residual. Healthy runs peak at ~1.4x inlet, so 2.5x separates
+    // the two cleanly while leaving room for sharp-edged bodies.
+    const float peakRatio = (params.uIn > 0.f) ? an.maxU / params.uIn : 0.f;
     const bool finiteAll = an.valid && std::isfinite(cd) && std::isfinite(cl) &&
                            std::isfinite(an.massAvg) && std::isfinite(an.maxU);
+
+    char bMass[64], bPeak[64], bRes[64], bCd[64];
+    std::snprintf(bMass, sizeof(bMass), "mass conserved (%.4f, want 1.00 +/- 0.05)", an.massAvg);
+    std::snprintf(bPeak, sizeof(bPeak), "peak |u| = %.2fx inlet (want < 2.5x)", peakRatio);
+    std::snprintf(bRes,  sizeof(bRes),  "residual decayed (%.2e -> %.2e)", firstRes, lastRes);
+    std::snprintf(bCd,   sizeof(bCd),   "C_D plausible (%.3f, want 0.05..8)", cd);
+
+    struct Check { const char* name; bool ok; };
     const Check checks[] = {
-        { "all quantities finite",            finiteAll },
-        { "mass conserved (1.00 +/- 0.10)",   an.massAvg > 0.90f && an.massAvg < 1.10f },
-        { "velocity bounded (max < 0.60)",    an.maxU < 0.60f },
-        { "residual decaying",                lastRes < firstRes || lastRes < 5e-2f },
-        { "drag positive",                    opts.meshPath.empty() ? cd > 0.f : true },
+        { "all quantities finite", finiteAll },
+        { bMass,  an.massAvg > 0.95f && an.massAvg < 1.05f },
+        { bPeak,  peakRatio > 0.f && peakRatio < 2.5f },
+        { bRes,   lastRes < firstRes },
+        { bCd,    opts.meshPath.empty() ? (cd > 0.05f && cd < 8.f) : true },
     };
     bool pass = true;
     std::printf("\n");

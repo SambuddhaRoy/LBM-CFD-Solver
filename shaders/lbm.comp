@@ -56,11 +56,10 @@ const float w[19] = float[19](
     1.0/36.0, 1.0/36.0, 1.0/36.0, 1.0/36.0
 );
 
-// TRT: upper bound on the antisymmetric relaxation time (see the collision
-// block). tau- = 1 => omega- >= 1, which keeps the odd ghost modes damped
-// right down to tau = 0.505. Above tau ~ 0.875 the magic parameter already
-// asks for tau- < 1, so the bound is inactive and Lambda = 3/16 is exact.
-const float kTauMinusMax = 1.0;
+// TRT relaxation rate for the odd (ghost) modes — see the collision block for
+// why this is a constant rather than the magic parameter. omega- = 1 is full
+// relaxation to equilibrium, the strongest damping available in (0,2).
+const float kOmegaMinus = 1.0;
 
 const int opp[19]  = int[19](0, 2,1, 4,3, 6,5, 10,9,8,7, 14,13,12,11, 18,17,16,15);
 // Direction with e_y sign flipped (specular reflection off Y walls)
@@ -219,30 +218,44 @@ void main() {
     float omega = 1.0 / tauEff;
 
     if (pc.collision == 2u) {
-        // TRT: split each population into symmetric/antisymmetric parts and
-        // relax with two rates. omega+ sets the viscosity; omega- is fixed by
-        // the magic parameter Lambda = (tau+ - 1/2)(tau- - 1/2) = 3/16, which
-        // makes the half-way bounce-back wall sit at the link midpoint
-        // independent of viscosity — removing the Reynolds-number offset that
-        // plain BGK/regularized bounce-back suffers on staircased bodies.
-        // Lambda = 3/16 is only usable while it leaves omega- large enough to
-        // damp the antisymmetric ghost modes. As tau+ -> 1/2 it sends
-        // tau- -> infinity (omega- -> 0), those modes stop relaxing and pile up
-        // into spurious high-speed vortices — at tau = 0.507 omega- is 0.037 and
-        // the wake blows up to ~3x the inlet speed while BGK at the same tau is
-        // fine. Bounding tau- floors omega-. Below tau ~ 0.875 that does give up
-        // the viscosity-independent wall position, which is the trade: an
-        // approximate wall beats an operator that diverges.
+        // ── TRT ──────────────────────────────────────────────────────────────
+        // Split every population about its opposite into a symmetric (even) and
+        // an antisymmetric (odd) part and relax each with its own rate.
+        //
+        //   even  -> omega+ = 1/tau_eff, which alone sets the viscosity
+        //           (rho and Pi are even moments)
+        //   odd   -> omega-, which touches only 3rd-order ghost modes, because
+        //           the momentum j is odd but conserved
+        //
+        // omega- is deliberately NOT taken from the magic parameter
+        // Lambda = (tau+ - 1/2)(tau- - 1/2) = 3/16. That value exists to park a
+        // HALFWAY BOUNCE-BACK wall on the link midpoint, and this solver does
+        // not use halfway bounce-back — it places the wall explicitly with
+        // Bouzidi interpolation from the SDF, so the magic parameter buys
+        // nothing here. It costs plenty though: fixed Lambda drives
+        // omega- -> 0 as tau+ -> 1/2 (0.037 at tau = 0.507), leaving the ghost
+        // modes completely undamped until they erupt into spurious vortices at
+        // ~3x the inlet speed, while BGK at the same tau stays clean.
+        //
+        // Pinning omega- to a strongly damped constant keeps those modes dead at
+        // every viscosity, which is exactly what TRT is good for: ghost-mode
+        // damping decoupled from the physical viscosity.
         float omegaP = omega;
-        float tauM   = min(0.5 + 0.1875 / max(tauEff - 0.5, 1e-4), kTauMinusMax);
-        float omegaM = 1.0 / tauM;
+        float omegaM = kOmegaMinus;
+
+        // Closed forms beat calling feq() four times per direction. With
+        // e_qb = -e_q and w_qb = w_q:
+        //   feq+ = 1/2 (feq_q + feq_qb) = w rho (1 + 4.5 (e.u)^2 - 1.5 u.u)
+        //   feq- = 1/2 (feq_q - feq_qb) = 3 w rho (e.u)
+        float uu = dot(u, u);
         for (uint q = 0u; q < 19u; ++q) {
-            uint qb = uint(opp[q]);
-            float feqP = 0.5*(feq(q, rho, u) + feq(qb, rho, u));
-            float feqM = 0.5*(feq(q, rho, u) - feq(qb, rho, u));
+            uint  qb   = uint(opp[q]);
+            float eu   = dot(vec3(e[q]), u);
+            float feqP = w[q]*rho*(1.0 + 4.5*eu*eu - 1.5*uu);
+            float feqM = w[q]*rho*3.0*eu;
             float fP   = 0.5*(f[q] + f[qb]);
             float fM   = 0.5*(f[q] - f[qb]);
-            float fv = f[q] - omegaP*(fP - feqP) - omegaM*(fM - feqM);
+            float fv   = f[q] - omegaP*(fP - feqP) - omegaM*(fM - feqM);
             fOut[distIdx(q, idx)] = isnan(fv) ? w[q] : fv;
         }
     } else if (pc.collision == 1u) {

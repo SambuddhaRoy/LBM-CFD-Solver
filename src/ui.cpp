@@ -366,6 +366,17 @@ void drawLeftPanel(App& app, const Layout& l) {
         if (app.model.triCount > 0) StatRow("Triangles", "%u", app.model.triCount);
         StatRow("Fill", "%.2f%% of domain", app.model.fillPct);
         StatRow("Frontal area", "%u cells", app.model.frontalCells);
+        // Measured on the sphere validation case: 24 cells across the body
+        // gives +34% on C_D, 32 gives +13%, 40 gives ~+8%. Resolution is the
+        // dominant error term once blockage is corrected, so show it.
+        StatRow("Cells across model", "%u", app.model.spanCellsX);
+        if (app.model.spanCellsX > 0 && app.model.spanCellsX < 32) {
+            ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
+            ImGui::TextWrapped("Under 32 cells across — wake shape is fine, "
+                               "but C_D reads high (~+30%% at 24 cells). "
+                               "Raise the grid for quantitative drag.");
+            ImGui::PopStyleColor();
+        }
     } else {
         ImGui::PushStyleColor(ImGuiCol_Text, kDim);
         ImGui::TextWrapped("No model loaded. Pick one from Model in the top bar, "
@@ -495,9 +506,21 @@ void drawLeftPanel(App& app, const Layout& l) {
         ImGui::TextWrapped("Mach > 0.3 — compressibility effects are not modelled.");
         ImGui::PopStyleColor();
     }
-    if (app.params.les && app.units.rePhys > app.units.reLat * 2.f) {
+    // The solver integrates the LATTICE Reynolds number. Where that sits far
+    // below the physical one, LES does not close the gap — there is no wall
+    // model here — so state it plainly instead of implying it is handled.
+    const float reGap = (app.units.reLat > 1e-6f)
+                      ? app.units.rePhys / app.units.reLat : 0.f;
+    if (reGap > 10.f) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
+        ImGui::TextWrapped("Resolving Re %.3g, not %.3g (%.0fx lower). Wake "
+                           "shape and trends are meaningful; absolute forces "
+                           "at the physical Re are not.",
+                           app.units.reLat, app.units.rePhys, reGap);
+        ImGui::PopStyleColor();
+    } else if (app.params.les) {
         ImGui::PushStyleColor(ImGuiCol_Text, kDim);
-        ImGui::TextWrapped("High-Re flow: sub-grid turbulence is LES-modelled.");
+        ImGui::TextWrapped("Sub-grid turbulence is LES-modelled.");
         ImGui::PopStyleColor();
     }
     ImGui::Dummy({0, S(6)});
@@ -530,9 +553,21 @@ void drawRightPanel(App& app, const Layout& l) {
     Sparkline("##clspark", app.clHist.data(), kHist, app.histIdx, S(30), kBlue);
     if (std::abs(app.cl) > 1e-9f && std::abs(app.cd) > 1e-9f)
         StatRow("L / D", "%.2f", app.cl / app.cd);
-    ImGui::PushStyleColor(ImGuiCol_Text, kDim);
-    ImGui::TextWrapped("Momentum exchange over the voxel surface.");
-    ImGui::PopStyleColor();
+    {
+        const float area = float(app.params.gy) * float(app.params.gz);
+        const float beta = (area > 0.f) ? float(app.model.frontalCells) / area : 0.f;
+        StatRow("Tunnel blockage", "%.1f%%", beta * 100.f);
+        ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+        ImGui::TextWrapped("Momentum exchange over the voxel surface, "
+                           "corrected for solid blockage.");
+        ImGui::PopStyleColor();
+        if (beta > 0.10f) {
+            ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
+            ImGui::TextWrapped("Blockage above 10%% — the correction is only "
+                               "first order, so C_D still reads high.");
+            ImGui::PopStyleColor();
+        }
+    }
     SectionEnd();
 
     // ── Convergence ─────────────────────────────────────────────────────────
