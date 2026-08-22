@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://img.shields.io/badge/version-2.0--dev-1dd1a1?style=for-the-badge" />
+<img src="https://img.shields.io/badge/version-v2.0.0--beta-1dd1a1?style=for-the-badge" />
 <img src="https://img.shields.io/badge/C%2B%2B-23-00599C?style=for-the-badge&logo=c%2B%2B" />
 <img src="https://img.shields.io/badge/Vulkan-1.3-AD1F1F?style=for-the-badge&logo=vulkan" />
 <img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" />
@@ -23,8 +23,12 @@ a real convergence monitor. Everything runs in Vulkan compute shaders;
 on a desktop GPU the solver sustains **thousands of MLUPS** (million lattice
 updates per second).
 
-This branch (`rewrite-v2`) is a complete ground-up rewrite. Only the idea
-survives from v0/v1 — every line of engine, solver, and UI code is new.
+v2 is a complete ground-up rewrite. Only the idea survives from v0/v1; every
+line of engine, solver, and UI code is new.
+
+**[Download the latest Windows build](https://github.com/SambuddhaRoy/LBM-CFD-Solver/releases/latest)**
+(no install, unzip and run; needs a Vulkan 1.3 GPU driver). Or build from
+source, below.
 
 ## Highlights
 
@@ -118,7 +122,6 @@ Prerequisites: Git, CMake 3.24+, Visual Studio 2022+ (C++ workload), and
 ```powershell
 git clone https://github.com/SambuddhaRoy/LBM-CFD-Solver.git
 cd LBM-CFD-Solver
-git checkout rewrite-v2
 
 cmake -S . -B build `
     -DCMAKE_TOOLCHAIN_FILE="<vcpkg>/scripts/buildsystems/vcpkg.cmake" `
