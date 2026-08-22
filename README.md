@@ -16,12 +16,17 @@
 
 ---
 
-Drop in a model — or pick a built-in sphere, cylinder, cube, or NACA 0012 wing —
-set the wind speed and angle of attack, and watch velocity, pressure, vorticity,
-and vortex-core fields update live, with measured drag and lift coefficients and
-a real convergence monitor. Everything runs in Vulkan compute shaders;
-on a desktop GPU the solver sustains **thousands of MLUPS** (million lattice
-updates per second).
+Drop in a model, or pick a built-in sphere, cylinder, cube, or NACA 0012 wing.
+Set the wind speed, rotate the body on all three axes while the solver runs, and
+watch velocity, pressure, vorticity, and vortex-core fields update live, with
+measured drag and lift coefficients and a real convergence monitor.
+
+Everything runs in Vulkan compute shaders. On an RTX 5070 Ti the solver sustains
+**4161 to 4970 MLUPS** (million lattice updates per second) across grids from
+3.9e5 to 2.6e7 cells, which is 71 to 84 percent of the card's peak memory
+bandwidth under a 152 byte per cell traffic model. Throughput is independent of
+the collision operator to within 1 percent, so the kernel is bandwidth-bound
+rather than compute-bound.
 
 v2 is a complete ground-up rewrite. Only the idea survives from v0/v1; every
 line of engine, solver, and UI code is new.
