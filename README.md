@@ -35,6 +35,14 @@ line of engine, solver, and UI code is new.
 (no install, unzip and run; needs a Vulkan 1.3 GPU driver). Or build from
 source, below.
 
+## Screenshot
+
+![NACA 0012 wing deep in stall, velocity field, live in the wind tunnel](docs/screenshots/naca0012-stall-velocity.png)
+
+NACA 0012 wing pitched to 58.7°, well past stall, showing the separated wake in
+the velocity field. Aerodynamic forces, convergence, and field statistics update
+live in the side panels while the solver runs at 4287 MLUPS.
+
 ## Highlights
 
 **Physics**
