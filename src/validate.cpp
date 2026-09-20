@@ -169,6 +169,133 @@ void downloadMacro(GpuContext& gpu, VkBuffer macro, size_t cells,
     gpu.destroyBuffer(host);
 }
 
+// ─── Refinement-fraction scan ────────────────────────────────────────────────
+// How much of the domain would a gradient-driven AMR actually have to refine?
+//
+// For a single 2:1 level the work multiplier is (1-phi) + 8*2*phi = 1 + 15*phi:
+// eight times the cells, and each fine block must subcycle two steps per coarse
+// step because LBM locks dt to dx. Refining the whole domain instead costs 16x.
+// So AMR only pays while phi stays small, and against its own 2-3x indirection
+// overhead the break-even sits near phi = 0.3.
+//
+// phi is reported per cell (an unreachable ideal) and per block, because real
+// AMR refines whole blocks and the block figure is the one that bills. The
+// grad-energy column is the share of total |grad u|^2 falling inside the
+// flagged cells; it makes the threshold choice principled instead of arbitrary,
+// since a region holding 95+% of the velocity-gradient energy is resolving the
+// physics that matters.
+
+struct CellGrad {
+    float gu;    // |grad u|_F normalised by uIn per cell
+    float gp;    // |grad p| normalised by rho*uIn^2, with c_s^2 = 1/3
+    float gu2;   // raw |grad u|^2, for the energy-capture fold
+};
+
+// Central differences. Solid cells carry rho=1, u=0 from the LBM kernel, so
+// differencing a fluid cell against a solid neighbour yields the wall shear,
+// which is exactly the boundary-layer gradient a refinement criterion must see.
+CellGrad cellGrad(const std::vector<float>& macro,
+                  uint32_t gx, uint32_t gy, uint32_t gz,
+                  int x, int y, int z, float uIn) {
+    auto at = [&](int cx, int cy, int cz) -> size_t {
+        cx = std::clamp(cx, 0, int(gx)-1);
+        cy = std::clamp(cy, 0, int(gy)-1);
+        cz = std::clamp(cz, 0, int(gz)-1);
+        return (size_t(cz)*gy + cy)*gx + cx;
+    };
+    static const int off[3][3] = { {1,0,0}, {0,1,0}, {0,0,1} };
+
+    float gu2 = 0.f, dr2 = 0.f;
+    for (int j = 0; j < 3; ++j) {
+        const size_t cp = at(x+off[j][0], y+off[j][1], z+off[j][2]);
+        const size_t cm = at(x-off[j][0], y-off[j][1], z-off[j][2]);
+        for (int i = 0; i < 3; ++i) {
+            const float d = 0.5f*(macro[cp*4+1+i] - macro[cm*4+1+i]);
+            gu2 += d*d;
+        }
+        const float dr = 0.5f*(macro[cp*4] - macro[cm*4]);
+        dr2 += dr*dr;
+    }
+    const float u = std::max(uIn, 1e-6f);
+    return { std::sqrt(gu2)/u, 3.f*std::sqrt(dr2)/(u*u), gu2 };
+}
+
+// A linear shear u_x = a*y has |grad u|_F = a everywhere, so the normalised
+// criterion must read a/uIn. Catches stride and index slips in the stencil,
+// which a plausible-looking phi would otherwise hide. Deliberately not an
+// assert: this has to run in the Release build, which is the only one used.
+bool refineScanSelfTest() {
+    const uint32_t g = 8;
+    std::vector<float> m(size_t(g)*g*g*4, 0.f);
+    const float a = 0.01f;
+    for (uint32_t z = 0; z < g; ++z)
+        for (uint32_t y = 0; y < g; ++y)
+            for (uint32_t x = 0; x < g; ++x) {
+                const size_t c = (size_t(z)*g + y)*g + x;
+                m[c*4+0] = 1.f;            // uniform rho -> gp must vanish
+                m[c*4+1] = a*float(y);     // u_x = a*y
+            }
+    const CellGrad cg = cellGrad(m, g, g, g, 3, 3, 3, kUin);   // interior, unclamped
+    const bool ok = std::abs(cg.gu - a/kUin) < 1e-4f && cg.gp < 1e-6f;
+    if (!ok)
+        std::printf("    [FAIL] refine-scan stencil self-test: "
+                    "gu=%.5f (want %.5f), gp=%.2e (want 0)\n",
+                    cg.gu, a/kUin, cg.gp);
+    return ok;
+}
+
+void refineScan(const std::vector<float>& macro,
+                const std::vector<uint32_t>& occ,
+                uint32_t gx, uint32_t gy, uint32_t gz, float uIn) {
+    if (!refineScanSelfTest()) return;   // broken stencil makes phi meaningless
+
+    const size_t n = size_t(gx)*gy*gz;
+    std::vector<float> crit(n, 0.f), gu2(n, 0.f);
+    double totalGu2 = 0; size_t fluid = 0;
+
+    for (uint32_t z = 0; z < gz; ++z)
+        for (uint32_t y = 0; y < gy; ++y)
+            for (uint32_t x = 0; x < gx; ++x) {
+                const size_t c = (size_t(z)*gy + y)*gx + x;
+                if (occ[c]) continue;
+                ++fluid;
+                const CellGrad cg = cellGrad(macro, gx, gy, gz,
+                                             int(x), int(y), int(z), uIn);
+                crit[c] = std::max(cg.gu, cg.gp);
+                gu2[c]  = cg.gu2;
+                totalGu2 += cg.gu2;
+            }
+    if (!fluid) return;
+
+    // Fraction of BLOCKS holding at least one flagged cell — what AMR bills for.
+    auto blockPhi = [&](uint32_t B, float t) {
+        const uint32_t bx = (gx+B-1)/B, by = (gy+B-1)/B, bz = (gz+B-1)/B;
+        std::vector<uint8_t> hit(size_t(bx)*by*bz, 0u);
+        for (uint32_t z = 0; z < gz; ++z)
+            for (uint32_t y = 0; y < gy; ++y)
+                for (uint32_t x = 0; x < gx; ++x) {
+                    const size_t c = (size_t(z)*gy + y)*gx + x;
+                    if (!occ[c] && crit[c] > t)
+                        hit[(size_t(z/B)*by + y/B)*bx + x/B] = 1u;
+                }
+        size_t h = 0; for (uint8_t v : hit) h += v;
+        return double(h)/double(hit.size());
+    };
+
+    std::printf("\n    AMR refinement scan — phi = share of domain needing refinement\n");
+    std::printf("      thr   phi_cell  phi_blk8  phi_blk16  grad-energy  work@blk8\n");
+    for (const float t : { 0.005f, 0.01f, 0.02f, 0.03f, 0.05f, 0.1f, 0.2f, 0.4f }) {
+        size_t flagged = 0; double cap = 0;
+        for (size_t c = 0; c < n; ++c)
+            if (!occ[c] && crit[c] > t) { ++flagged; cap += gu2[c]; }
+        const double p8 = blockPhi(8, t), p16 = blockPhi(16, t);
+        std::printf("     %5.2f    %6.1f%%   %6.1f%%    %6.1f%%     %6.1f%%    %6.2fx\n",
+                    t, 100.0*double(flagged)/double(fluid), 100.0*p8, 100.0*p16,
+                    totalGu2 > 0 ? 100.0*cap/totalGu2 : 0.0, 1.0 + 15.0*p8);
+    }
+    std::printf("      uniform 2x refine = 16.00x, before AMR's own 2-3x overhead\n");
+}
+
 // ─── Vorticity BMP dump (viridis) ────────────────────────────────────────────
 
 void viridis(float t, uint8_t& r, uint8_t& g, uint8_t& b) {
@@ -247,7 +374,8 @@ CaseResult runCase(GpuContext& gpu, uint32_t gx, uint32_t gy, uint32_t gz,
                    std::vector<uint32_t> occ, float D, float Re,
                    int spanAxis, uint32_t warmup, uint32_t window, uint32_t batch,
                    const std::filesystem::path& bmpPath,
-                   const std::vector<float>* sdf = nullptr) {
+                   const std::vector<float>* sdf = nullptr,
+                   bool scan = false) {
     CaseResult R;
     R.Re = Re; R.D = D;
     R.tau = std::clamp(tauForRe(Re, D), 0.505f, 6.f);
@@ -342,6 +470,8 @@ CaseResult runCase(GpuContext& gpu, uint32_t gx, uint32_t gy, uint32_t gz,
     // Field analysis: recirculation length + vortex core on the wake centreline
     std::vector<float> macro;
     downloadMacro(gpu, solver.macroBuffer(), solver.cells(), macro);
+
+    if (scan) refineScan(macro, occ, gx, gy, gz, p.uIn);
 
     auto cellAt = [&](int x, int cross) -> size_t {
         if (spanAxis == 2)   // span Z: vary X and Y(=cross), z = spanMid
@@ -453,7 +583,8 @@ int runValidation(const ValidateOptions& opts) {
             auto occ = makeCylinder2D(gx, gy, gz, cx, cy, D);
             const auto img = s.img ? (outDir / s.img) : std::filesystem::path{};
             CaseResult r = runCase(gpu, gx, gy, gz, std::move(occ), D, s.Re,
-                                   2 /*span Z*/, s.warm, s.win, 100, img, &sdf);
+                                   2 /*span Z*/, s.warm, s.win, 100, img, &sdf,
+                                   std::abs(s.Re - 100.f) < 1.f /*scan*/);
             printRow(r);
             results.push_back(r);
         }
@@ -558,7 +689,7 @@ int runValidation(const ValidateOptions& opts) {
             auto occ = makeSphere3D(gx, gy, gz, cx, cy, cz, D);
             auto sdf = sphereSDF(gx, gy, gz, cx, cy, cz, D);
             CaseResult r = runCase(gpu, gx, gy, gz, std::move(occ), D, s.Re,
-                                   1, s.warm, s.win, 100, {}, &sdf);
+                                   1, s.warm, s.win, 100, {}, &sdf, true /*scan*/);
             printRow(r);
             const float lit = schillerNaumann(s.Re);
             const bool ok = r.meanCd > lit*0.75f && r.meanCd < lit*1.25f;
