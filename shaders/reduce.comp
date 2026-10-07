@@ -1,0 +1,31 @@
+#version 460
+// reduce.comp — fold per-workgroup partials into K final vec4s, one
+// workgroup per output. Components flagged in maxMask (bit 4k+c) take the
+// maximum instead of the sum. Sums are accumulated in a fixed order, so the
+// result is deterministic.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform RP { uint count, K, maxMask, pad; } rp;
+layout(std430, set = 0, binding = 4) readonly buffer In { vec4 partials[]; };
+layout(std430, set = 0, binding = 5) writeonly buffer Out { vec4 result[]; };
+
+shared vec4 sv[256];
+
+void main() {
+    const uint k = gl_WorkGroupID.x, t = gl_LocalInvocationID.x;
+    const bvec4 isMax = bvec4((rp.maxMask >> (4u*k)) & 1u, (rp.maxMask >> (4u*k+1u)) & 1u,
+                              (rp.maxMask >> (4u*k+2u)) & 1u, (rp.maxMask >> (4u*k+3u)) & 1u);
+    vec4 acc = vec4(0.0);
+    for (uint i = t; i < rp.count; i += 256u) {
+        const vec4 v = partials[i * rp.K + k];
+        acc = mix(acc + v, max(acc, v), isMax);
+    }
+    sv[t] = acc;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) sv[t] = mix(sv[t] + sv[t + s], max(sv[t], sv[t + s]), isMax);
+        barrier();
+    }
+    if (t == 0u) result[k] = sv[0];
+}

@@ -1,7 +1,7 @@
 {
   "name": "virtual-wind-tunnel",
-  "version": "0.0.1-alpha",
-  "description": "High-performance virtual wind tunnel using GPU-accelerated D3Q19 LBM",
+  "version": "3.0.0",
+  "description": "Real-time GPU wind tunnel: D3Q19 lattice Boltzmann solver in Vulkan compute",
   "dependencies": [
     "vulkan-headers",
     "vulkan-loader",
@@ -14,6 +14,7 @@
     "glm",
     "vk-bootstrap",
     "vulkan-memory-allocator",
-    "shaderc"
+    "shaderc",
+    "stb"
   ]
 }

@@ -1,0 +1,61 @@
+#version 460
+// sdf_mesh.comp — unsigned narrow-band distance to a triangle mesh. One
+// workgroup per triangle visits the cells of its bounding box (padded by the
+// band) inside the body's local scratch box and keeps the minimum distance
+// with an atomic min on the float bits (non-negative floats order like uints).
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform MP {
+    ivec4 origin;       // scratch box origin, lattice cells
+    uvec4 dims;         // scratch box size
+    uint  nTris, nbY, nbZ, binSize;
+    float band;
+} mp;
+
+layout(std430, set = 0, binding = 4) readonly buffer Tris { vec4 tri[]; };   // 3 per triangle
+layout(std430, set = 0, binding = 5) buffer Scratch { uint dist[]; };
+
+// Closest point on triangle abc to p (Ericson, Real-Time Collision Detection 5.1.5).
+vec3 closestOnTriangle(vec3 p, vec3 a, vec3 b, vec3 c) {
+    const vec3 ab = b - a, ac = c - a, ap = p - a;
+    const float d1 = dot(ab, ap), d2 = dot(ac, ap);
+    if (d1 <= 0.0 && d2 <= 0.0) return a;
+    const vec3 bp = p - b;
+    const float d3 = dot(ab, bp), d4 = dot(ac, bp);
+    if (d3 >= 0.0 && d4 <= d3) return b;
+    const float vc = d1*d4 - d3*d2;
+    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) return a + ab * (d1 / (d1 - d3));
+    const vec3 cp = p - c;
+    const float d5 = dot(ab, cp), d6 = dot(ac, cp);
+    if (d6 >= 0.0 && d5 <= d6) return c;
+    const float vb = d5*d2 - d1*d6;
+    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) return a + ac * (d2 / (d2 - d6));
+    const float va = d3*d6 - d5*d4;
+    if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0)
+        return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+    const float denom = 1.0 / (va + vb + vc);
+    return a + ab * (vb * denom) + ac * (vc * denom);
+}
+
+void main() {
+    const uint t = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    if (t >= mp.nTris) return;
+    const vec3 a = tri[3u*t].xyz, b = tri[3u*t + 1u].xyz, c = tri[3u*t + 2u].xyz;
+
+    const ivec3 dims = ivec3(mp.dims.xyz);
+    const ivec3 lo = clamp(ivec3(floor(min(a, min(b, c)) - mp.band)) - mp.origin.xyz, ivec3(0), dims - 1);
+    const ivec3 hi = clamp(ivec3(ceil (max(a, max(b, c)) + mp.band)) - mp.origin.xyz, ivec3(0), dims - 1);
+    const ivec3 ext = hi - lo + 1;
+    const uint count = uint(ext.x * ext.y * ext.z);
+
+    for (uint i = gl_LocalInvocationID.x; i < count; i += 256u) {
+        const int x = int(i % uint(ext.x));
+        const int y = int((i / uint(ext.x)) % uint(ext.y));
+        const int z = int(i / uint(ext.x * ext.y));
+        const ivec3 l = lo + ivec3(x, y, z);
+        const vec3 p = vec3(l + mp.origin.xyz);           // cell centre, world
+        const float d = distance(p, closestOnTriangle(p, a, b, c));
+        if (d < mp.band)
+            atomicMin(dist[(uint(l.z) * mp.dims.y + uint(l.y)) * mp.dims.x + uint(l.x)], floatBitsToUint(d));
+    }
+}

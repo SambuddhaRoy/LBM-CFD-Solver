@@ -1,234 +1,250 @@
 <div align="center">
 
-<img src="https://img.shields.io/badge/version-v2.0.0--beta-1dd1a1?style=for-the-badge" />
-<img src="https://img.shields.io/badge/C%2B%2B-23-00599C?style=for-the-badge&logo=c%2B%2B" />
+<img src="https://img.shields.io/badge/version-v3.0.0-1dd1a1?style=for-the-badge" />
+<img src="https://img.shields.io/badge/C%2B%2B-20-00599C?style=for-the-badge&logo=c%2B%2B" />
 <img src="https://img.shields.io/badge/Vulkan-1.3-AD1F1F?style=for-the-badge&logo=vulkan" />
 <img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" />
-<img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-0078D4?style=for-the-badge" />
 
 <br /><br />
 
-# Virtual Wind Tunnel v2
+# Wind Tunnel v3
 
-**Real-time GPU aerodynamics — a D3Q19 Lattice Boltzmann solver in Vulkan compute**
+**A real-time GPU wind tunnel: D3Q19 lattice Boltzmann in Vulkan compute**
 
 </div>
 
 ---
 
-Drop in a model, or pick a built-in sphere, cylinder, cube, or NACA 0012 wing.
-Set the wind speed, rotate the body on all three axes while the solver runs, and
-watch velocity, pressure, vorticity, and vortex-core fields update live, with
-measured drag and lift coefficients and a real convergence monitor.
+Put a body in the tunnel (sphere, cube, cylinder, NACA 0012 wing, or any
+STL/OBJ/glTF/FBX/PLY model), set the wind, and watch the flow develop live.
+Rotate the body while the solver runs. Zoom into any part of the flow: the
+viewport is drawn per screen pixel straight from the simulation, so zooming in
+shows the lattice's real detail instead of magnified texels.
 
-Everything runs in Vulkan compute shaders. On an RTX 5070 Ti the solver sustains
-**4161 to 4970 MLUPS** (million lattice updates per second) across grids from
-3.9e5 to 2.6e7 cells, which is 71 to 84 percent of the card's peak memory
-bandwidth under a 152 byte per cell traffic model. Throughput is independent of
-the collision operator to within 1 percent, so the kernel is bandwidth-bound
-rather than compute-bound.
+On an RTX 5070 Ti the solver sustains **9,200 to 9,300 million lattice updates
+per second** with 16-bit storage, about 80% of the card's memory bandwidth, and
+fits up to ~300 million cells in 16 GB.
 
-v2 is a complete ground-up rewrite. Only the idea survives from v0/v1; every
-line of engine, solver, and UI code is new.
+v3 is a ground-up rewrite. Only the idea carries over from v2.
 
-**[Download the latest Windows build](https://github.com/SambuddhaRoy/LBM-CFD-Solver/releases/latest)**
-(no install, unzip and run; needs a Vulkan 1.3 GPU driver). Or build from
-source, below.
+![Sphere at Re 5.8e5, velocity slice](docs/screenshots/sphere-velocity.png)
 
-## Screenshot
+## Performance
 
-![NACA 0012 wing deep in stall, velocity field, live in the wind tunnel](docs/screenshots/naca0012-stall-velocity.png)
+`WindTunnel --bench --peak 896`, 256³ cells, sphere obstacle, RTX 5070 Ti:
 
-NACA 0012 wing pitched to 58.7°, well past stall, showing the separated wake in
-the velocity field. Aerodynamic forces, convergence, and field statistics update
-live in the side panels while the solver runs at 4287 MLUPS.
+| storage | MLUPS | effective bandwidth | % of 896 GB/s |
+|---|---|---|---|
+| FP32  | 4,780 | 731 GB/s | 82% |
+| FP16S | 9,180 | 707 GB/s | 79% |
+| FP16C | 9,257 | 713 GB/s | 80% |
 
-## Highlights
+Throughput is flat with grid size: FP16C runs at 9,215 MLUPS on
+1024 x 448 x 448 (205M cells) and 9,241 on 1024 x 512 x 512 (268M cells).
+In the interactive app, with rendering every frame, it sustains 9,200 to
+9,500 MLUPS.
 
-**Physics**
-- D3Q19 LBM with **BGK**, **regularized**, and **TRT** collision operators
-- **Smagorinsky LES** subgrid turbulence — effective relaxation time from the
-  local non-equilibrium stress
-- **Free-slip tunnel walls** (specular reflection) instead of periodic wrap —
-  the wake can't re-enter the domain from the other side
-- Equilibrium velocity inlet with optional perturbation; **pressure outlet**
-  pinning rho = 1 (a floating zero-gradient outlet back-pressurises the domain
-  and halves the effective Reynolds number); **Bouzidi interpolated
-  bounce-back** at obstacles, so the wall sits at its true sub-cell position
-  rather than on the voxel staircase
-- **Measured, not modeled, diagnostics**: a single fused GPU reduction returns
-  the L2 velocity residual, **momentum-exchange** drag/lift/side force, mass
-  conservation, peak velocity, and kinetic energy every frame
+Bandwidth counts what each cell must move per step: its 19 distributions read
+and written once, plus a flag byte (153 B in FP32, 77 B in FP16).
 
-**Aerodynamics workflow**
-- Built-in analytic models — sphere, cube, spanwise cylinder, **NACA 0012 wing**
-  — voxelized exactly, no mesh files needed
-- **Pitch, yaw and roll sliders** rotate the body on all three axes and
-  re-voxelize live — while the solver is running the existing flow field is
-  kept, so the wake visibly reorganises instead of restarting from rest
-- Mesh import (STL / OBJ / glTF / FBX / PLY) via Assimp with SAT voxelization
-  and interior fill
-- Reference area for C_D / C_L taken from the actual projected frontal area,
-  with a **solid-blockage correction** applied (see Accuracy below)
+For reference, FluidX3D, the fastest open single-GPU LBM code, publishes
+10,304 MLUPS (FP16C) for the RTX 5080. Scaled by memory bandwidth to the
+5070 Ti that is about 9,600. That comparison is an estimate (FluidX3D was not
+run on this machine), and FluidX3D's default collision is plain BGK, while
+this solver runs a recursive-regularized collision with LES in the same
+budget.
 
-**Physical unit scaling**
-- Pick a working fluid (sea-level air, high-altitude air, water, Mars CO2),
-  set the real wind speed and model size — the app derives dx, dt, the physical
-  and lattice Reynolds numbers, and Mach, and warns when compressibility or
-  resolution limits are hit
-- Colorbar and field statistics are labeled in physical units (m/s)
+**Memory:** 49 bytes per cell in FP16 (87 in FP32), so the largest preset,
+1024 x 512 x 512 = 268M cells, needs 12.2 GiB.
 
-**Engineering**
-- `--headless` self-validates windowless (mass, residual decay, peak velocity
-  relative to inlet, plausible C_D) and `--validate` runs the full Reynolds
-  sweep against literature — both exit 0/1, ready for CI
-- Frames-in-flight rendering with per-frame analysis readback slots (no
-  CPU-GPU stalls, no readback races)
-- Disk-backed pipeline cache; config persistence; BMP snapshot export
-- Clean module split: `gpu` (context/swapchain), `sim` (solver), `mesh`
-  (import/voxelize), `viz` (slice view), `ui` (panels), `app` (orchestration)
+### Where the speed comes from
+
+- **In-place streaming (Esoteric-Pull, Lehmann 2022).** One copy of the
+  distributions instead of two: half the memory, the same traffic per step.
+- **16-bit storage, 32-bit arithmetic.** Distributions are stored shifted
+  (f - w) in IEEE half (FP16S) or a custom 1-4-11 format (FP16C), halving the
+  bytes per step. Validation below shows the coefficients barely move.
+- **Bounce-back for free.** A solid cell never runs, so the slot a fluid cell
+  wrote its wall-bound population into is untouched; reading it with the step
+  parity flipped returns it reversed one step later. That is exact halfway
+  bounce-back, and the same bookkeeping supports interpolated (Bouzidi) walls
+  with no races: the q < 1/2 blend happens at load time, the q >= 1/2 blend
+  at store time, each using only local data.
+- **Compile-time step parity.** Each direction lives in its own buffer (so
+  grids can exceed Vulkan's 4 GiB per-binding limit), and the parity decides
+  which buffer each access uses. Making the parity a specialization constant
+  turned every access into a fixed binding: registers fell from 80 to 47.
+- **No divergent boundary branch.** Inlet, far-field and outlet cells run the
+  same code as every other cell, with density, velocity and stress overridden
+  so the collision yields the equilibrium. A separate branch made any warp
+  holding a face cell execute both paths; removing it took FP16 from 52% to
+  80% of peak.
+
+## Physics
+
+- **Lattice:** D3Q19, single-step stream + collide kernel.
+- **Collision:** recursive regularized BGK (Coreixas et al. 2017) with the six
+  third-order Hermite terms D3Q19 supports. The non-equilibrium part is
+  rebuilt from the stress tensor, which filters ghost modes and stays stable
+  down to tau -> 1/2.
+- **Turbulence:** Smagorinsky LES from the local non-equilibrium stress.
+- **Walls:** halfway or Bouzidi interpolated bounce-back from a signed
+  distance field, so curved walls sit at their true sub-cell position.
+- **Tunnel:** equilibrium inlet (optional perturbation), far-field side faces
+  or periodic, pressure outlet pinned at rho = 1.
+- **Forces:** momentum exchange summed inside the step kernel on demand.
+  Coefficients use planform area (chord x span) for the wing and projected
+  frontal area for every other body.
+- **Geometry:** voxelized on the GPU as a signed distance field. Analytic
+  bodies are exact in any rotation; meshes use a narrow-band distance splat
+  plus ray-parity inside/outside. Rotating the body re-voxelizes in
+  milliseconds and keeps the running flow; uncovered cells are revived from
+  their neighbours' populations.
+
+## Viewport
+
+- **2D slice** along any axis, pan and unlimited zoom. Every pixel samples
+  the 3D field. Scalars are trilinearly interpolated; vorticity and the
+  Q-criterion are computed at cell centres by central differences, then
+  interpolated, so they stay smooth when magnified. The body outline comes
+  from the signed distance field with per-pixel anti-aliasing and stays crisp
+  at any zoom. Past ~12 px per cell the lattice grid fades in, so you can see
+  the actual resolution you are looking at.
+- **3D view:** orbit camera, the slice plane in place, the body sphere-traced
+  from the SDF and shaded (coloured by surface pressure in pressure mode).
+- **Fields:** velocity, pressure, vorticity, Q-criterion, with a colour bar
+  and scale bar in physical units.
+
+![NACA 0012 at 12 degrees, vorticity, zoomed to show the lattice](docs/screenshots/wing-vorticity-zoom.png)
+
+![3D view, sphere coloured by surface pressure](docs/screenshots/sphere-3d-pressure.png)
 
 ## Validation
 
-Two tiers. `--headless` is a fast smoke test; `--validate` is the real one.
+Two suites, both exit 0/1.
 
-**`--validate`** runs a Reynolds sweep and asserts against published values —
-including C_D, which is the number the tool exists to produce:
+**`--selftest`** checks the GPU solver against a double-precision CPU
+reference written the textbook way: two buffers, plain pull streaming,
+bounce-back spelled out. Sphere (halfway and Bouzidi walls), a pitched cube
+with one-cell gaps, and a pitched NACA 0012, with inlet, pressure outlet and
+LES active. FP32 agrees to 6e-8 in velocity and 2e-6 in force, i.e. float
+round-off; the 16-bit formats track within 7e-5. A mutation check (reverting
+to lag-2 bounce-back) fails it by four orders of magnitude, so it does catch
+bugs. It also voxelizes a rotated icosphere and a rotated torus mesh and
+compares every cell to the exact shape: all misclassified cells lie within
+0.02 cells of the true surface.
 
-```
-  CYLINDER — diameter 40 cells, blockage 0.12
-    Re     tau    C_D     St      L_r/D    regime
-     2   4.100  7.383      --      0.00    attached flow (no separation)
-    40   0.680  1.589      --      2.15    steady recirculation (twin vortices)
-   100   0.572  1.463   0.181      1.70    Von Karman vortex street
-   150   0.548  1.502   0.192      1.40    Von Karman vortex street
-
-  Literature: L_r/D ~ 2.1 at Re=40; St ~ 0.164 / 0.184 at Re=100 / 150;
-              C_D ~ 1.50 / 1.35 / 1.33 at Re=40 / 100 / 150.
-```
-
-Recirculation length lands at 2.15 D against 2.1 published; Strouhal is 5-10%
-high (blockage); C_D is within 6-13% and asserted to +/-25%. A square prism and
-a **fully 3D sphere** checked against the Schiller-Naumann drag correlation
-round it out — the sphere is the only case that exercises the same 3D code path
-an imported model takes, since the 2D cases run at `gz = 6`.
-
-**`--headless`** is the CI smoke test — exit code 0/1, thresholds stated
-relative to the inlet speed rather than as loose absolutes:
+**`--validate`** runs canonical flows against published data. Every
+coefficient is raw: the 2D cases use a domain big enough (5% blockage) that
+no blockage correction is applied.
 
 ```
-  [PASS] all quantities finite
-  [PASS] mass conserved (1.0447, want 1.00 +/- 0.05)
-  [PASS] peak |u| = 1.30x inlet (want < 2.5x)
-  [PASS] residual decayed (6.97e-01 -> 2.67e-01)
-  [PASS] C_D plausible (0.754, want 0.05..8)
+  CYLINDER (2D), D = 40 cells, 1600 x 800, blockage 5%, FP16C storage
+  Re      C_D (published)          St (published)    L_r/D (published)
+  20      2.141 (2.050)  +4.5%          --            0.94 (0.94)
+  40      1.630 (1.520)  +7.2%          --            2.27 (2.13-2.35)
+  100     1.396 (1.330)  +5.0%     0.171 (0.165)          --
+  150     1.377 (1.320)  +4.3%     0.189 (0.184)          --
+
+  SPHERE (3D), D = 40 cells, 480 x 240 x 240, blockage 2.2%
+  100     1.141 (1.092)  +4.5%          --            0.86 (0.88)
+
+  STORAGE PRECISION, cylinder Re = 100
+  FP32    1.384  +4.0%             0.169
+  FP16S   1.392  +4.7%             0.169
+  FP16C   1.396  +5.0%             0.171
 ```
 
-The `2.5x inlet` bound is calibrated, not guessed: healthy runs peak near 1.3x,
-and a known-bad collision configuration peaks at 2.96x and is rejected.
+References: Dennis & Chang (1970) and Coutanceau & Bouard (1977) for the
+steady wake, Park, Kwon & Choi (1998) and Williamson (1996) for drag and
+Strouhal number, Schiller-Naumann for sphere drag, Taneda (1956) for the
+sphere wake. Tolerances: C_D 8%, St 6%, L_r/D 12%.
 
-## Building (Windows)
+The wake geometry and shedding frequency land within a few percent. Drag is
+consistently 4-7% high: what remains of blockage plus the finite resolution
+of 40 cells per diameter. Storing the distributions in 16 bits moves C_D by
+under 1% and the Strouhal number by at most 0.002.
 
-Prerequisites: Git, CMake 3.24+, Visual Studio 2022+ (C++ workload), and
-[vcpkg](https://github.com/microsoft/vcpkg).
+The whole suite takes about five minutes; the 3D sphere (28M cells, 40,000
+steps) takes two of them.
+
+## Accuracy: read before quoting a number
+
+- **The lattice resolves its own Reynolds number.** Set a 1 m body at 30 m/s
+  in air and the app asks for Re = 2e6. It simulates that Re when the
+  relaxation time allows, otherwise the highest it can and says so. At high
+  Re the boundary layer is far thinner than a cell and there is no wall
+  model: wake structure, trends and comparisons between shapes are
+  meaningful; absolute drag at Re 1e6 is not.
+- **Resolution drives the remaining error.** The validated cases put 40 cells
+  across the body. Below 32 the app warns.
+- **Blockage:** the tunnel's side faces confine the flow. The blockage ratio
+  is shown next to the forces; above 10% it warns. No correction is applied.
+- Incompressible regime: physical Mach above 0.3 is flagged, not modelled.
+
+## Building
+
+Prerequisites: CMake 3.24+, a C++20 compiler (Visual Studio 2022+),
+[vcpkg](https://github.com/microsoft/vcpkg), and a Vulkan 1.3
+driver with 8/16-bit storage (any desktop GPU from the last several years).
 
 ```powershell
 git clone https://github.com/SambuddhaRoy/LBM-CFD-Solver.git
 cd LBM-CFD-Solver
-
-cmake -S . -B build `
-    -DCMAKE_TOOLCHAIN_FILE="<vcpkg>/scripts/buildsystems/vcpkg.cmake" `
-    -DVCPKG_TARGET_TRIPLET=x64-windows
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE="<vcpkg>/scripts/buildsystems/vcpkg.cmake"
 cmake --build build --config Release
 ```
 
-The first configure installs the dependencies (Vulkan loader, GLFW, ImGui,
-Assimp, GLM, vk-bootstrap, VMA, shaderc) — this takes a while once.
-The executable, compiled shaders, and DLLs land in `build/Release/`.
+Dependencies (installed by vcpkg on first configure): Vulkan loader, GLFW,
+Dear ImGui, Assimp, GLM, vk-bootstrap, VMA, shaderc (for `glslc`), stb.
 
-On Linux the same CMake flow works with `x64-linux`; GCC 13+ or Clang 17+.
+v3 has been built and tested on Windows only. The code avoids
+platform-specific paths except the Windows file dialog (on Linux, drop a
+model onto the window), but the Linux build is untested.
 
-## Controls
+## Usage
 
-| Key | Action |
+```
+WindTunnel                      interactive wind tunnel
+WindTunnel --selftest           GPU solver vs CPU reference, all precisions
+WindTunnel --bench [--grid X Y Z] [--precision fp32|fp16s|fp16c|all] [--peak GBs]
+WindTunnel --validate [--precision P]
+WindTunnel --capture out.png [frames]   run the app, save the window, exit
+           --mesh FILE --shape S --pitch DEG --view 2d|3d --field F --zoom X --preset N
+```
+
+| Input | Action |
 |---|---|
-| `Space` | Run / pause |
-| `R` | Reset flow |
-| `1`–`4` | Velocity / Pressure / Vorticity / Q-criterion |
-| `[` `]` | Move slice plane |
-| `Tab` / `F` | Toggle left / right panel |
-| `S` | Save snapshot (BMP) |
-| `F11` | Fullscreen |
-| `Esc` | Reset view / close help |
-| Wheel / drag | Zoom / pan |
+| `Space` | run / pause |
+| `R` | reset flow |
+| `1`-`4` | velocity / pressure / vorticity / Q-criterion |
+| `V` | 2D slice / 3D view |
+| `[` `]` | move the slice (Shift: 10 cells) |
+| `H` | fit view |
+| `S` | save the viewport as PNG |
+| wheel | zoom about the cursor (2D) / dolly (3D) |
+| drag | pan (2D) / orbit (3D); right drag pans in 3D |
 
-Drag-and-drop a mesh file anywhere on the window to load it.
+Drop a model file anywhere on the window to load it.
 
-## Architecture
+## Code map
 
 ```
 src/
-  main.cpp   CLI parsing, GUI/headless dispatch
-  gpu.*      Vulkan context, swapchain, buffers, pipeline cache
-  sim.*      D3Q19 solver, unit scaling, fused analysis reduction
-  mesh.*     Assimp import, SAT voxelizer, analytic primitives
-  viz.*      slice compute pass -> ImGui texture, snapshot readback
-  ui.*       theme, panels, viewport, overlays
-  app.*      frame loop, actions, config, headless validation
+  vk.*         Vulkan context: device, buffers, push-descriptor compute kernels
+  solver.*     lattice buffers, step recording, forces, statistics, probe
+  geometry.*   analytic bodies, mesh import, GPU signed-distance voxelization
+  render.*     viewport renderer
+  app.*        window, swapchain, frame loop, UI
+  tests.cpp    CPU reference self-test, benchmark
+  validate.cpp CFD validation suite
 shaders/
-  lbm.comp       collide-stream: BGK/regularized/TRT + Smagorinsky LES
-  analysis.comp  residual + momentum-exchange forces + field stats, one pass
-  slice.comp     4-mode field visualization, classic blue-to-red false colour
+  lattice.glsl   velocity set, storage formats, indexing, equilibrium
+  stream.glsl    in-place streaming with bounce-back, moment accumulation
+  step.comp      the solver kernel
+  render.comp    per-pixel viewport
+  ...            geometry, initialisation, reductions
 ```
-
-~5,000 lines of C++23 and GLSL. No engine middleware — Vulkan, GLFW, ImGui,
-Assimp, GLM, VMA, vk-bootstrap via vcpkg.
-
-## Accuracy — read this before quoting a number
-
-This is a real-time solver. The flow structures it produces are trustworthy;
-the absolute coefficients need caveats.
-
-- **C_D is blockage-corrected.** A body of frontal area `A` in a tunnel of
-  cross-section `C` accelerates the stream past it to roughly `U/(1-A/C)`, so
-  normalising by the *inlet* dynamic pressure overstates C_D by `1/(1-beta)^2`
-  — about +29% at 12% blockage, which was the bulk of this solver's former drag
-  error. The continuity correction is now applied automatically and the
-  blockage ratio is shown next to the forces.
-
-  It is first order, and it is not equally right for every body. It takes the
-  round-body cases from +36..+45% down to +6..+13%. For a sharp-edged prism,
-  whose separation points are pinned at the corners rather than set by the
-  local speed, it over-corrects: the square case reads 1.52 uncorrected against
-  ~1.5 published and 1.22 corrected. Treat C_D on bluff, sharp-edged geometry as
-  a lower bound.
-- **The solver resolves the lattice Reynolds number, not the physical one.**
-  Ask for a 1 m body at 30 m/s and the panel will report Re ~ 2x10^6 while the
-  lattice is actually integrating Re ~ 10^3. Smagorinsky LES with no wall model
-  does not bridge three orders of magnitude. Wake topology, trends, and
-  comparisons between two shapes are meaningful; absolute forces at the
-  physical Re are not. The UI says so explicitly when the gap exceeds 10x.
-- **Resolution is the dominant remaining error, and it is measured.** On the
-  sphere validation case at Re=100, against Schiller-Naumann:
-
-  | cells across body | C_D error | wake length L/D (lit ~0.87) |
-  |---|---|---|
-  | 24 | +34% | 0.83 |
-  | 32 | +13% | 0.88 |
-
-  The wake geometry is already right at 24 cells; the *force* is what needs
-  resolution. Want quantitative drag: keep at least 32 cells across the body —
-  the app shows this figure and warns below it. The Coarse preset puts a
-  default model at ~22 cells, Fine at ~35.
-- Single precision throughout. No formal grid-convergence study ships, though
-  the table above is a two-point version of one.
-
-## Known limits
-
-- No wall model or wall functions: boundary layers are unresolved at high Re
-- Free-slip side walls, so the domain is a slip-walled duct rather than open air
-- Single-phase, incompressible-regime flow (lattice Mach is clamped)
-- No heat transfer, compressibility, or moving/deforming geometry
 
 ## License
 

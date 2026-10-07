@@ -1,0 +1,89 @@
+#version 460
+// sdf_shape.comp — exact signed distance (lattice units, > 0 in fluid) to an
+// analytic body, evaluated in the body frame so any rotation is exact.
+//   0 sphere   size.x = radius
+//   1 box      size.xyz = half extents
+//   2 cylinder axis = body z, size.x = radius, size.y = half length
+//   3 prism    2D polygon in the body xy plane (binding 4) extruded along
+//              body z, size.x = half span: wings and other extruded profiles
+//   4 mesh     signed distances already computed in a scratch box (binding
+//              5, see sdf_mesh / sdf_sign); size.xyz = box origin,
+//              bounds.xyz = box size, both in cells
+// Values are clamped to +-band; only the band near the surface matters for
+// interpolated walls and for sphere-traced rendering.
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform SP {
+    uint Nx, Ny, Nz, shape;
+    vec4 center;        // xyz body origin in lattice coordinates, w = band
+    vec4 size;
+    vec4 r0, r1, r2;    // rows of the world -> body rotation
+    vec4 bounds;        // prism: polygon bounding box (min.xy, max.xy)
+    uint nPoly, pad0, pad1, pad2;
+} sp;
+
+layout(std430, set = 0, binding = 2) writeonly buffer Sdf { float16_t sdf[]; };
+layout(std430, set = 0, binding = 4) readonly buffer Poly { vec2 poly[]; };
+layout(std430, set = 0, binding = 5) readonly buffer Scratch { uint scratch[]; };
+
+float extrude(float d2, float z, float halfLen) {
+    const vec2 w = vec2(d2, abs(z) - halfLen);
+    return min(max(w.x, w.y), 0.0) + length(max(w, 0.0));
+}
+
+float sdBox(vec3 p, vec3 b) {
+    const vec3 q = abs(p) - b;
+    return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+
+// Signed distance to a closed polygon (Quilez), negative inside.
+float sdPolygon(vec2 p) {
+    float d = dot(p - poly[0], p - poly[0]);
+    float s = 1.0;
+    for (uint i = 0u, j = sp.nPoly - 1u; i < sp.nPoly; j = i, ++i) {
+        const vec2 e = poly[j] - poly[i], w = p - poly[i];
+        const vec2 b = w - e * clamp(dot(w, e) / dot(e, e), 0.0, 1.0);
+        d = min(d, dot(b, b));
+        const bvec3 c = bvec3(p.y >= poly[i].y, p.y < poly[j].y, e.x*w.y > e.y*w.x);
+        if (all(c) || all(not(c))) s = -s;
+    }
+    return s * sqrt(d);
+}
+
+void main() {
+    const uint n = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 256u
+                 + gl_LocalInvocationID.x;
+    if (n >= sp.Nx * sp.Ny * sp.Nz) return;
+    const uint xy = sp.Nx * sp.Ny;
+    const uint z = n / xy, r = n - z * xy, y = r / sp.Nx, x = r - y * sp.Nx;
+    const vec3 w = vec3(x, y, z) - sp.center.xyz;
+    const vec3 p = vec3(dot(sp.r0.xyz, w), dot(sp.r1.xyz, w), dot(sp.r2.xyz, w));
+
+    float d;
+    if (sp.shape == 0u)      d = length(p) - sp.size.x;
+    else if (sp.shape == 1u) d = sdBox(p, sp.size.xyz);
+    else if (sp.shape == 2u) d = extrude(length(p.xy) - sp.size.x, p.z, sp.size.y);
+    else if (sp.shape == 4u) {
+        const ivec3 l = ivec3(x, y, z) - ivec3(sp.size.xyz);
+        const ivec3 dims = ivec3(sp.bounds.xyz);
+        if (all(greaterThanEqual(l, ivec3(0))) && all(lessThan(l, dims))) {
+            d = uintBitsToFloat(scratch[(uint(l.z) * uint(dims.y) + uint(l.y)) * uint(dims.x) + uint(l.x)]);
+        } else {
+            // Outside the box that encloses the whole mesh: distance to the
+            // box is a lower bound with the right (positive) sign.
+            const vec3 h = 0.5 * vec3(dims - 1);
+            d = sdBox(vec3(x, y, z) - (sp.size.xyz + h), h);
+        }
+    } else {
+        // Polygon distance is a loop over every edge, so only pay for it near
+        // the body. Outside the padded bounds the bounding-box distance is a
+        // lower bound with the right sign, which is all anything here needs.
+        const vec3 lo = vec3(sp.bounds.xy, -sp.size.x), hi = vec3(sp.bounds.zw, sp.size.x);
+        const vec3 c = 0.5 * (lo + hi), h = 0.5 * (hi - lo);
+        const float dBox = sdBox(p - c, h);
+        d = dBox > sp.center.w ? dBox : extrude(sdPolygon(p.xy), p.z, sp.size.x);
+    }
+    sdf[n] = float16_t(clamp(d, -sp.center.w, sp.center.w));
+}

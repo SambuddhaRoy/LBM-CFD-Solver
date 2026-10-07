@@ -1,0 +1,40 @@
+#version 460
+// classify.comp — derive cell types from the signed distance field after the
+// geometry changed (load, move, rotate), without restarting the flow.
+//
+// A cell the body has just uncovered is revived at rest equilibrium, written
+// as step t-1 would have stored it. Its neighbours wrote their populations
+// towards it during t-1 regardless (Esoteric-Pull always stores every link),
+// so it starts from their real outgoing populations. A cell the body has just
+// covered needs nothing: neighbours bounce back off the slots they wrote.
+//
+// pc.faces: bit 0 = Y faces are far field, bit 1 = Z faces (else periodic).
+#include "lattice.glsl"
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 1) buffer Flags { uint8_t flags[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Sdf { float16_t sdf[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer Field { f16vec4 field[]; };
+
+void main() {
+    const uint n = cellIndex();
+    if (n >= cellCount()) return;
+    const uvec3 p = coords(n);
+
+    uint face = 0u;
+    if (p.x == 0u) face = FLAG_EQ;
+    else if (p.x + 1u == pc.Nx) face = FLAG_OUTLET;
+    if ((pc.faces & 1u) != 0u && (p.y == 0u || p.y + 1u == pc.Ny)) face = FLAG_EQ;
+    if ((pc.faces & 2u) != 0u && (p.z == 0u || p.z + 1u == pc.Nz)) face = FLAG_EQ;
+
+    const bool wasSolid = (uint(flags[n]) & FLAG_SOLID) != 0u;
+    const bool solid = face == 0u && float(sdf[n]) < 0.0;
+
+    if (wasSolid && !solid) {
+        float f[19];
+        equilibrium(0.0, vec3(0.0), f);
+        storeAll(neighbourhood(p), (pc.t & 1u) == 0u, f);
+    }
+    if (solid) field[n] = f16vec4(0.0);
+    flags[n] = uint8_t(solid ? FLAG_SOLID : face);
+}

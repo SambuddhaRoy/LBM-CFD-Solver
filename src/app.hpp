@@ -1,0 +1,145 @@
+#pragma once
+// ============================================================================
+// app.hpp — the interactive wind tunnel: window, swapchain, frame loop, UI.
+// ============================================================================
+
+#include "geometry.hpp"
+#include "render.hpp"
+#include "solver.hpp"
+#include "vk.hpp"
+
+#include <array>
+#include <deque>
+#include <string>
+#include <vector>
+
+struct GLFWwindow;
+
+namespace wt {
+
+// Working fluids for physical scaling.
+struct Fluid { const char* name; float rho, nu, sound; };   // kg/m^3, m^2/s, m/s
+inline constexpr Fluid kFluids[] = {
+    {"Air, sea level, 15 C",  1.225f, 1.461e-5f, 340.3f},
+    {"Air, 11 km, -56 C",     0.364f, 3.930e-5f, 295.1f},
+    {"Water, 20 C",           998.2f, 1.004e-6f, 1482.f},
+    {"CO2, Mars surface",     0.020f, 6.600e-4f, 244.0f},
+};
+
+struct GridPreset { const char* name; uint32_t nx, ny, nz; };
+inline constexpr GridPreset kGrids[] = {
+    {"256 x 128 x 128",   256, 128, 128},
+    {"384 x 192 x 192",   384, 192, 192},
+    {"512 x 256 x 256",   512, 256, 256},
+    {"640 x 320 x 320",   640, 320, 320},
+    {"768 x 384 x 384",   768, 384, 384},
+    {"1024 x 448 x 448", 1024, 448, 448},
+    {"1024 x 512 x 512", 1024, 512, 512},
+};
+
+// Initial state from the command line. With a capture path the app saves the
+// whole window as a PNG after `captureFrames` frames and exits: reproducible
+// screenshots, and an end-to-end check of the interactive path.
+struct StartSetup {
+    Precision   precision = Precision::FP16C;
+    int         preset = 1;              // index into kGrids
+    Shape       shape = Shape::Sphere;
+    float       pitch = 0.f;
+    int         view3d = 0;
+    Field       field = Field::Speed;
+    float       zoom = 1.f;              // relative to the fitted view
+    std::string meshPath;                // model to load at start
+    std::string capturePath;
+    uint32_t    captureFrames = 300;
+};
+
+class App {
+public:
+    int run(const StartSetup& setup);
+
+private:
+    struct Frame {
+        VkCommandPool   pool = VK_NULL_HANDLE;
+        VkCommandBuffer cmd  = VK_NULL_HANDLE;
+        VkFence         fence = VK_NULL_HANDLE;
+        VkSemaphore     acquired = VK_NULL_HANDLE;
+        bool            stepped = false;     // this frame's submission ran steps
+        uint32_t        steps = 0;
+    };
+
+    void initWindow();
+    void initSwapchain();
+    void destroySwapchain();
+    void initImGui();
+    void rebuildSolver();                    // grid or precision changed
+    void applyGeometry();                    // body changed: keeps the flow
+    void resetFlow();
+    void updateScaling();                    // physical units -> tau
+    void fitView();
+    glm::vec3 bodyBoundsHalf() const;
+    double referenceArea() const;
+
+    void frame();
+    void collectResults(Frame& f, uint32_t slot);
+    void drawUi();
+    void drawControls(float width, float height);
+    void drawStats(float x, float width, float height);
+    void drawViewport(float x, float width, float height);
+    void handleViewportInput(float w, float h);
+    void handleKeys();
+    void loadMeshFile(const std::string& path);
+    void snapshot();
+    void saveCapture(uint32_t width, uint32_t height);
+
+    GLFWwindow*  window_ = nullptr;
+    gpu::Context ctx_;
+    Solver       solver_;
+    Geometry     geometry_;
+    Renderer     renderer_;
+
+    VkSwapchainKHR           swapchain_ = VK_NULL_HANDLE;
+    VkFormat                 swapFormat_ = VK_FORMAT_UNDEFINED;
+    VkExtent2D               swapExtent_{};
+    std::vector<VkImage>     swapImages_;
+    std::vector<VkImageView> swapViews_;
+    std::vector<VkSemaphore> renderDone_;     // one per swapchain image
+    bool                     swapDirty_ = false;
+    std::array<Frame, Solver::kSlots> frames_;
+    uint64_t frameCount_ = 0;
+
+    // Simulation settings.
+    int       gridIndex_ = 1;
+    Precision precision_ = Precision::FP16C;
+    Body      body_;
+    std::string meshName_;
+    bool      running_ = true;
+    bool      geometryDirty_ = false, resetRequested_ = false, rebuildRequested_ = false;
+    int       fluid_ = 0;
+    float     speed_ = 30.f;                 // m/s
+    float     length_ = 1.f;                 // m, body reference length
+    float     reRequested_ = 0.f, reSimulated_ = 0.f, mach_ = 0.f;
+    float     dx_ = 0.f, dt_ = 0.f;          // m, s per cell / step
+    bool      tauClamped_ = false;
+
+    // Measurements.
+    uint32_t stepsPerFrame_ = 4;
+    double   mlups_ = 0, simMs_ = 0;
+    std::array<double, 3> force_{};
+    Stats    stats_;
+    std::deque<float> histResidual_, histCd_, histCl_;
+
+    // View.
+    View  view_;
+    float viewportW_ = 1, viewportH_ = 1;
+    bool  autoRange_ = true;
+    bool  fitPending_ = true;      // fit once the viewport knows its size
+    float startZoom_ = 1.f;        // applied to the first fit only
+    float rangeScale_ = 1.f;
+    std::string capturePath_;
+    uint32_t    captureFrames_ = 0;
+    gpu::Buffer captureBuf_;
+    std::string status_;
+    double statusUntil_ = 0;
+};
+
+} // namespace wt

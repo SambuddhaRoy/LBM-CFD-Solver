@@ -1,745 +1,239 @@
 // ============================================================================
-// validate.cpp — Reynolds-resolved bluff-body validation
+// validate.cpp — CFD validation against published bluff-body results.
 //
-// For each case the harness:
-//   1. sets nu (via tau) so that Re = U*D/nu hits the target,
-//   2. builds a full-span (2D-equivalent) obstacle so free-slip walls make the
-//      flow mathematically two-dimensional,
-//   3. seeds the wake with a brief inlet perturbation, then removes it,
-//   4. records the cross-flow force every batch to detect vortex shedding and
-//      its Strouhal number, and
-//   5. reads the velocity field back to measure the recirculation length and
-//      locate the vortex core.
+//   Cylinder (2D)  Re 20, 40, 100, 150: drag coefficient, recirculation
+//                  length, Strouhal number of vortex shedding
+//   Sphere (3D)    Re 100: drag against the Schiller-Naumann correlation,
+//                  wake length
+//   Precision      the Re = 100 cylinder in FP32, FP16S and FP16C side by
+//                  side: 16-bit storage must not move the answer
 //
-// Strouhal is the headline metric: it is purely kinematic (a wake frequency),
-// so it validates the flow dynamics independently of any force-magnitude error.
+// The 2D cases run on a single cell in z with periodic z, which is an exact
+// two-dimensional flow, so the domain can be large enough (5% blockage) that
+// no blockage correction is applied: every coefficient reported here is raw.
+// LES is off, these are laminar flows.
 // ============================================================================
 
-#include "validate.h"
-
-#include "gpu.h"
-#include "mesh.h"
-#include "sim.h"
+#include "geometry.hpp"
+#include "solver.hpp"
+#include "tests.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
-#include <cstdint>
 #include <cstdio>
-#include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <vector>
 
-namespace vwt {
+namespace wt {
 
 namespace {
 
-constexpr float kUin = 0.06f;   // inlet speed, lattice units (Mach ~0.10)
+constexpr float kU = 0.06f;                  // inlet speed, lattice units (Mach 0.10)
 
-// ─── Geometry helpers ────────────────────────────────────────────────────────
-
-struct Extent { int x0, x1, y0, y1, z0, z1; bool any; };
-
-Extent measureExtent(const std::vector<uint32_t>& occ,
-                     uint32_t gx, uint32_t gy, uint32_t gz) {
-    Extent e{ int(gx), -1, int(gy), -1, int(gz), -1, false };
-    for (uint32_t z = 0; z < gz; ++z)
-        for (uint32_t y = 0; y < gy; ++y)
-            for (uint32_t x = 0; x < gx; ++x)
-                if (occ[(size_t(z)*gy + y)*gx + x]) {
-                    e.any = true;
-                    e.x0 = std::min(e.x0, int(x)); e.x1 = std::max(e.x1, int(x));
-                    e.y0 = std::min(e.y0, int(y)); e.y1 = std::max(e.y1, int(y));
-                    e.z0 = std::min(e.z0, int(z)); e.z1 = std::max(e.z1, int(z));
-                }
-    return e;
-}
-
-// Project the obstacle through the span axis so it becomes uniform there;
-// with free-slip span walls this is an exact infinite-span (2D) body.
-void extrudeAlong(std::vector<uint32_t>& occ, uint32_t gx, uint32_t gy,
-                  uint32_t gz, int spanAxis /*1=Y, 2=Z*/) {
-    if (spanAxis == 2) {
-        for (uint32_t y = 0; y < gy; ++y)
-            for (uint32_t x = 0; x < gx; ++x) {
-                bool any = false;
-                for (uint32_t z = 0; z < gz && !any; ++z)
-                    any = occ[(size_t(z)*gy + y)*gx + x];
-                if (any) for (uint32_t z = 0; z < gz; ++z)
-                    occ[(size_t(z)*gy + y)*gx + x] = 1u;
-            }
-    } else {
-        for (uint32_t z = 0; z < gz; ++z)
-            for (uint32_t x = 0; x < gx; ++x) {
-                bool any = false;
-                for (uint32_t y = 0; y < gy && !any; ++y)
-                    any = occ[(size_t(z)*gy + y)*gx + x];
-                if (any) for (uint32_t y = 0; y < gy; ++y)
-                    occ[(size_t(z)*gy + y)*gx + x] = 1u;
-            }
-    }
-}
-
-// Analytic infinite cylinder (axis = Z) of diameter D centred at (cx,cy).
-std::vector<uint32_t> makeCylinder2D(uint32_t gx, uint32_t gy, uint32_t gz,
-                                     float cx, float cy, float D) {
-    std::vector<uint32_t> occ(size_t(gx)*gy*gz, 0u);
-    const float r2 = (D*0.5f)*(D*0.5f);
-    for (uint32_t z = 0; z < gz; ++z)
-        for (uint32_t y = 0; y < gy; ++y)
-            for (uint32_t x = 0; x < gx; ++x) {
-                const float dx = float(x)+0.5f - cx, dy = float(y)+0.5f - cy;
-                if (dx*dx + dy*dy <= r2)
-                    occ[(size_t(z)*gy + y)*gx + x] = 1u;
-            }
-    return occ;
-}
-
-// Analytic infinite square prism (axis = Z), side D centred at (cx,cy).
-std::vector<uint32_t> makeSquare2D(uint32_t gx, uint32_t gy, uint32_t gz,
-                                   float cx, float cy, float D) {
-    std::vector<uint32_t> occ(size_t(gx)*gy*gz, 0u);
-    const float h = D*0.5f;
-    for (uint32_t z = 0; z < gz; ++z)
-        for (uint32_t y = 0; y < gy; ++y)
-            for (uint32_t x = 0; x < gx; ++x) {
-                const float dx = float(x)+0.5f - cx, dy = float(y)+0.5f - cy;
-                if (std::abs(dx) <= h && std::abs(dy) <= h)
-                    occ[(size_t(z)*gy + y)*gx + x] = 1u;
-            }
-    return occ;
-}
-
-// Analytic sphere of diameter D centred at (cx,cy,cz) — the only genuinely
-// three-dimensional validation body. Everything else here is quasi-2D (gz=6),
-// which leaves the 3D path that real models actually use unmeasured.
-std::vector<uint32_t> makeSphere3D(uint32_t gx, uint32_t gy, uint32_t gz,
-                                   float cx, float cy, float cz, float D) {
-    std::vector<uint32_t> occ(size_t(gx)*gy*gz, 0u);
-    const float r2 = (D*0.5f)*(D*0.5f);
-    for (uint32_t z = 0; z < gz; ++z)
-        for (uint32_t y = 0; y < gy; ++y)
-            for (uint32_t x = 0; x < gx; ++x) {
-                const float dx = float(x)+0.5f - cx;
-                const float dy = float(y)+0.5f - cy;
-                const float dz = float(z)+0.5f - cz;
-                if (dx*dx + dy*dy + dz*dz <= r2)
-                    occ[(size_t(z)*gy + y)*gx + x] = 1u;
-            }
-    return occ;
-}
-
-// Signed distance to that sphere, so the Bouzidi wall sits on the true surface
-// instead of the voxel staircase.
-std::vector<float> sphereSDF(uint32_t gx, uint32_t gy, uint32_t gz,
-                             float cx, float cy, float cz, float D) {
-    std::vector<float> phi(size_t(gx)*gy*gz, 0.f);
-    for (uint32_t z = 0; z < gz; ++z)
-        for (uint32_t y = 0; y < gy; ++y)
-            for (uint32_t x = 0; x < gx; ++x) {
-                const float dx = float(x)+0.5f - cx;
-                const float dy = float(y)+0.5f - cy;
-                const float dz = float(z)+0.5f - cz;
-                phi[(size_t(z)*gy + y)*gx + x] =
-                    std::sqrt(dx*dx + dy*dy + dz*dz) - 0.5f*D;
-            }
-    return phi;
-}
-
-// ─── Field readback ──────────────────────────────────────────────────────────
-
-void downloadMacro(GpuContext& gpu, VkBuffer macro, size_t cells,
-                   std::vector<float>& out) {
-    const VkDeviceSize sz = VkDeviceSize(cells) * 4 * sizeof(float);
-    GpuBuffer host = gpu.createBuffer(sz, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                      MemLoc::HostRead);
-    gpu.oneShot([&](VkCommandBuffer cmd) {
-        VkMemoryBarrier mb{};
-        mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
-        VkBufferCopy cr{ 0, 0, sz };
-        vkCmdCopyBuffer(cmd, macro, host.buffer, 1, &cr);
-    });
-    vmaInvalidateAllocation(gpu.allocator(), host.alloc, 0, VK_WHOLE_SIZE);
-    out.resize(cells * 4);
-    std::memcpy(out.data(), host.mapped, sz);
-    gpu.destroyBuffer(host);
-}
-
-// ─── Refinement-fraction scan ────────────────────────────────────────────────
-// How much of the domain would a gradient-driven AMR actually have to refine?
-//
-// For a single 2:1 level the work multiplier is (1-phi) + 8*2*phi = 1 + 15*phi:
-// eight times the cells, and each fine block must subcycle two steps per coarse
-// step because LBM locks dt to dx. Refining the whole domain instead costs 16x.
-// So AMR only pays while phi stays small, and against its own 2-3x indirection
-// overhead the break-even sits near phi = 0.3.
-//
-// phi is reported per cell (an unreachable ideal) and per block, because real
-// AMR refines whole blocks and the block figure is the one that bills. The
-// grad-energy column is the share of total |grad u|^2 falling inside the
-// flagged cells; it makes the threshold choice principled instead of arbitrary,
-// since a region holding 95+% of the velocity-gradient energy is resolving the
-// physics that matters.
-
-struct CellGrad {
-    float gu;    // |grad u|_F normalised by uIn per cell
-    float gp;    // |grad p| normalised by rho*uIn^2, with c_s^2 = 1/3
-    float gu2;   // raw |grad u|^2, for the energy-capture fold
+struct Measured {
+    double cd = 0, cdLit = 0;
+    double st = 0, stLit = 0;                // 0 = steady case
+    double lr = 0, lrLit = 0;                // recirculation length / D, 0 = not measured
+    double seconds = 0;
 };
 
-// Central differences. Solid cells carry rho=1, u=0 from the LBM kernel, so
-// differencing a fluid cell against a solid neighbour yields the wall shear,
-// which is exactly the boundary-layer gradient a refinement criterion must see.
-CellGrad cellGrad(const std::vector<float>& macro,
-                  uint32_t gx, uint32_t gy, uint32_t gz,
-                  int x, int y, int z, float uIn) {
-    auto at = [&](int cx, int cy, int cz) -> size_t {
-        cx = std::clamp(cx, 0, int(gx)-1);
-        cy = std::clamp(cy, 0, int(gy)-1);
-        cz = std::clamp(cz, 0, int(gz)-1);
-        return (size_t(cz)*gy + cy)*gx + cx;
-    };
-    static const int off[3][3] = { {1,0,0}, {0,1,0}, {0,0,1} };
+// Mean drag, and the Strouhal number from the up-crossings of the lift about
+// its mean, with crossing times interpolated between samples.
+struct ForceHistory {
+    std::vector<double> t, drag, lift;
 
-    float gu2 = 0.f, dr2 = 0.f;
-    for (int j = 0; j < 3; ++j) {
-        const size_t cp = at(x+off[j][0], y+off[j][1], z+off[j][2]);
-        const size_t cm = at(x-off[j][0], y-off[j][1], z-off[j][2]);
-        for (int i = 0; i < 3; ++i) {
-            const float d = 0.5f*(macro[cp*4+1+i] - macro[cm*4+1+i]);
-            gu2 += d*d;
-        }
-        const float dr = 0.5f*(macro[cp*4] - macro[cm*4]);
-        dr2 += dr*dr;
+    double meanDrag() const {
+        double s = 0; for (double d : drag) s += d;
+        return drag.empty() ? 0 : s / double(drag.size());
     }
-    const float u = std::max(uIn, 1e-6f);
-    return { std::sqrt(gu2)/u, 3.f*std::sqrt(dr2)/(u*u), gu2 };
-}
-
-// A linear shear u_x = a*y has |grad u|_F = a everywhere, so the normalised
-// criterion must read a/uIn. Catches stride and index slips in the stencil,
-// which a plausible-looking phi would otherwise hide. Deliberately not an
-// assert: this has to run in the Release build, which is the only one used.
-bool refineScanSelfTest() {
-    const uint32_t g = 8;
-    std::vector<float> m(size_t(g)*g*g*4, 0.f);
-    const float a = 0.01f;
-    for (uint32_t z = 0; z < g; ++z)
-        for (uint32_t y = 0; y < g; ++y)
-            for (uint32_t x = 0; x < g; ++x) {
-                const size_t c = (size_t(z)*g + y)*g + x;
-                m[c*4+0] = 1.f;            // uniform rho -> gp must vanish
-                m[c*4+1] = a*float(y);     // u_x = a*y
+    // Shedding frequency in cycles per step, 0 if the lift does not oscillate.
+    double frequency() const {
+        if (lift.size() < 8) return 0;
+        double mean = 0, amp = 0;
+        for (double l : lift) mean += l;
+        mean /= double(lift.size());
+        for (double l : lift) amp = std::max(amp, std::abs(l - mean));
+        if (amp < 1e-3 * std::max(std::abs(meanDrag()), 1e-9)) return 0;
+        // Count a cycle only when the lift climbs through +band after having
+        // been below -band: noise riding on the signal near its mean must
+        // not register as extra cycles.
+        const double band = 0.25 * amp;
+        std::vector<double> up;
+        bool armed = false;
+        for (size_t i = 1; i < lift.size(); ++i) {
+            const double a = lift[i - 1] - mean - band, b = lift[i] - mean - band;
+            if (lift[i - 1] - mean < -band) armed = true;
+            if (armed && a < 0 && b >= 0) {
+                up.push_back(t[i - 1] + (t[i] - t[i - 1]) * (-a / (b - a)));
+                armed = false;
             }
-    const CellGrad cg = cellGrad(m, g, g, g, 3, 3, 3, kUin);   // interior, unclamped
-    const bool ok = std::abs(cg.gu - a/kUin) < 1e-4f && cg.gp < 1e-6f;
-    if (!ok)
-        std::printf("    [FAIL] refine-scan stencil self-test: "
-                    "gu=%.5f (want %.5f), gp=%.2e (want 0)\n",
-                    cg.gu, a/kUin, cg.gp);
-    return ok;
-}
-
-void refineScan(const std::vector<float>& macro,
-                const std::vector<uint32_t>& occ,
-                uint32_t gx, uint32_t gy, uint32_t gz, float uIn) {
-    if (!refineScanSelfTest()) return;   // broken stencil makes phi meaningless
-
-    const size_t n = size_t(gx)*gy*gz;
-    std::vector<float> crit(n, 0.f), gu2(n, 0.f);
-    double totalGu2 = 0; size_t fluid = 0;
-
-    for (uint32_t z = 0; z < gz; ++z)
-        for (uint32_t y = 0; y < gy; ++y)
-            for (uint32_t x = 0; x < gx; ++x) {
-                const size_t c = (size_t(z)*gy + y)*gx + x;
-                if (occ[c]) continue;
-                ++fluid;
-                const CellGrad cg = cellGrad(macro, gx, gy, gz,
-                                             int(x), int(y), int(z), uIn);
-                crit[c] = std::max(cg.gu, cg.gp);
-                gu2[c]  = cg.gu2;
-                totalGu2 += cg.gu2;
-            }
-    if (!fluid) return;
-
-    // Fraction of BLOCKS holding at least one flagged cell — what AMR bills for.
-    auto blockPhi = [&](uint32_t B, float t) {
-        const uint32_t bx = (gx+B-1)/B, by = (gy+B-1)/B, bz = (gz+B-1)/B;
-        std::vector<uint8_t> hit(size_t(bx)*by*bz, 0u);
-        for (uint32_t z = 0; z < gz; ++z)
-            for (uint32_t y = 0; y < gy; ++y)
-                for (uint32_t x = 0; x < gx; ++x) {
-                    const size_t c = (size_t(z)*gy + y)*gx + x;
-                    if (!occ[c] && crit[c] > t)
-                        hit[(size_t(z/B)*by + y/B)*bx + x/B] = 1u;
-                }
-        size_t h = 0; for (uint8_t v : hit) h += v;
-        return double(h)/double(hit.size());
-    };
-
-    std::printf("\n    AMR refinement scan — phi = share of domain needing refinement\n");
-    std::printf("      thr   phi_cell  phi_blk8  phi_blk16  grad-energy  work@blk8\n");
-    for (const float t : { 0.005f, 0.01f, 0.02f, 0.03f, 0.05f, 0.1f, 0.2f, 0.4f }) {
-        size_t flagged = 0; double cap = 0;
-        for (size_t c = 0; c < n; ++c)
-            if (!occ[c] && crit[c] > t) { ++flagged; cap += gu2[c]; }
-        const double p8 = blockPhi(8, t), p16 = blockPhi(16, t);
-        std::printf("     %5.2f    %6.1f%%   %6.1f%%    %6.1f%%     %6.1f%%    %6.2fx\n",
-                    t, 100.0*double(flagged)/double(fluid), 100.0*p8, 100.0*p16,
-                    totalGu2 > 0 ? 100.0*cap/totalGu2 : 0.0, 1.0 + 15.0*p8);
-    }
-    std::printf("      uniform 2x refine = 16.00x, before AMR's own 2-3x overhead\n");
-}
-
-// ─── Vorticity BMP dump (viridis) ────────────────────────────────────────────
-
-void viridis(float t, uint8_t& r, uint8_t& g, uint8_t& b) {
-    t = std::clamp(t, 0.f, 1.f);
-    auto P = [t](double a,double bb,double c,double d,double e,double f,double gg) {
-        return float(a+t*(bb+t*(c+t*(d+t*(e+t*(f+t*gg))))));
-    };
-    auto cl = [](float v){ return uint8_t(std::clamp(v,0.f,1.f)*255.f); };
-    r = cl(P( 0.2777, 0.1051,-0.3308,-4.6342, 6.2283, 4.7764,-5.4355));
-    g = cl(P( 0.0054, 1.4046, 0.2148,-5.7991,14.1799,-13.7451, 4.6459));
-    b = cl(P( 0.3341, 1.3846, 0.0951,-19.3324,56.6906,-65.3530,26.3124));
-}
-
-void dumpVorticityBmp(const std::filesystem::path& path,
-                      const std::vector<float>& macro,
-                      uint32_t gx, uint32_t gy, uint32_t gz,
-                      uint32_t spanMid, int crossAxis, float scale) {
-    // Render the flow plane (X × cross axis) at the mid-span slice.
-    const uint32_t W = gx;
-    const uint32_t H = (crossAxis == 1) ? gy : gz;
-    const int crossComp = (crossAxis == 1) ? 2 : 3;   // uy or uz
-    auto vel = [&](int x, int c, int comp) -> float {
-        x = std::clamp(x, 0, int(gx)-1);
-        c = std::clamp(c, 0, int(H)-1);
-        const size_t cell = (crossAxis == 1)
-            ? (size_t(spanMid)*gy + c)*gx + x          // span=Z: cross is Y
-            : (size_t(c)*gy + spanMid)*gx + x;         // span=Y: cross is Z
-        return macro[cell*4 + comp];
-    };
-    const uint32_t rowBytes = (W*3 + 3) & ~3u;
-    std::vector<uint8_t> img(size_t(rowBytes)*H, 0);
-    for (uint32_t c = 0; c < H; ++c)
-        for (uint32_t x = 0; x < W; ++x) {
-            // omega = d(u_cross)/dx - d(u_x)/d(cross)
-            const float ducr = (vel(int(x)+1,int(c),crossComp) - vel(int(x)-1,int(c),crossComp))*0.5f;
-            const float dux  = (vel(int(x),int(c)+1,1) - vel(int(x),int(c)-1,1))*0.5f;
-            const float w = (ducr - dux);
-            uint8_t r,g,b; viridis(0.5f + 0.5f*std::clamp(w/scale,-1.f,1.f), r,g,b);
-            uint8_t* px = &img[size_t(c)*rowBytes + x*3];
-            px[0]=b; px[1]=g; px[2]=r;
         }
-    std::ofstream f(path, std::ios::binary);
-    if (!f.is_open()) return;
-    const uint32_t dataSize = rowBytes*H, fileSize = 54 + dataSize, off=54, ih=40;
-    const uint16_t planes=1, bpp=24;
-    uint8_t hdr[54]={}; hdr[0]='B'; hdr[1]='M';
-    std::memcpy(hdr+2,&fileSize,4); std::memcpy(hdr+10,&off,4);
-    std::memcpy(hdr+14,&ih,4); std::memcpy(hdr+18,&W,4); std::memcpy(hdr+22,&H,4);
-    std::memcpy(hdr+26,&planes,2); std::memcpy(hdr+28,&bpp,2);
-    std::memcpy(hdr+34,&dataSize,4);
-    f.write(reinterpret_cast<char*>(hdr),54);
-    f.write(reinterpret_cast<char*>(img.data()), std::streamsize(img.size()));
-}
-
-// ─── Case driver ─────────────────────────────────────────────────────────────
-
-struct CaseResult {
-    float Re=0, tau=0, D=0;
-    float meanCd=0, clMean=0, clAmp=0;
-    float strouhal=0;
-    bool  shedding=false;
-    bool  separated=false;
-    float recircLD=0;
-    float vortX=0, vortY=0;        // vortex core, units of D, relative to body rear/centre
-    float residual=1;
-    float maxU=0;                  // peak |u| (lattice) — freestream sanity check
-    bool  valid=false;
+        if (up.size() < 3) return 0;
+        return double(up.size() - 1) / (up.back() - up.front());
+    }
 };
 
-float tauForRe(float Re, float D) {
-    // Re = U D / nu, nu = (tau - 1/2)/3  →  tau = 1/2 + 3 U D / Re
-    return 0.5f + 3.f * kUin * D / std::max(Re, 0.1f);
-}
-
-CaseResult runCase(GpuContext& gpu, uint32_t gx, uint32_t gy, uint32_t gz,
-                   std::vector<uint32_t> occ, float D, float Re,
-                   int spanAxis, uint32_t warmup, uint32_t window, uint32_t batch,
-                   const std::filesystem::path& bmpPath,
-                   const std::vector<float>* sdf = nullptr,
-                   bool scan = false) {
-    CaseResult R;
-    R.Re = Re; R.D = D;
-    R.tau = std::clamp(tauForRe(Re, D), 0.505f, 6.f);
-
-    const int crossAxis = (spanAxis == 2) ? 1 : 2;   // 1=Y, 2=Z
-
-    SimParams p;
-    p.gx = gx; p.gy = gy; p.gz = gz;
-    p.tau = R.tau; p.uIn = kUin;
-    // TRT collision: the magic parameter Lambda=3/16 fixes the bounce-back
-    // wall at the link midpoint independent of viscosity, so the effective
-    // Reynolds number matches the nominal one (plain bounce-back shifts it).
-    p.collision = 2;
-    p.les = false;          // laminar shedding: no turbulence model
-    p.turb = 0.f;
-
-    Extent e = measureExtent(occ, gx, gy, gz);
-    const int xRear = e.x1;
-    const float crossC = (crossAxis == 1) ? 0.5f*(e.y0+e.y1) : 0.5f*(e.z0+e.z1);
-    const uint32_t spanMid = (spanAxis == 2) ? gz/2 : gy/2;
-
-    Solver solver;
-    solver.init(gpu, p);
-    solver.uploadObstacles(occ);
-    if (sdf) solver.setSDF(*sdf);   // exact interpolated bounce-back
-    solver.reset();
-
-    // Reference area = frontal projection along the flow (X): the silhouette
-    // the flow actually sees, = D x span. (Summing all solid cells and
-    // dividing by span gives the cross-sectional AREA, ~pi/4 too large for a
-    // cylinder — wrong for C_D/C_L.)
-    const uint32_t frontal = [&]{
-        uint32_t f = 0;
-        for (uint32_t z = 0; z < gz; ++z)
-            for (uint32_t y = 0; y < gy; ++y) {
-                bool any = false;
-                for (uint32_t x = 0; x < gx && !any; ++x)
-                    any = occ[(size_t(z)*gy + y)*gx + x] != 0u;
-                if (any) ++f;
-            }
-        return f;
-    }();
-    // Blockage-corrected, same normalisation the app reports (see sim.h).
-    auto coeff = [&](float force) {
-        return forceCoefficient(force, frontal, gy, gz, p.uIn);
-    };
-
-    std::vector<float> perp;        // cross-flow force coefficient series
-    perp.reserve(window / batch + 4);
-    double cdAcc = 0; int cdN = 0;
-
-    uint64_t step = 0;
-    while (step < uint64_t(warmup) + window) {
-        p.turb = (step < warmup/2) ? 0.15f : 0.f;   // seed, then let it self-sustain
-        gpu.oneShot([&](VkCommandBuffer cmd) {
-            solver.recordSteps(cmd, p, batch, uint32_t(step), false);
-            solver.recordAnalysis(cmd, p, 0);
-        });
-        step += batch;
-        const Analysis a = solver.readAnalysis(0);
-        R.residual = a.residual;
-        const float cd  = coeff(a.drag);
-        const float per = coeff((crossAxis == 1) ? a.lift : a.side);
-        if (step > warmup) { perp.push_back(per); cdAcc += cd; ++cdN; }
-        R.maxU = a.maxU;
-        if (!a.valid) break;
-    }
-
-    R.meanCd = cdN ? float(cdAcc / cdN) : 0.f;
-
-    // Cross-flow force statistics → shedding + Strouhal
-    if (!perp.empty()) {
-        double mean = 0; for (float v : perp) mean += v; mean /= perp.size();
-        double var = 0, pk = 0;
-        for (float v : perp) { var += (v-mean)*(v-mean); pk = std::max(pk, std::abs(v-mean)); }
-        R.clMean = float(mean);
-        R.clAmp  = float(pk);
-        const float rms = float(std::sqrt(var / perp.size()));
-
-        // up-crossings of the mean → shedding cycles
-        int cross = 0;
-        for (size_t i = 1; i < perp.size(); ++i)
-            if (perp[i-1]-mean < 0 && perp[i]-mean >= 0) ++cross;
-        R.shedding = (rms > 0.01f) && (cross >= 3);
-        if (R.shedding) {
-            const double stepsInWindow = double(perp.size()) * batch;
-            const double f = double(cross) / stepsInWindow;   // cycles per step
-            R.strouhal = float(f * D / p.uIn);
+// Runs `warm` steps, then samples forces every `every` steps for `window`.
+ForceHistory run(gpu::Context& ctx, Solver& s, uint32_t warm, uint32_t window, uint32_t every,
+                 float kickSteps) {
+    ForceHistory h;
+    const uint64_t t0 = s.t;
+    while (s.t - t0 < uint64_t(warm) + window) {
+        // A brief inlet perturbation breaks the symmetry so shedding starts
+        // promptly; it is switched off long before measurement.
+        s.flow.turbulence = (s.t - t0) < uint64_t(kickSteps) ? 0.03f : 0.f;
+        const bool sample = (s.t - t0) >= warm;
+        ctx.submitNow([&](VkCommandBuffer cmd) { s.recordSteps(cmd, every, false, sample, 0); });
+        if (sample) {
+            const auto f = s.forces(0);
+            h.t.push_back(double(s.t));
+            h.drag.push_back(f[0]);
+            h.lift.push_back(f[1]);
         }
     }
+    return h;
+}
 
-    // Field analysis: recirculation length + vortex core on the wake centreline
-    std::vector<float> macro;
-    downloadMacro(gpu, solver.macroBuffer(), solver.cells(), macro);
+// Length of the reversed-flow region behind the body along the wake centre
+// line, in units of D, with the zero crossing interpolated.
+double recirculation(const std::vector<float>& rhoU, const GridConfig& g, double xRear,
+                     uint32_t y, uint32_t z, double D) {
+    auto ux = [&](uint32_t x) { return double(rhoU[((size_t(z) * g.ny + y) * g.nx + x) * 4 + 1]); };
+    uint32_t x = uint32_t(std::ceil(xRear));
+    while (x < g.nx && ux(x) == 0.0) ++x;   // solid cells read exactly 0
+    if (x + 1 >= g.nx || ux(x) >= 0) return 0;  // no reversed flow: attached
+    while (x + 1 < g.nx && ux(x + 1) < 0) ++x;
+    const double a = ux(x), b = ux(x + 1);
+    const double x0 = double(x) + (-a / (b - a));
+    return (x0 - xRear) / D;
+}
 
-    if (scan) refineScan(macro, occ, gx, gy, gz, p.uIn);
+Measured cylinder(gpu::Context& ctx, Precision prec, double Re, double cdLit, double lrLit,
+                  double stLit) {
+    const auto start = std::chrono::steady_clock::now();
+    const float D = 40.f;
+    GridConfig g;
+    g.nx = 1600; g.ny = 800; g.nz = 1;
+    g.precision = prec; g.farFieldY = true; g.farFieldZ = false;
+    Solver s;
+    s.create(ctx, g);
+    s.flow.tau = 0.5f + 3.f * kU * D / float(Re);
+    s.flow.smagorinsky = 0.f;
+    s.flow.uIn = kU;
+    Geometry geo;
+    geo.create(ctx);
+    Body b;
+    b.shape = Shape::Cylinder;
+    b.center = {400.f, 400.3f, 0.f};          // 10 D upstream, 30 D downstream
+    b.length = D;
+    geo.apply(s, b);
+    ctx.submitNow([&](VkCommandBuffer cmd) { s.reset(cmd); });
 
-    auto cellAt = [&](int x, int cross) -> size_t {
-        if (spanAxis == 2)   // span Z: vary X and Y(=cross), z = spanMid
-            return (size_t(spanMid)*gy + cross)*gx + x;
-        else                 // span Y: vary X and Z(=cross), y = spanMid
-            return (size_t(cross)*gy + spanMid)*gx + x;
-    };
-    auto ux = [&](int x, int cross){ return macro[cellAt(x,cross)*4 + 1]; };
-    auto ucr = [&](int x, int cross){
-        return macro[cellAt(x,cross)*4 + (crossAxis==1 ? 2 : 3)];
-    };
+    // Long enough to settle: ~20 flow-throughs of the body for the steady
+    // cases, and ~15 shedding periods averaged for the unsteady ones.
+    const bool shedding = stLit > 0;
+    const uint32_t warm = shedding ? 90000 : 120000;
+    const uint32_t window = shedding ? 70000 : 6000;
+    const ForceHistory h = run(ctx, s, warm, window, 50, warm / 3.f);
 
-    const int cc = int(std::lround(crossC));
-    int lastNeg = -1;
-    for (int x = xRear + 1; x < int(gx) - 2; ++x) {
-        if (ux(x, cc) < 0.f) lastNeg = x;
-        else if (lastNeg >= 0 && ux(x, cc) >= 0.f && x > lastNeg + 1) break;
+    Measured m;
+    const double q = 0.5 * kU * kU * D;       // per unit span, rho = 1
+    m.cd = h.meanDrag() / q;  m.cdLit = cdLit;
+    m.st = h.frequency() * D / kU; m.stLit = stLit;
+    if (lrLit > 0) {
+        std::vector<float> rhoU;
+        s.probe(rhoU);
+        m.lr = recirculation(rhoU, g, b.center.x + 0.5 * D, 400, 0, D);
+        m.lrLit = lrLit;
     }
-    R.separated = (lastNeg >= 0);
-    R.recircLD  = R.separated ? float(lastNeg - xRear) / D : 0.f;
-
-    // Vortex core: max |omega_z| in the near wake (time snapshot)
-    float bestW = 0; int bx = xRear, bcr = cc;
-    const int crossMax = (crossAxis == 1) ? int(gy)-2 : int(gz)-2;
-    for (int x = xRear + 1; x < std::min(int(gx)-2, xRear + int(3*D)); ++x)
-        for (int c = std::max(1, cc - int(1.5f*D));
-             c < std::min(crossMax, cc + int(1.5f*D)); ++c) {
-            const float duc = (ucr(x+1,c) - ucr(x-1,c))*0.5f;
-            const float dux = (ux(x,c+1) - ux(x,c-1))*0.5f;
-            const float w = std::abs(duc - dux);
-            if (w > bestW) { bestW = w; bx = x; bcr = c; }
-        }
-    R.vortX = float(bx - xRear) / D;
-    R.vortY = float(bcr - cc) / D;
-
-    if (!bmpPath.empty())
-        dumpVorticityBmp(bmpPath, macro, gx, gy, gz, spanMid, crossAxis,
-                         0.6f * p.uIn / D * 8.f);
-
-    R.valid = std::isfinite(R.meanCd) && std::isfinite(R.strouhal);
-    solver.destroy();
-    return R;
+    geo.destroy();
+    s.destroy();
+    m.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    return m;
 }
 
-const char* regimeName(const CaseResult& r) {
-    if (r.shedding)      return "Von Karman vortex street (unsteady)";
-    if (r.separated)     return "steady recirculation (twin vortices)";
-    return "attached flow (no separation)";
+Measured sphere(gpu::Context& ctx, Precision prec, double Re) {
+    const auto start = std::chrono::steady_clock::now();
+    const float D = 40.f;
+    GridConfig g;
+    g.nx = 480; g.ny = 240; g.nz = 240;       // blockage 2.2%
+    g.precision = prec;
+    Solver s;
+    s.create(ctx, g);
+    s.flow.tau = 0.5f + 3.f * kU * D / float(Re);
+    s.flow.smagorinsky = 0.f;
+    s.flow.uIn = kU;
+    Geometry geo;
+    geo.create(ctx);
+    Body b;
+    b.shape = Shape::Sphere;
+    b.center = {140.f, 120.3f, 120.3f};
+    b.length = D;
+    geo.apply(s, b);
+    ctx.submitNow([&](VkCommandBuffer cmd) { s.reset(cmd); });
+    const ForceHistory h = run(ctx, s, 36000, 4000, 50, 0.f);
+
+    Measured m;
+    const double area = 3.14159265358979 * 0.25 * D * D;
+    m.cd = h.meanDrag() / (0.5 * kU * kU * area);
+    m.cdLit = 24.0 / Re * (1.0 + 0.15 * std::pow(Re, 0.687));    // Schiller-Naumann
+    std::vector<float> rhoU;
+    s.probe(rhoU);
+    m.lr = recirculation(rhoU, g, b.center.x + 0.5 * D, 120, 120, D);
+    m.lrLit = 0.88;                           // Taneda (1956), Re = 100
+    geo.destroy();
+    s.destroy();
+    m.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    return m;
 }
 
-void printRow(const CaseResult& r) {
-    char st[16];
-    if (r.shedding) std::snprintf(st, sizeof(st), "%.3f", r.strouhal);
-    else            std::snprintf(st, sizeof(st), "  --  ");
-    std::printf("  %5.0f  %6.3f  %7.3f  %8s  %7.2f  %7.3f  maxU=%.3f  %.1e  %s\n",
-                r.Re, r.tau, r.meanCd, st, r.recircLD, r.clAmp, r.maxU, r.residual,
-                regimeName(r));
+bool within(double v, double lit, double tol) { return lit > 0 && std::abs(v - lit) <= tol * lit; }
+
+void row(const char* label, const Measured& m, bool& ok, double tolCd, double tolSt, double tolLr) {
+    char st[32] = "    --      ", lr[32] = "    --      ";
+    if (m.stLit > 0) std::snprintf(st, sizeof st, "%.3f (%.3f)", m.st, m.stLit);
+    if (m.lrLit > 0) std::snprintf(lr, sizeof lr, "%.2f (%.2f)", m.lr, m.lrLit);
+    const bool pass = within(m.cd, m.cdLit, tolCd)
+                   && (m.stLit == 0 || within(m.st, m.stLit, tolSt))
+                   && (m.lrLit == 0 || within(m.lr, m.lrLit, tolLr));
+    ok = ok && pass;
+    std::printf("  %-14s %.3f (%.3f) %+6.1f%%   %-14s  %-12s  %5.0fs  %s\n", label, m.cd, m.cdLit,
+                100.0 * (m.cd / m.cdLit - 1.0), st, lr, m.seconds, pass ? "PASS" : "FAIL");
 }
 
 } // namespace
 
-// ════════════════════════════════════════════════════════════════════════════
+int runValidation(gpu::Context& ctx, Precision prec) {
+    bool ok = true;
+    std::printf("\nCFD validation, %s storage. Measured (published) values.\n", precisionName(prec));
+    std::printf("Tolerances: C_D 8%%, St 6%%, recirculation length 12%%.\n\n");
 
-int runValidation(const ValidateOptions& opts) {
-    GpuContext gpu;
-    gpu.init(nullptr);
-
-    const auto outDir = exeDir() / "validation";
-    std::error_code ec; std::filesystem::create_directories(outDir, ec);
-
-    std::printf("\n");
-    std::printf("==============================================================\n");
-    std::printf("  Virtual Wind Tunnel v2 — CFD validation suite\n");
-    std::printf("  GPU: %s\n", gpu.gpuName());
-    std::printf("==============================================================\n");
-
-    bool allPass = true;
-
-    // ── Cylinder Reynolds sweep (analytic, infinite span) ───────────────────
-    {
-        const uint32_t gx=680, gy=340, gz=6;
-        const float D = 40.f;
-        const float cx = 0.25f*gx, cy = 0.5f*gy;   // blockage ~0.118
-
-        std::printf("\n  CYLINDER — diameter %.0f cells, blockage %.2f, U=%.2f\n",
-                    D, D/gy, kUin);
-        std::printf("  ----------------------------------------------------------\n");
-        std::printf("    Re     tau    C_D     St      L_r/D   |C_L|    regime\n");
-
-        // Exact signed-distance field for the circle → interpolated bounce-back
-        // that places the curved wall at its true sub-cell position.
-        std::vector<float> sdf(size_t(gx)*gy*gz);
-        for (uint32_t z = 0; z < gz; ++z)
-            for (uint32_t yy = 0; yy < gy; ++yy)
-                for (uint32_t xx = 0; xx < gx; ++xx) {
-                    const float dx = float(xx)+0.5f - cx, dy = float(yy)+0.5f - cy;
-                    sdf[(size_t(z)*gy + yy)*gx + xx] = std::sqrt(dx*dx + dy*dy) - 0.5f*D;
-                }
-
-        struct Spec { float Re; uint32_t warm, win; const char* img; };
-        const Spec specs[] = {
-            {   2.f,  16000,  4000, "cyl_Re2.bmp"   },
-            {  40.f,  80000,  6000, "cyl_Re40.bmp"  },
-            { 100.f, 130000, 70000, "cyl_Re100.bmp" },
-            { 150.f, 150000, 80000, "cyl_Re150.bmp" },
-        };
-        std::vector<CaseResult> results;
-        for (const Spec& s : specs) {
-            auto occ = makeCylinder2D(gx, gy, gz, cx, cy, D);
-            const auto img = s.img ? (outDir / s.img) : std::filesystem::path{};
-            CaseResult r = runCase(gpu, gx, gy, gz, std::move(occ), D, s.Re,
-                                   2 /*span Z*/, s.warm, s.win, 100, img, &sdf,
-                                   std::abs(s.Re - 100.f) < 1.f /*scan*/);
-            printRow(r);
-            results.push_back(r);
-        }
-
-        auto findRe = [&](float re)->const CaseResult&{
-            for (auto& r : results) if (std::abs(r.Re-re)<1.f) return r; return results[0];
-        };
-        const CaseResult& re2   = findRe(2.f);
-        const CaseResult& re40  = findRe(40.f);
-        const CaseResult& re100 = findRe(100.f);
-        const CaseResult& re150 = findRe(150.f);
-
-        std::printf("\n  Literature: attached Re<5; steady recirc 5<Re<47 with\n");
-        std::printf("  L_r/D ~ 0.05 Re (=> ~2.1 at Re=40); shedding Re>47 with\n");
-        std::printf("  St ~ 0.164 (Re=100), 0.184 (Re=150).\n");
-        std::printf("  C_D ~ 1.50 (Re=40), 1.35 (Re=100), 1.33 (Re=150).\n\n");
-
-        // C_D is the number this tool exists to produce, so it is asserted here
-        // rather than merely printed. Bands are +/-25% of the literature value:
-        // wide enough for a 40-cell cylinder at 12% blockage, tight enough to
-        // catch the ~40% overprediction the uncorrected normalisation gave.
-        auto cdNear = [](float got, float lit) {
-            return got > lit * 0.75f && got < lit * 1.25f;
-        };
-
-        struct Chk { const char* name; bool ok; };
-        const Chk checks[] = {
-            { "Re=2 attached (no separation)",      !re2.shedding && re2.recircLD < 0.3f },
-            { "Re=40 steady recirculation",         !re40.shedding && re40.separated },
-            { "Re=40 recirc length 1.7-2.5 D",      re40.recircLD > 1.7f && re40.recircLD < 2.5f },
-            { "Re=100 vortex shedding",             re100.shedding },
-            { "Re=100 Strouhal 0.14-0.19",          re100.strouhal > 0.14f && re100.strouhal < 0.19f },
-            { "Re=150 Strouhal 0.16-0.21",          re150.strouhal > 0.16f && re150.strouhal < 0.21f },
-            { "Strouhal rises with Re",             re150.strouhal > re100.strouhal },
-            { "Re=40 C_D within 25% of 1.50",       cdNear(re40.meanCd,  1.50f) },
-            { "Re=100 C_D within 25% of 1.35",      cdNear(re100.meanCd, 1.35f) },
-            { "Re=150 C_D within 25% of 1.33",      cdNear(re150.meanCd, 1.33f) },
-            { "C_D falls from Re=40 to Re=150",     re150.meanCd < re40.meanCd },
-        };
-        for (const Chk& c : checks) {
-            std::printf("    [%s] %s\n", c.ok ? "PASS":"FAIL", c.name);
-            allPass = allPass && c.ok;
-        }
-    }
-
-    // ── Square prism (analytic) ─────────────────────────────────────────────
-    {
-        const uint32_t gx=680, gy=340, gz=6;
-        const float D = 36.f;
-        const float cx = 0.25f*gx, cy = 0.5f*gy;
-        std::printf("\n  SQUARE PRISM / CUBE CROSS-SECTION — side %.0f cells\n", D);
-        std::printf("  ----------------------------------------------------------\n");
-        std::printf("    Re     tau    C_D     St      L_r/D   |C_L|    regime\n");
-
-        struct Spec { float Re; uint32_t warm, win; const char* img; };
-        const Spec specs[] = {
-            {  40.f,  80000,  6000, "square_Re40.bmp"  },
-            { 200.f, 160000, 90000, "square_Re200.bmp" },
-        };
-        CaseResult hi{};
-        for (const Spec& s : specs) {
-            auto occ = makeSquare2D(gx, gy, gz, cx, cy, D);
-            const auto img = s.img ? (outDir / s.img) : std::filesystem::path{};
-            CaseResult r = runCase(gpu, gx, gy, gz, std::move(occ), D, s.Re,
-                                   2, s.warm, s.win, 100, img);
-            printRow(r);
-            if (std::abs(s.Re-200.f)<1.f) hi = r;
-        }
-        std::printf("\n    Wake: separates at the leading edges, recirculation bubble\n");
-        std::printf("    behind the body; vortex core (Re=200 snapshot) at x=%.2f D\n",
-                    hi.vortX);
-        std::printf("    downstream, y=%.2f D off the centreline.\n", hi.vortY);
-        const bool ok = hi.shedding && hi.strouhal > 0.05f && hi.strouhal < 0.30f;
-        std::printf("    [%s] square-body Von Karman shedding with finite Strouhal\n",
-                    ok ? "PASS":"FAIL");
-        allPass = allPass && ok;
-    }
-
-    // ── Sphere (analytic, fully 3D) ─────────────────────────────────────────
-    // Every case above runs at gz=6 with free-slip Z walls, i.e. quasi-2D. This
-    // is the only one that exercises the real 3D path — the same path every
-    // imported model takes — against a quantitative drag correlation.
-    {
-        const uint32_t gx=480, gy=160, gz=160;
-        const float D = 32.f;
-        const float cx = 0.28f*gx, cy = 0.5f*gy, cz = 0.5f*gz;
-        const float beta = 3.14159265f*0.25f*D*D / (float(gy)*float(gz));
-        std::printf("\n  SPHERE (3D) — diameter %.0f cells, blockage %.3f\n", D, beta);
-        std::printf("  ----------------------------------------------------------\n");
-        std::printf("    Re     tau    C_D     St      L_r/D   |C_L|    regime\n");
-
-        // Schiller-Naumann: C_D = (24/Re)(1 + 0.15 Re^0.687), the standard
-        // correlation for a smooth sphere below the drag crisis.
-        auto schillerNaumann = [](float re) {
-            return (24.f/re) * (1.f + 0.15f*std::pow(re, 0.687f));
-        };
-
-        struct Spec { float Re; uint32_t warm, win; };
-        const Spec specs[] = { { 100.f, 34000, 3000 } };
-        bool sphereOk = true;
-        for (const Spec& s : specs) {
-            auto occ = makeSphere3D(gx, gy, gz, cx, cy, cz, D);
-            auto sdf = sphereSDF(gx, gy, gz, cx, cy, cz, D);
-            CaseResult r = runCase(gpu, gx, gy, gz, std::move(occ), D, s.Re,
-                                   1, s.warm, s.win, 100, {}, &sdf, true /*scan*/);
-            printRow(r);
-            const float lit = schillerNaumann(s.Re);
-            const bool ok = r.meanCd > lit*0.75f && r.meanCd < lit*1.25f;
-            std::printf("    [%s] Re=%.0f sphere C_D %.3f vs Schiller-Naumann %.3f"
-                        " (within 25%%)\n", ok ? "PASS":"FAIL", s.Re, r.meanCd, lit);
-            sphereOk = sphereOk && ok;
-        }
-        allPass = allPass && sphereOk;
-    }
-
-    // ── Provided models ─────────────────────────────────────────────────────
-    auto runProvided = [&](const std::string& path, const char* label,
-                           float Re, const char* img) {
-        std::vector<Tri> tris; std::string err;
-        if (!mesh::loadTriangles(path, tris, err)) {
-            std::printf("\n  %s: import failed (%s)\n", label, err.c_str());
-            return;
-        }
-        const uint32_t gx=300, gy=140, gz=140;
-        VoxelModel m = mesh::voxelizeTriangles(tris, gx, gy, gz, 0.f, 0.f, 0.f, label);
-        Extent e = measureExtent(m.occupancy, gx, gy, gz);
-        const int dy = e.y1-e.y0+1, dz = e.z1-e.z0+1;
-        const int spanAxis = (dy >= dz) ? 1 : 2;     // longest cross-axis = span
-        extrudeAlong(m.occupancy, gx, gy, gz, spanAxis);
-        Extent e2 = measureExtent(m.occupancy, gx, gy, gz);
-        const float D = (spanAxis == 2) ? float(e2.y1-e2.y0+1)
-                                        : float(e2.z1-e2.z0+1);
-        std::printf("\n  PROVIDED MODEL: %s  (D=%.0f cells, span axis %c)\n",
-                    label, D, spanAxis==1?'Y':'Z');
-        std::printf("    Re     tau    C_D     St      L_r/D   |C_L|    regime\n");
-        const auto out = img ? (outDir / img) : std::filesystem::path{};
-        CaseResult r = runCase(gpu, gx, gy, gz, std::move(m.occupancy), D, Re,
-                               spanAxis, 70000, 45000, 100, out);
-        printRow(r);
+    // Published references: Dennis & Chang (1970) and Coutanceau & Bouard
+    // (1977) for the steady wake; Park, Kwon & Choi (1998) and Williamson
+    // (1996) for drag and Strouhal number in the shedding regime.
+    std::printf("  CYLINDER, D = 40 cells, 1600 x 800, blockage 5%%\n");
+    std::printf("  Re             C_D                      St              L_r / D        time\n");
+    struct Case { double re, cd, lr, st; };
+    const Case cyl[] = {
+        { 20, 2.05, 0.94, 0     },
+        { 40, 1.52, 2.24, 0     },   // L_r/D published 2.13-2.35: midpoint
+        {100, 1.33, 0,    0.165 },
+        {150, 1.32, 0,    0.184 },
     };
-    if (!opts.cylinderMesh.empty())
-        runProvided(opts.cylinderMesh, "cylinder.glb", 220.f, "provided_cylinder.bmp");
-    if (!opts.cubeMesh.empty())
-        runProvided(opts.cubeMesh, "CUBE1.stl", 220.f, "provided_cube.bmp");
+    for (const Case& c : cyl) {
+        char label[16]; std::snprintf(label, sizeof label, "%.0f", c.re);
+        row(label, cylinder(ctx, prec, c.re, c.cd, c.lr, c.st), ok, 0.08, 0.06, 0.12);
+    }
 
-    std::printf("\n==============================================================\n");
-    std::printf("  %s\n", allPass ? "VALIDATION PASSED — physics matches canonical results"
-                                   : "VALIDATION INCOMPLETE — see failed checks above");
-    if (opts.dumpImages)
-        std::printf("  Vorticity field images written to: %s\n",
-                    outDir.string().c_str());
-    std::printf("==============================================================\n\n");
+    std::printf("\n  SPHERE, D = 40 cells, 480 x 240 x 240, blockage 2.2%%\n");
+    row("100", sphere(ctx, prec, 100), ok, 0.08, 0.06, 0.12);
 
-    gpu.destroy();
-    return allPass ? 0 : 1;
+    std::printf("\n  STORAGE PRECISION, cylinder Re = 100\n");
+    for (const Precision p : {Precision::FP32, Precision::FP16S, Precision::FP16C})
+        row(precisionName(p), cylinder(ctx, p, 100, 1.33, 0, 0.165), ok, 0.08, 0.06, 0.12);
+
+    std::printf("\n%s\n", ok ? "VALIDATION PASSED" : "VALIDATION FAILED");
+    return ok ? 0 : 1;
 }
 
-} // namespace vwt
+} // namespace wt

@@ -1,0 +1,237 @@
+#version 460
+// ============================================================================
+// step.comp — one fused stream + collide update of every cell.
+//
+//   Streaming   Esoteric-Pull, in place (see lattice.glsl)
+//   Collision   recursive regularized BGK (Coreixas et al. 2017): the
+//               non-equilibrium part is rebuilt from the stress tensor alone,
+//               which filters ghost modes and keeps the scheme stable down to
+//               tau -> 1/2; third-order terms come from the recursion
+//               a1_abg = u_a P_bg + u_b P_ag + u_g P_ab
+//   Turbulence  Smagorinsky LES from the local non-equilibrium stress
+//   Walls       halfway or Bouzidi interpolated bounce-back, read from the
+//               slots solid cells leave untouched (race-free)
+//   Faces       equilibrium inlet / far field, pressure outlet (rho = 1)
+//
+// Register economy matters more than arithmetic here: with 16-bit storage a
+// cell moves only 77 bytes, so saturating memory needs many cells in flight.
+// The collision therefore never materialises f_eq or the post-collision
+// populations as arrays: the stress comes straight from raw second moments,
+// and equilibrium, collision, wall blending and store run fused per
+// direction pair.
+//
+// FORCES=1 also sums the momentum-exchange force on the obstacle into one
+// partial per workgroup (reduce.comp folds them).
+// ============================================================================
+
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+#include "lattice.glsl"
+#include "stream.glsl"
+
+#ifndef FORCES
+#define FORCES 0
+#endif
+
+// 3D dispatch: coordinates come straight from the invocation ID (no integer
+// division), and each 32-wide warp covers 32 consecutive cells of a row.
+layout(local_size_x_id = 1, local_size_y_id = 2, local_size_z = 1) in;
+
+// Step parity as a specialization constant: the solver builds an even and an
+// odd pipeline. The DDFs live in one buffer per direction and the parity
+// decides which buffer each load and store uses; as a runtime value that
+// would make every access an indexed descriptor lookup.
+layout(constant_id = 0) const uint PARITY = 0u;
+const bool ODD = PARITY != 0u;
+
+layout(std430, set = 0, binding = 3) buffer Field { f16vec4 field[]; };
+#if FORCES
+layout(std430, set = 0, binding = 4) writeonly buffer Partials { vec4 partials[]; };
+shared vec3 sForce[32];
+#endif
+// Velocity of the plane just upstream of the outlet, double-buffered by step
+// parity: cells at x = Nx-2 write half (t&1), the outlet reads the other half,
+// i.e. the previous step. Reading the live field instead would race with the
+// writers in this same dispatch and make runs non-reproducible.
+layout(std430, set = 0, binding = 5) buffer OutletPlane { vec4 plane[]; };
+
+uvec3 pcg3(uvec3 v) {
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    v ^= v >> 16u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    return v;
+}
+vec3 noise(uvec3 key) { return vec3(pcg3(key)) * (2.0 / 4294967296.0) - 1.0; }
+
+// Inlet velocity with an optional perturbation: 4x4-cell patches whose value
+// is blended between random keyframes every 32 steps, so it is smooth in time.
+vec3 inletVelocity(uvec3 p) {
+    vec3 u = pc.uin.xyz;
+    if (pc.turb > 0.0 && p.x == 0u) {
+        const uint k = pc.t / 32u;
+        const float s = float(pc.t % 32u) / 32.0;
+        const uvec3 key = uvec3(p.y / 4u, p.z / 4u, k);
+        const vec3 a = noise(key), b = noise(key + uvec3(0u, 0u, 1u));
+        u += mix(a, b, s) * pc.turb * length(pc.uin.xyz);
+    }
+    return u;
+}
+
+uint planeIndex(uvec3 p, uint half_) { return (half_ * pc.Nz + p.z) * pc.Ny + p.y; }
+
+void writeField(uint n, uvec3 p, float rhom1, vec3 u) {
+    if (pc.writeField != 0u) field[n] = f16vec4(rhom1, u);
+    if (p.x + 2u == pc.Nx) plane[planeIndex(p, pc.t & 1u)] = vec4(u, 0.0);
+}
+
+// Everything the post-collision population of any direction depends on.
+struct Collision {
+    float rhom1, rho, uu15;
+    vec3  u;
+    float pxx, pyy, pzz, pxy, pyz, pxz;   // non-equilibrium stress
+    float keep;                           // 1 - 1/tau
+    vec3  tp, tm;    // third order: equilibrium + keep * off-equilibrium, (+) and (-) combos
+};
+
+// f~eq_q + (1 - 1/tau) f1_q, shifted. q is a constant after unrolling, so
+// the velocity and Hermite factors fold to constants.
+float postPop(uint q, const Collision k) {
+    const vec3 c = vec3(C[q]);
+    const vec3 c2 = c*c - 1.0/3.0;
+    const float cu = dot(c, k.u);
+    const float h2 = c2.x*k.pxx + c2.y*k.pyy + c2.z*k.pzz
+                   + 2.0*(c.x*c.y*k.pxy + c.y*c.z*k.pyz + c.x*c.z*k.pxz);
+    vec3 hp, hm; hermite3(q, hp, hm);
+    return W[q] * (k.rhom1 + k.rho*(3.0*cu + 4.5*cu*cu - k.uu15)
+                   + 4.5*k.keep*h2 + 13.5*dot(hp, k.tp) + 4.5*dot(hm, k.tm));
+}
+
+// Equilibrium, collision, wall blending and store, fused per direction pair.
+void storePairs(const Nbr b, const Collision k, uint solid, inout vec3 force) {
+    const uint n = b.n;
+    ddfStore(0u, n, postPop(0u, k));
+    [[unroll]] for (uint i = 1u; i < 19u; i += 2u) {
+        float fa = postPop(i, k), fb = postPop(i + 1u, k);
+        const bool sm = (solid & (1u << i)) != 0u;
+        const bool sp = (solid & (1u << (i + 1u))) != 0u;
+#if FORCES
+        // Outgoing half: c_out (f_out + w) for every population sent at a wall.
+        if (sp) force += vec3(C[i])      * (fa + W[i]);
+        if (sm) force += vec3(C[i + 1u]) * (fb + W[i]);
+#endif
+        // Bouzidi with the wall at or beyond halfway (q >= 1/2): store the
+        // blend of this cell's own two post-collision populations into the
+        // wall slot, where the next step's bounce-back read will find it.
+        if (sm != sp && pc.bouzidi != 0.0) {
+            if (sp) {
+                const float q = linkQ(n, nb(b, i));
+                if (q >= 0.5) { const float r = 0.5 / q; fa = r*fa + (1.0 - r)*fb; }
+            } else {
+                const float q = linkQ(n, nb(b, i + 1u));
+                if (q >= 0.5) { const float r = 0.5 / q; fb = r*fb + (1.0 - r)*fa; }
+            }
+        }
+        ddfStore(slotNbr(i, ODD), nb(b, i), fa);
+        ddfStore(slotOwn(i, ODD), n, fb);
+    }
+}
+
+void cell(uvec3 p, inout vec3 force) {
+    const Nbr b = neighbourhood(p);
+    const uint fl = uint(flags[b.n]);
+    if ((fl & FLAG_SOLID) != 0u) return;
+    const bool odd = ODD;
+    // Inlet, far-field and outlet faces are imposed equilibria. They run the
+    // same code as every other cell with density, velocity and stress
+    // overridden below, so post-collision equals f_eq. A separate branch would
+    // make every warp holding a face cell execute both paths; at 256 cells a
+    // row that was a quarter of all warps, at three times the normal cost.
+    const bool face = (fl & (FLAG_EQ | FLAG_OUTLET)) != 0u;
+
+    // ── Stream: populations folded straight into raw moments ─────────────
+    // Cells touching a wall take a separate copy of the load: with solid a
+    // literal 0 the bulk copy folds to 19 straight-line loads, which lets the
+    // compiler issue them all at once (16-bit storage needs twice the loads
+    // in flight of FP32 to saturate memory).
+    const uint solid = (fl & FLAG_WALL) != 0u ? wallLinks(b) : 0u;
+    vec3 fin = vec3(0.0);
+    const Moments m = solid == 0u ? streamIn(b, odd, 0u, fin) : streamIn(b, odd, solid, fin);
+#if FORCES
+    force += fin;
+#endif
+    const float rhom1 = m.rhom1;
+    const vec3 mom = m.mom;
+    const float sxx = m.sxx, syy = m.syy, szz = m.szz, sxy = m.sxy, syz = m.syz, sxz = m.sxz;
+
+    // ── Collide ──────────────────────────────────────────────────────────
+    Collision k;
+    k.rhom1 = face ? 0.0 : rhom1;
+    k.rho = 1.0 + k.rhom1;
+    k.u = mom / k.rho;
+    const float ul = length(k.u);
+    if (ul > 0.4) k.u *= 0.4 / ul;      // lattice-Mach guard against blow-up
+    if (face) {
+        // Pressure outlet: pinning rho = 1 instead of letting it float stops
+        // the outlet reflecting pressure back into the domain. Velocity is
+        // the upstream cell's from the previous step (see OutletPlane).
+        k.u = (fl & FLAG_OUTLET) != 0u ? plane[planeIndex(p, (pc.t + 1u) & 1u)].xyz
+                                      : inletVelocity(p);
+    }
+    const vec3 u = k.u;
+    k.uu15 = 1.5 * dot(u, u);
+
+    // Non-equilibrium stress from the raw second moments of the shifted
+    // populations: P = sum c c f~ - rho u u - (rho - 1)/3 I. The third-order
+    // equilibrium terms have no second moment, so no f_eq is needed.
+    k.pxx = sxx - k.rho*u.x*u.x - rhom1/3.0;
+    k.pyy = syy - k.rho*u.y*u.y - rhom1/3.0;
+    k.pzz = szz - k.rho*u.z*u.z - rhom1/3.0;
+    k.pxy = sxy - k.rho*u.x*u.y;
+    k.pyz = syz - k.rho*u.y*u.z;
+    k.pxz = sxz - k.rho*u.x*u.z;
+    if (face) { k.pxx = 0.0; k.pyy = 0.0; k.pzz = 0.0; k.pxy = 0.0; k.pyz = 0.0; k.pxz = 0.0; }
+
+    // Smagorinsky. With S = -P / (2 rho cs^2 tau) and nu_t = (C dx)^2 |S|,
+    // tau = tau0 + 3 nu_t closes to tau = (tau0 + sqrt(tau0^2 + 18 sqrt2 C^2 Q / rho)) / 2,
+    // Q = sqrt(P:P).
+    float tau = pc.tau0;
+    if (pc.smag2 > 0.0) {
+        const float Q = sqrt(k.pxx*k.pxx + k.pyy*k.pyy + k.pzz*k.pzz
+                             + 2.0*(k.pxy*k.pxy + k.pyz*k.pyz + k.pxz*k.pxz));
+        tau = 0.5 * (pc.tau0 + sqrt(pc.tau0*pc.tau0 + 25.45584412 * pc.smag2 * Q / k.rho));
+    }
+    k.keep = 1.0 - 1.0 / tau;
+
+    // Third order: equilibrium rho u u u plus the recursive off-equilibrium
+    // estimate, both in the orthogonal D3Q19 combinations.
+    vec3 ap, am, bp, bm;
+    combos3(k.rho*u.x*u.x*u.y, k.rho*u.y*u.z*u.z, k.rho*u.x*u.z*u.z,
+            k.rho*u.x*u.y*u.y, k.rho*u.y*u.y*u.z, k.rho*u.x*u.x*u.z, ap, am);
+    combos3(2.0*u.x*k.pxy + u.y*k.pxx, 2.0*u.z*k.pyz + u.y*k.pzz, 2.0*u.z*k.pxz + u.x*k.pzz,
+            2.0*u.y*k.pxy + u.x*k.pyy, 2.0*u.y*k.pyz + u.z*k.pyy, 2.0*u.x*k.pxz + u.z*k.pxx, bp, bm);
+    k.tp = ap + k.keep * bp;
+    k.tm = am + k.keep * bm;
+
+    // ── Store, fused per direction pair (bulk and wall copies, as above) ─
+    if (solid == 0u) storePairs(b, k, 0u, force);
+    else             storePairs(b, k, solid, force);
+    writeField(b.n, p, k.rhom1, u);
+}
+
+void main() {
+    const uvec3 p = gl_GlobalInvocationID;
+    vec3 force = vec3(0.0);
+    if (p.x < pc.Nx && p.y < pc.Ny && p.z < pc.Nz) cell(p, force);
+#if FORCES
+    force = subgroupAdd(force);
+    if (subgroupElect()) sForce[gl_SubgroupID] = force;
+    barrier();
+    if (gl_LocalInvocationID.x == 0u) {
+        vec3 s = vec3(0.0);
+        for (uint k = 0u; k < gl_NumSubgroups; ++k) s += sForce[k];
+        const uvec3 g = gl_WorkGroupID, ng = gl_NumWorkGroups;
+        partials[(g.z * ng.y + g.y) * ng.x + g.x] = vec4(s, 0.0);
+    }
+#endif
+}

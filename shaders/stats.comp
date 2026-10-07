@@ -1,0 +1,53 @@
+#version 460
+// stats.comp — flow statistics on a strided subsample of the render field:
+// convergence residual sum|u - u_prev|^2 / sum|u|^2, mean density, peak
+// speed, kinetic energy. A few million samples are plenty for monitoring and
+// keep the cost flat however large the grid gets.
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform SP { uint N, stride, count, pad; } sp;
+layout(std430, set = 0, binding = 1) readonly buffer Flags { uint8_t flags[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Field { f16vec4 field[]; };
+layout(std430, set = 0, binding = 4) buffer Prev { vec4 prev[]; };
+layout(std430, set = 0, binding = 5) writeonly buffer Partials { vec4 partials[]; };
+
+shared vec4 sA[32];
+shared vec2 sB[32];
+
+void main() {
+    const uint k = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 256u
+                 + gl_LocalInvocationID.x;
+    vec4 a = vec4(0.0);   // sum|du|^2, sum|u|^2, sum rho, fluid count
+    vec2 b = vec2(0.0);   // max|u|, kinetic energy
+    if (k < sp.count) {
+        const uint n = k * sp.stride;
+        if ((uint(flags[n]) & 1u) == 0u) {
+            const vec4 fv = vec4(field[n]);
+            const vec3 u = fv.yzw;
+            const float rho = 1.0 + fv.x;
+            const vec3 du = u - prev[k].xyz;
+            a = vec4(dot(du, du), dot(u, u), rho, 1.0);
+            b = vec2(length(u), 0.5 * rho * dot(u, u));
+            prev[k] = vec4(u, 0.0);
+        }
+    }
+    a = subgroupAdd(a);
+    b = vec2(subgroupMax(b.x), subgroupAdd(b.y));
+    if (subgroupElect()) { sA[gl_SubgroupID] = a; sB[gl_SubgroupID] = b; }
+    barrier();
+    if (gl_LocalInvocationID.x == 0u) {
+        vec4 ta = vec4(0.0); vec2 tb = vec2(0.0);
+        for (uint s = 0u; s < gl_NumSubgroups; ++s) {
+            ta += sA[s];
+            tb = vec2(max(tb.x, sB[s].x), tb.y + sB[s].y);
+        }
+        const uint g = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+        partials[2u * g]      = ta;
+        partials[2u * g + 1u] = vec4(tb, 0.0, 0.0);
+    }
+}

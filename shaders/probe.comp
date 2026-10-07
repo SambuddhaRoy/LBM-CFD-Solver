@@ -1,0 +1,28 @@
+#version 460
+// probe.comp — exact FP32 density and velocity of every cell, from the DDFs
+// as the next step will load them. Used by tests and validation, where the
+// FP16 render field is too coarse.
+#include "lattice.glsl"
+#include "stream.glsl"
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 4) writeonly buffer Out { vec4 outv[]; };
+layout(std430, set = 0, binding = 5) readonly buffer OutletPlane { vec4 plane[]; };
+
+void main() {
+    const uint n = cellIndex();
+    if (n >= cellCount()) return;
+    const uint fl = uint(flags[n]);
+    if ((fl & FLAG_SOLID) != 0u) { outv[n] = vec4(1.0, 0.0, 0.0, 0.0); return; }
+    if ((fl & FLAG_EQ) != 0u)    { outv[n] = vec4(1.0, pc.uin.xyz); return; }
+    if ((fl & FLAG_OUTLET) != 0u) {
+        const uvec3 p = coords(n);
+        outv[n] = vec4(1.0, plane[((((pc.t + 1u) & 1u) * pc.Nz + p.z) * pc.Ny + p.y)].xyz);
+        return;
+    }
+    const Nbr b = neighbourhood(coords(n));
+    const uint solid = (fl & FLAG_WALL) != 0u ? wallLinks(b) : 0u;
+    vec3 fin = vec3(0.0);
+    const Moments m = streamIn(b, (pc.t & 1u) != 0u, solid, fin);
+    outv[n] = vec4(1.0 + m.rhom1, m.mom / (1.0 + m.rhom1));
+}

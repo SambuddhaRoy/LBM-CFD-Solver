@@ -1,0 +1,28 @@
+#version 460
+// init.comp — set every cell to equilibrium (rho = 1, inlet velocity; at rest
+// inside solids). Populations are written exactly as step t-1 would have
+// stored them, so the next step's load finds a consistent Esoteric-Pull state.
+// Solid cells are written too: their slots are where neighbouring fluid
+// cells find their bounce-back populations.
+#include "lattice.glsl"
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 1) readonly buffer Flags { uint8_t flags[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer Field { f16vec4 field[]; };
+layout(std430, set = 0, binding = 5) writeonly buffer OutletPlane { vec4 plane[]; };
+
+void main() {
+    const uint n = cellIndex();
+    if (n >= cellCount()) return;
+    const bool solid = (uint(flags[n]) & FLAG_SOLID) != 0u;
+    const vec3 u = solid ? vec3(0.0) : pc.uin.xyz;
+    float f[19];
+    equilibrium(0.0, u, f);
+    const uvec3 p = coords(n);
+    storeAll(neighbourhood(p), (pc.t & 1u) == 0u, f);
+    field[n] = f16vec4(0.0, u);
+    if (p.x + 2u == pc.Nx) {
+        plane[(0u * pc.Nz + p.z) * pc.Ny + p.y] = vec4(u, 0.0);
+        plane[(1u * pc.Nz + p.z) * pc.Ny + p.y] = vec4(u, 0.0);
+    }
+}

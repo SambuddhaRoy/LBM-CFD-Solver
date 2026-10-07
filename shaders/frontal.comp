@@ -1,0 +1,20 @@
+#version 460
+// frontal.comp — projected (frontal) area of the body seen from the inlet:
+// every solid cell sets the bit of its (y, z) column. The CPU counts the bits.
+// This is the reference area for the drag and lift coefficients.
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform FP { uint Nx, Ny, Nz, pad; } fp;
+layout(std430, set = 0, binding = 1) readonly buffer Flags { uint8_t flags[]; };
+layout(std430, set = 0, binding = 4) buffer Columns { uint columns[]; };
+
+void main() {
+    const uint n = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 256u
+                 + gl_LocalInvocationID.x;
+    if (n >= fp.Nx * fp.Ny * fp.Nz) return;
+    if ((uint(flags[n]) & 1u) == 0u) return;
+    const uint col = n / fp.Nx;                 // = z * Ny + y
+    atomicOr(columns[col >> 5], 1u << (col & 31u));
+}

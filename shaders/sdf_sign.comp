@@ -1,0 +1,61 @@
+#version 460
+// sdf_sign.comp — inside/outside by ray parity. One thread per (y, z) column
+// of the scratch box casts a ray along +x, collects its crossings with the
+// triangles binned to that column, sorts them, and flips the sign of every
+// cell lying behind an odd number of crossings. The ray is nudged off the
+// cell centre so axis-aligned meshes cannot hit an edge or vertex exactly.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform MP {
+    ivec4 origin;
+    uvec4 dims;
+    uint  nTris, nbY, nbZ, binSize;
+    float band;
+} mp;
+
+layout(std430, set = 0, binding = 1) readonly buffer Bins { uint bins[]; };  // CSR: starts, then ids
+layout(std430, set = 0, binding = 4) readonly buffer Tris { vec4 tri[]; };
+layout(std430, set = 0, binding = 5) buffer Scratch { uint dist[]; };
+
+const uint kMaxHits = 64u;
+
+void main() {
+    const uint col = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 256u
+                   + gl_LocalInvocationID.x;
+    if (col >= mp.dims.y * mp.dims.z) return;
+    const uint ly = col % mp.dims.y, lz = col / mp.dims.y;
+    const vec2 r = vec2(float(int(ly) + mp.origin.y) + 1.37e-3, float(int(lz) + mp.origin.z) + 0.71e-3);
+
+    const uint bin = (lz / mp.binSize) * mp.nbY + ly / mp.binSize;
+    const uint nBins = mp.nbY * mp.nbZ;
+    float hits[kMaxHits];
+    uint nHits = 0u;
+    for (uint k = bins[bin]; k < bins[bin + 1u]; ++k) {
+        const uint t = bins[nBins + 1u + k];
+        const vec3 a = tri[3u*t].xyz, b = tri[3u*t + 1u].xyz, c = tri[3u*t + 2u].xyz;
+        // Point-in-triangle in the yz plane via signed areas.
+        const float w0 = (b.y - r.x) * (c.z - r.y) - (b.z - r.y) * (c.y - r.x);
+        const float w1 = (c.y - r.x) * (a.z - r.y) - (c.z - r.y) * (a.y - r.x);
+        const float w2 = (a.y - r.x) * (b.z - r.y) - (a.z - r.y) * (b.y - r.x);
+        const bool inside = (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
+        const float sum = w0 + w1 + w2;
+        if (!inside || abs(sum) < 1e-12 || nHits == kMaxHits) continue;
+        hits[nHits++] = (w0 * a.x + w1 * b.x + w2 * c.x) / sum;
+    }
+    for (uint i = 1u; i < nHits; ++i) {                 // insertion sort, nHits is small
+        const float v = hits[i];
+        int k = int(i) - 1;
+        while (k >= 0 && hits[k] > v) { hits[k + 1] = hits[k]; --k; }
+        hits[k + 1] = v;
+    }
+
+    uint h = 0u;
+    for (uint lx = 0u; lx < mp.dims.x; ++lx) {
+        const float x = float(int(lx) + mp.origin.x);
+        while (h < nHits && hits[h] < x) ++h;
+        if ((h & 1u) != 0u) {
+            const uint idx = (lz * mp.dims.y + ly) * mp.dims.x + lx;
+            dist[idx] = floatBitsToUint(-uintBitsToFloat(dist[idx]));
+        }
+    }
+}

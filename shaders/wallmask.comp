@@ -1,0 +1,21 @@
+#version 460
+// wallmask.comp — mark fluid cells that touch a solid. Only these cells take
+// the bounce-back path in step.comp, so the rest never read neighbour flags.
+#include "lattice.glsl"
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 1) buffer Flags { uint8_t flags[]; };
+
+void main() {
+    const uint n = cellIndex();
+    if (n >= cellCount()) return;
+    const uint fl = uint(flags[n]);
+    if ((fl & (FLAG_SOLID | FLAG_EQ | FLAG_OUTLET)) != 0u) return;
+    const Nbr b = neighbourhood(coords(n));
+    bool touch = false;
+    [[unroll]] for (uint q = 1u; q < 19u; ++q)
+        touch = touch || (uint(flags[nb(b, q)]) & FLAG_SOLID) != 0u;
+    // Only the WALL bit of this byte changes; the SOLID bits other threads
+    // read here are stable during this pass.
+    flags[n] = uint8_t(touch ? (fl | FLAG_WALL) : (fl & ~FLAG_WALL));
+}

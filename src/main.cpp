@@ -1,104 +1,111 @@
 // ============================================================================
-// main.cpp — Virtual Wind Tunnel v2 entry point
+// main.cpp — command line entry point
 // ============================================================================
 
-#include "app.h"
-#include "validate.h"
+#include "app.hpp"
+#include "tests.hpp"
+#include "vk.hpp"
 
+#include <algorithm>
 #include <cstdio>
-#include <cstring>
+#include <cstdlib>
 #include <exception>
 #include <string>
 
 namespace {
 
-void printUsage(const char* prog) {
+void usage() {
     std::printf(
-        "Virtual Wind Tunnel v2 — real-time GPU LBM aerodynamics\n\n"
-        "Usage: %s [options]\n\n"
-        "  --mesh <path>        load a model file on startup\n"
-        "  --grid <X> <Y> <Z>   lattice resolution (default 128 80 80)\n"
-        "  --no-les             disable the Smagorinsky subgrid model\n"
-        "  --collision <0|1|2>  collision operator: 0 BGK, 1 regularised, 2 TRT\n"
-        "  --tau <t>            relaxation time (default 0.56; ->0.5 = less stable)\n"
-        "  --headless           run without a window and self-validate\n"
-        "  --bench              pure-throughput benchmark (MLUPS), no window\n"
-        "  --steps <N>          headless: number of LBM steps (default 240)\n"
-        "  --shape <name>       headless: sphere | cube | cylinder | wing\n"
-        "  --aoa <deg>          headless: angle of attack (default 0)\n"
-        "  --validate           run the CFD validation suite (Reynolds sweep)\n"
-        "  --cyl-mesh <path>    validation: provided cylinder model to test\n"
-        "  --cube-mesh <path>   validation: provided cube model to test\n"
-        "  --help               this message\n",
-        prog);
+        "Wind Tunnel v3: real-time GPU lattice Boltzmann aerodynamics\n\n"
+        "  (no arguments)          interactive wind tunnel\n"
+        "  --selftest              GPU solver vs CPU reference, all precisions\n"
+        "  --bench                 throughput benchmark (MLUPS)\n"
+        "  --validate              CFD validation suite against published data\n"
+        "  --grid X Y Z            benchmark grid (default 256 256 256)\n"
+        "  --steps N               benchmark steps per timing (default 200)\n"
+        "  --precision P           fp32 | fp16s | fp16c | all (default: all for --bench,\n"
+        "                          fp16c otherwise)\n"
+        "  --peak GBs              device peak bandwidth, adds a %% of peak column\n"
+        "  --capture FILE [N]      run the interactive app for N frames (default 300),\n"
+        "                          save the window as a PNG and exit\n\n"
+        "Initial state of the interactive app:\n"
+        "  --preset N              grid preset index (default 1)\n"
+        "  --mesh FILE             load a model (STL, OBJ, glTF, FBX, PLY, ...)\n"
+        "  --shape S               sphere | cube | cylinder | wing\n"
+        "  --pitch DEG             body pitch (angle of attack)\n"
+        "  --view 2d|3d            slice or 3D camera\n"
+        "  --field F               speed | pressure | vorticity | q\n"
+        "  --zoom X                magnification relative to the fitted view\n");
 }
 
-int parseShape(const std::string& s) {
-    if (s == "sphere")   return 0;
-    if (s == "cube")     return 1;
-    if (s == "cylinder") return 2;
-    if (s == "wing")     return 3;
-    return -1;
+bool parsePrecision(const std::string& s, std::vector<wt::Precision>& out) {
+    if (s == "fp32")  { out = {wt::Precision::FP32};  return true; }
+    if (s == "fp16s") { out = {wt::Precision::FP16S}; return true; }
+    if (s == "fp16c") { out = {wt::Precision::FP16C}; return true; }
+    if (s == "all")   { out = {wt::Precision::FP32, wt::Precision::FP16S, wt::Precision::FP16C}; return true; }
+    return false;
 }
 
 } // namespace
 
-int main(int argc, char* argv[]) {
-    vwt::StartOptions opts;
-    vwt::ValidateOptions vopts;
-    bool validate = false;
-
+int main(int argc, char** argv) {
+    std::string mode;
+    wt::BenchOptions bench;
+    std::vector<wt::Precision> precs;
+    wt::StartSetup setup;
     for (int i = 1; i < argc; ++i) {
-        const std::string arg = argv[i];
-        if (arg == "--help") {
-            printUsage(argv[0]);
-            return 0;
-        } else if (arg == "--validate") {
-            validate = true;
-        } else if (arg == "--cyl-mesh" && i + 1 < argc) {
-            vopts.cylinderMesh = argv[++i];
-        } else if (arg == "--cube-mesh" && i + 1 < argc) {
-            vopts.cubeMesh = argv[++i];
-        } else if (arg == "--headless") {
-            opts.headless = true;
-        } else if (arg == "--bench") {
-            opts.bench = true;
-        } else if (arg == "--no-les") {
-            opts.lesOff = true;
-        } else if (arg == "--collision" && i + 1 < argc) {
-            opts.collision = int(std::strtol(argv[++i], nullptr, 10));
-        } else if (arg == "--tau" && i + 1 < argc) {
-            opts.tau = std::strtof(argv[++i], nullptr);
-        } else if (arg == "--steps" && i + 1 < argc) {
-            opts.steps = uint32_t(std::strtoul(argv[++i], nullptr, 10));
-        } else if (arg == "--aoa" && i + 1 < argc) {
-            opts.aoaDeg = std::strtof(argv[++i], nullptr);
-        } else if (arg == "--shape" && i + 1 < argc) {
-            const int s = parseShape(argv[++i]);
-            if (s < 0) {
-                std::fprintf(stderr, "Unknown shape '%s'\n", argv[i]);
-                return 2;
-            }
-            opts.shape = s;
-        } else if (arg == "--grid" && i + 3 < argc) {
-            opts.gx = uint32_t(std::strtoul(argv[++i], nullptr, 10));
-            opts.gy = uint32_t(std::strtoul(argv[++i], nullptr, 10));
-            opts.gz = uint32_t(std::strtoul(argv[++i], nullptr, 10));
-        } else if (arg == "--mesh" && i + 1 < argc) {
-            opts.meshPath = argv[++i];
-        } else {
-            std::fprintf(stderr, "Unknown option '%s'\n", arg.c_str());
-            printUsage(argv[0]);
-            return 2;
+        const std::string a = argv[i];
+        if (a == "--selftest" || a == "--bench" || a == "--validate") mode = a;
+        else if (a == "--grid" && i + 3 < argc) {
+            bench.nx = uint32_t(std::strtoul(argv[++i], nullptr, 10));
+            bench.ny = uint32_t(std::strtoul(argv[++i], nullptr, 10));
+            bench.nz = uint32_t(std::strtoul(argv[++i], nullptr, 10));
+        } else if (a == "--steps" && i + 1 < argc) bench.steps = uint32_t(std::strtoul(argv[++i], nullptr, 10));
+        else if (a == "--peak" && i + 1 < argc)  bench.peakGBs = std::strtod(argv[++i], nullptr);
+        else if (a == "--capture" && i + 1 < argc) {
+            setup.capturePath = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                setup.captureFrames = uint32_t(std::strtoul(argv[++i], nullptr, 10));
         }
+        else if (a == "--preset" && i + 1 < argc) setup.preset = std::atoi(argv[++i]);
+        else if (a == "--mesh" && i + 1 < argc)   setup.meshPath = argv[++i];
+        else if (a == "--pitch" && i + 1 < argc)  setup.pitch = float(std::atof(argv[++i]));
+        else if (a == "--zoom" && i + 1 < argc)   setup.zoom = std::max(1e-3f, float(std::atof(argv[++i])));
+        else if (a == "--view" && i + 1 < argc)   setup.view3d = std::string(argv[++i]) == "3d" ? 1 : 0;
+        else if (a == "--shape" && i + 1 < argc) {
+            const std::string s = argv[++i];
+            const char* names[] = {"sphere", "cube", "cylinder", "wing"};
+            for (int k = 0; k < 4; ++k) if (s == names[k]) setup.shape = wt::Shape(k);
+        }
+        else if (a == "--field" && i + 1 < argc) {
+            const std::string s = argv[++i];
+            const char* names[] = {"speed", "pressure", "vorticity", "q"};
+            for (int k = 0; k < 4; ++k) if (s == names[k]) setup.field = wt::Field(k);
+        }
+        else if (a == "--precision" && i + 1 < argc) {
+            if (!parsePrecision(argv[++i], precs)) { usage(); return 2; }
+        } else { usage(); return a == "--help" ? 0 : 2; }
     }
 
     try {
-        if (validate) return vwt::runValidation(vopts);
-        vwt::App app;
-        return app.run(opts);
+        if (mode.empty()) {
+            wt::App app;
+            if (!precs.empty()) setup.precision = precs.front();
+            return app.run(setup);
+        }
+        gpu::Context ctx;
+        ctx.init(nullptr);
+        std::printf("GPU: %s\n", ctx.deviceName.c_str());
+        int rc = 0;
+        if (mode == "--selftest") rc = wt::runSelfTest(ctx);
+        else if (mode == "--bench") {
+            if (!precs.empty()) bench.precisions = precs;
+            rc = wt::runBenchmark(ctx, bench);
+        } else rc = wt::runValidation(ctx, precs.empty() ? wt::Precision::FP16C : precs.front());
+        ctx.destroy();
+        return rc;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "\n[FATAL] %s\n", e.what());
+        std::fprintf(stderr, "\nerror: %s\n", e.what());
         return 1;
     }
 }

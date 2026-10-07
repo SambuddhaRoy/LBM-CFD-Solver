@@ -1,0 +1,240 @@
+#version 460
+// ============================================================================
+// render.comp — the viewport, one invocation per screen pixel.
+//
+// Nothing is pre-rasterised at lattice resolution: every pixel samples the
+// 3D field itself, so the image is always exactly as sharp as the screen and
+// zooming in reveals real lattice detail rather than magnified texels.
+//   - scalar fields are trilinearly interpolated between cell centres
+//   - derivative fields (vorticity, Q) are computed at the eight surrounding
+//     cells by central differences, then interpolated, so they stay smooth
+//     instead of turning into constant-gradient blocks when zoomed
+//   - the body is drawn from its signed distance field with per-pixel
+//     anti-aliasing, so its outline stays crisp at any magnification
+//
+// view 0: orthographic slice through the domain (pan / zoom)
+// view 1: perspective camera, slice plane in 3D, body sphere-traced from the
+//         SDF and shaded (coloured by surface pressure in pressure mode)
+// ============================================================================
+
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, set = 0, binding = 2) readonly buffer Sdf { float16_t sdf[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Field { f16vec4 field[]; };   // rho-1, u
+layout(std430, set = 0, binding = 4) readonly buffer Params {
+    uvec4 dims;       // nx, ny, nz, mode (0 speed, 1 pressure, 2 vorticity, 3 Q)
+    uvec4 image;      // width, height, view, grid overlay
+    vec4  origin;     // 2D: plane coords of the top-left corner, z = cells per pixel
+                      // 3D: camera position
+    vec4  right, up, forward;   // 3D: per-pixel ray increments and centre direction
+    vec4  slice;      // axis, position, inlet speed, -
+    vec4  range;      // colour range low, high
+    vec4  bodyLo, bodyHi;       // body bounds (padded) for sphere tracing
+} P;
+layout(std430, set = 0, binding = 5) writeonly buffer Out { uint pixels[]; };
+
+const vec3 kBackground = vec3(0.075, 0.08, 0.095);
+const vec3 kBody       = vec3(0.80, 0.81, 0.83);
+
+ivec3 N() { return ivec3(P.dims.xyz); }
+uint idx(ivec3 c) {
+    c = clamp(c, ivec3(0), N() - 1);
+    return (uint(c.z) * P.dims.y + uint(c.y)) * P.dims.x + uint(c.x);
+}
+vec4 cellField(ivec3 c) { return vec4(field[idx(c)]); }
+
+float sdfAt(vec3 p) {
+    const vec3 q = clamp(p, vec3(0.0), vec3(N() - 1));
+    const ivec3 c = ivec3(floor(q));
+    const vec3 f = q - vec3(c);
+    float s[8];
+    for (int k = 0; k < 8; ++k)
+        s[k] = float(sdf[idx(c + ivec3(k & 1, (k >> 1) & 1, k >> 2))]);
+    return mix(mix(mix(s[0], s[1], f.x), mix(s[2], s[3], f.x), f.y),
+               mix(mix(s[4], s[5], f.x), mix(s[6], s[7], f.x), f.y), f.z);
+}
+
+vec3 sdfNormal(vec3 p) {
+    const vec2 e = vec2(0.75, 0.0);
+    return normalize(vec3(sdfAt(p + e.xyy) - sdfAt(p - e.xyy),
+                          sdfAt(p + e.yxy) - sdfAt(p - e.yxy),
+                          sdfAt(p + e.yyx) - sdfAt(p - e.yyx)));
+}
+
+// Velocity gradient at a cell by central differences: g[i] = d u / d x_i.
+mat3 gradU(ivec3 c) {
+    mat3 g;
+    for (int i = 0; i < 3; ++i) {
+        ivec3 e = ivec3(0); e[i] = 1;
+        g[i] = 0.5 * (cellField(c + e).yzw - cellField(c - e).yzw);
+    }
+    return g;
+}
+
+// The displayed scalar at one cell.
+float cellValue(ivec3 c) {
+    const uint mode = P.dims.w;
+    if (mode == 0u) return length(cellField(c).yzw);
+    if (mode == 1u) return cellField(c).x / 3.0;            // p - p0 = cs^2 (rho - 1)
+    const mat3 g = gradU(c);                                // g[i][j] = d u_j / d x_i
+    if (mode == 2u) {
+        // Vorticity component normal to the slice: signed, so the two senses
+        // of rotation separate into the two halves of the colour map.
+        const vec3 w = vec3(g[1][2] - g[2][1], g[2][0] - g[0][2], g[0][1] - g[1][0]);
+        return w[int(P.slice.x)];
+    }
+    // Q-criterion: 1/2 (|Omega|^2 - |S|^2); positive where rotation dominates.
+    float q = 0.0;
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) {
+            const float s = 0.5 * (g[i][j] + g[j][i]), o = 0.5 * (g[i][j] - g[j][i]);
+            q += 0.5 * (o*o - s*s);
+        }
+    return q;
+}
+
+float sampleValue(vec3 p) {
+    const vec3 q = clamp(p, vec3(0.0), vec3(N() - 1));
+    const ivec3 c = ivec3(floor(q));
+    const vec3 f = q - vec3(c);
+    float v[8];
+    for (int k = 0; k < 8; ++k) v[k] = cellValue(c + ivec3(k & 1, (k >> 1) & 1, k >> 2));
+    return mix(mix(mix(v[0], v[1], f.x), mix(v[2], v[3], f.x), f.y),
+               mix(mix(v[4], v[5], f.x), mix(v[6], v[7], f.x), f.y), f.z);
+}
+
+// Turbo (Mikhailov 2019), polynomial fit: magnitudes.
+vec3 turbo(float t) {
+    t = clamp(t, 0.0, 1.0);
+    const vec4 kR = vec4(0.13572138, 4.61539260, -42.66032258, 132.13108234);
+    const vec4 kG = vec4(0.09140261, 2.19418839, 4.84296658, -14.18503333);
+    const vec4 kB = vec4(0.10667330, 12.64194608, -60.58204836, 110.36276771);
+    const vec2 kR2 = vec2(-152.94239396, 59.28637943);
+    const vec2 kG2 = vec2(4.27729857, 2.82956604);
+    const vec2 kB2 = vec2(-89.90310912, 27.34824973);
+    const vec4 v4 = vec4(1.0, t, t*t, t*t*t);
+    const vec2 v2 = v4.zw * v4.z;
+    return vec3(dot(v4, kR) + dot(v2, kR2), dot(v4, kG) + dot(v2, kG2), dot(v4, kB) + dot(v2, kB2));
+}
+
+// Blue - white - red diverging map: signed quantities.
+vec3 diverging(float t) {
+    t = clamp(t, 0.0, 1.0);
+    const vec3 lo = vec3(0.23, 0.30, 0.75), mid = vec3(0.87, 0.87, 0.87), hi = vec3(0.71, 0.02, 0.15);
+    return t < 0.5 ? mix(lo, mid, t * 2.0) : mix(mid, hi, t * 2.0 - 1.0);
+}
+
+vec3 colourOf(float v) {
+    const float t = (v - P.range.x) / max(P.range.y - P.range.x, 1e-12);
+    return P.dims.w == 0u ? turbo(t) : diverging(t);
+}
+
+uint pack(vec3 c) {
+    const uvec3 u = uvec3(clamp(c, 0.0, 1.0) * 255.0 + 0.5);
+    return u.r | (u.g << 8) | (u.b << 16) | (255u << 24);
+}
+
+vec3 planePoint(vec2 uv) {
+    const int a = int(P.slice.x);
+    const float s = P.slice.y;
+    return a == 2 ? vec3(uv, s) : a == 1 ? vec3(uv.x, s, uv.y) : vec3(s, uv.y, uv.x);
+}
+
+bool insideDomain(vec3 p) {
+    return all(greaterThanEqual(p, vec3(-0.5))) && all(lessThanEqual(p, vec3(N()) - 0.5));
+}
+
+vec3 slicePixel(uvec2 px) {
+    const float cpp = P.origin.z;                          // cells per pixel
+    const vec2 uv = vec2(P.origin.x + (float(px.x) + 0.5) * cpp,
+                         P.origin.y - (float(px.y) + 0.5) * cpp);
+    const vec3 p = planePoint(uv);
+    if (!insideDomain(p)) return kBackground;
+
+    vec3 col = colourOf(sampleValue(p));
+
+    // Lattice overlay once cells are big enough to see: lines on cell faces.
+    if (P.image.w != 0u && cpp < 1.0 / 12.0) {
+        const vec2 g = abs(fract(uv + 0.5) - 0.5) / cpp;     // pixels to nearest face
+        const float line = 1.0 - clamp(min(g.x, g.y) - 0.5, 0.0, 1.0);
+        col = mix(col, col * 0.6, line * 0.35);
+    }
+
+    // Body: coverage from the distance in pixels, so the edge is a one-pixel
+    // anti-aliased line at every zoom; plus a thin darker outline.
+    const float d = sdfAt(p) / cpp;
+    const float cover = clamp(0.5 - d, 0.0, 1.0);
+    const float rim = clamp(1.5 - abs(d), 0.0, 1.0);
+    col = mix(col, kBody * 0.35, rim * 0.8);
+    return mix(col, kBody, cover);
+}
+
+vec2 boxHit(vec3 o, vec3 d, vec3 lo, vec3 hi) {
+    const vec3 inv = 1.0 / d;
+    const vec3 a = (lo - o) * inv, b = (hi - o) * inv;
+    const vec3 tmin = min(a, b), tmax = max(a, b);
+    return vec2(max(max(tmin.x, tmin.y), max(tmin.z, 0.0)), min(tmax.x, min(tmax.y, tmax.z)));
+}
+
+vec3 cameraPixel(uvec2 px) {
+    const vec2 c = vec2(px) + 0.5 - 0.5 * vec2(P.image.xy);
+    const vec3 o = P.origin.xyz;
+    const vec3 d = normalize(P.forward.xyz + c.x * P.right.xyz - c.y * P.up.xyz);
+    const vec3 sky = mix(kBackground, vec3(0.13, 0.14, 0.17), 0.5 + 0.5 * d.y);
+
+    const vec2 dom = boxHit(o, d, vec3(-0.5), vec3(N()) - 0.5);
+    if (dom.x > dom.y) return sky;
+
+    // Slice plane.
+    const int a = int(P.slice.x);
+    float tp = abs(d[a]) > 1e-6 ? (P.slice.y - o[a]) / d[a] : -1.0;
+    if (tp < dom.x || tp > dom.y) tp = 1e30;
+
+    // Body, sphere-traced through its padded bounds only.
+    float tb = 1e30;
+    const vec2 bb = boxHit(o, d, P.bodyLo.xyz, P.bodyHi.xyz);
+    if (bb.x <= bb.y) {
+        float t = max(bb.x, dom.x);
+        const float tEnd = min(min(bb.y, dom.y), tp);
+        for (int i = 0; i < 256 && t < tEnd; ++i) {
+            const float s = sdfAt(o + t * d);
+            if (s < 0.02) { tb = t; break; }
+            t += max(s, 0.05);
+        }
+    }
+
+    if (tb < tp) {
+        const vec3 p = o + tb * d;
+        const vec3 n = sdfNormal(p);
+        const float diff = max(dot(n, -d), 0.0);
+        vec3 base = kBody;
+        if (P.dims.w == 1u) {
+            // Surface pressure, read one and a half cells out into the fluid.
+            const vec3 q = p + 1.5 * n;
+            base = colourOf(sampleValue(q));
+        }
+        return base * (0.30 + 0.70 * diff);
+    }
+    if (tp < 1e29) {
+        const vec3 p = o + tp * d;
+        vec3 col = colourOf(sampleValue(p));
+        // Cut through the body: draw its cross-section on the plane.
+        if (sdfAt(p) < 0.0) col = kBody * 0.85;
+        // Shade the plane slightly by its angle to the view so it reads as a surface.
+        return col * (0.85 + 0.15 * abs(d[a]));
+    }
+    // Inside the domain but nothing hit: faint domain volume over the sky.
+    return mix(sky, vec3(0.18, 0.20, 0.24), 0.35);
+}
+
+void main() {
+    const uvec2 px = gl_GlobalInvocationID.xy;
+    if (px.x >= P.image.x || px.y >= P.image.y) return;
+    const vec3 c = P.image.z == 0u ? slicePixel(px) : cameraPixel(px);
+    pixels[px.y * P.image.x + px.x] = pack(c);
+}
