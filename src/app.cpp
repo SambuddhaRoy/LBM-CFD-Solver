@@ -261,8 +261,7 @@ void App::rebuildSolver() {
         body_.center = {0.3f * float(g.nx), 0.5f * float(g.ny) + 0.25f, 0.5f * float(g.nz) + 0.25f};
         body_.length = 0.25f * float(std::min(g.ny, g.nz));
     }
-    solver_.flow.uIn = 0.08f;
-    solver_.flow.smagorinsky = 0.12f;
+    solver_.flow.uIn = 0.08f;          // LES is decided in updateScaling()
     for (auto& f : frames_) f.stepped = false;
     applyGeometry();
     resetFlow();
@@ -286,9 +285,9 @@ void App::resetFlow() {
 }
 
 void App::updateScaling() {
-    const Fluid& f = kFluids[fluid_];
-    reRequested_ = speed_ * length_ / f.nu;
-    mach_ = speed_ / f.sound;
+    props_ = properties(ambient_);
+    reRequested_ = float(speed_ * length_ / props_.nu);
+    mach_ = float(speed_ / props_.sound);
     const float cells = std::max(body_.length, 1.f);
     const float u = solver_.flow.uIn;
     // Viscosity follows from the Reynolds number the body should see. The
@@ -300,6 +299,16 @@ void App::updateScaling() {
     tau = std::max(tau, tauMin);
     solver_.flow.tau = tau;
     reSimulated_ = 3.f * u * cells / (tau - 0.5f);
+
+    // Turbulence model. A subgrid model is only needed once the grid can no
+    // longer resolve the smallest eddies: with the Kolmogorov scale
+    // eta ~ L Re^(-3/4) and a resolved simulation needing dx <~ 2 eta, that
+    // is Re > (2 L / dx)^(4/3). Below it the flow is computed directly; the
+    // Smagorinsky model would only add spurious viscosity (measured: +4% at
+    // tau = 0.515, +10% at 0.505 in laminar channel flow).
+    reResolved_ = std::pow(2.f * cells, 4.f / 3.f);
+    const bool les = flowModel_ == 2 || (flowModel_ == 0 && reSimulated_ > reResolved_);
+    solver_.flow.smagorinsky = les ? 0.12f : 0.f;
     dx_ = length_ / cells;
     dt_ = speed_ > 0 ? u * dx_ / speed_ : 0.f;
 }
@@ -560,11 +569,45 @@ void App::drawControls(float width, float height) {
 
     if (ImGui::CollapsingHeader("Flow", ImGuiTreeNodeFlags_DefaultOpen)) {
         bool ch = false;
-        if (ImGui::BeginCombo("Fluid", kFluids[fluid_].name)) {
-            for (int i = 0; i < int(std::size(kFluids)); ++i)
-                if (ImGui::Selectable(kFluids[i].name, i == fluid_)) { fluid_ = i; ch = true; }
-            ImGui::EndCombo();
+        int kind = int(ambient_.kind);
+        const char* kinds[] = {"Air", "Water", "Carbon dioxide"};
+        if (ImGui::Combo("Fluid", &kind, kinds, 3)) {
+            ambient_ = {FluidKind(kind), 293.15, 101325.0};
+            ch = true;
         }
+        // Ambient state. Temperature and pressure set the fluid's density,
+        // viscosity and speed of sound, hence Re, Mach and every
+        // dimensional result. The flow itself is isothermal.
+        float tC = float(ambient_.T - 273.15);
+        const bool liquid = ambient_.kind == FluidKind::Water;
+        if (ImGui::SliderFloat("Temperature", &tC, liquid ? 0.5f : -90.f, liquid ? 99.5f : 400.f, "%.1f C")) {
+            ambient_.T = double(tC) + 273.15;
+            ch = true;
+        }
+        float pKpa = float(ambient_.p / 1000.0);
+        if (ImGui::SliderFloat("Pressure", &pKpa, 0.1f, 10000.f, "%.2f kPa", ImGuiSliderFlags_Logarithmic)) {
+            ambient_.p = double(pKpa) * 1000.0;
+            ch = true;
+        }
+        if (ambient_.kind == FluidKind::Air &&
+            ImGui::SliderFloat("ISA altitude", &altitude_, 0.f, 20000.f, "%.0f m")) {
+            standardAtmosphere(altitude_, ambient_.T, ambient_.p);
+            ch = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("International Standard Atmosphere: sets temperature and pressure\n"
+                              "for the altitude.");
+        if (ImGui::Button("Sea level", {ImGui::GetContentRegionAvail().x / 3 - 4, 0})) {
+            ambient_ = {FluidKind::Air, 288.15, 101325.0}; altitude_ = 0; ch = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Mars", {ImGui::GetContentRegionAvail().x / 2 - 4, 0})) {
+            ambient_ = {FluidKind::CO2, 210.0, 610.0}; ch = true;   // mean surface conditions
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Water", {-1, 0})) { ambient_ = {FluidKind::Water, 293.15, 101325.0}; ch = true; }
+        ImGui::TextDisabled("rho %.4g kg/m3   mu %.3g Pa s\nnu %.3g m2/s   c %.0f m/s",
+                            props_.rho, props_.mu, props_.nu, props_.sound);
         ch |= ImGui::SliderFloat("Wind speed", &speed_, 0.5f, 340.f, "%.1f m/s", ImGuiSliderFlags_Logarithmic);
         ch |= ImGui::SliderFloat("Body length", &length_, 0.005f, 50.f, "%.3f m", ImGuiSliderFlags_Logarithmic);
         ch |= ImGui::SliderFloat("Lattice speed", &solver_.flow.uIn, 0.02f, 0.15f, "%.3f");
@@ -573,8 +616,14 @@ void App::drawControls(float width, float height) {
                               "above ~0.1 compressibility error grows (lattice Mach = %.2f).",
                               solver_.flow.uIn * std::sqrt(3.f));
         if (ch) updateScaling();
-        bool les = solver_.flow.smagorinsky > 0;
-        if (ImGui::Checkbox("LES (Smagorinsky)", &les)) solver_.flow.smagorinsky = les ? 0.12f : 0.f;
+        const char* models[] = {"Auto", "Laminar (resolved)", "Turbulent (LES)"};
+        if (ImGui::Combo("Flow model", &flowModel_, models, 3)) updateScaling();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Laminar: the Navier-Stokes equations are solved directly, no turbulence model.\n"
+                              "Turbulent: Smagorinsky LES for eddies smaller than a cell.\n"
+                              "Auto: LES only above Re %.0f, where this body's resolution stops\n"
+                              "resolving the smallest eddies.", reResolved_);
+        ImGui::TextDisabled("Now: %s", solver_.flow.smagorinsky > 0 ? "turbulent, LES on" : "laminar, resolved");
         ImGui::Checkbox("Interpolated walls", &solver_.flow.bouzidi);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Bouzidi bounce-back: the wall sits at its true sub-cell position\n"
@@ -607,7 +656,9 @@ void App::drawControls(float width, float height) {
         if (ImGui::Combo("Storage", &p, precs, 3)) { precision_ = Precision(p); rebuildRequested_ = true; }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Memory format of the distribution functions; arithmetic is always FP32.\n"
-                              "FP16C halves memory and roughly doubles speed; validated against FP32.");
+                              "FP16C halves memory and roughly doubles speed. Against FP32 it moves bluff-body\n"
+                              "drag and shedding frequency by under 1%%, but thin laminar boundary layers at\n"
+                              "low viscosity come out 2-6%% thinner: use FP32 for skin friction.");
     }
 
     if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -632,6 +683,7 @@ void App::drawControls(float width, float height) {
         if (autoRange_) ImGui::SliderFloat("Range scale", &rangeScale_, 0.05f, 20.f, "%.2fx", ImGuiSliderFlags_Logarithmic);
         else { ImGui::DragFloat("Low", &view_.lo, 1e-4f, 0, 0, "%.5f"); ImGui::DragFloat("High", &view_.hi, 1e-4f, 0, 0, "%.5f"); }
         ImGui::Checkbox("Show lattice when zoomed", &view_.grid);
+        if (view_.field == Field::Pressure) ImGui::Checkbox("Absolute pressure", &absolutePressure_);
         if (ImGui::Button("Fit view (H)", {ImGui::GetContentRegionAvail().x * 0.5f - 4, 0})) fitView();
         ImGui::SameLine();
         if (ImGui::Button("Snapshot (S)", {-1, 0})) snapshot();
@@ -664,8 +716,7 @@ void App::drawStats(float x, float width, float height) {
     const double frontal = std::max<uint32_t>(geometry_.frontalCells(), 1);
     const double q = 0.5 * u * u;
     const double cd = force_[0] / (q * area), cl = force_[1] / (q * area), cs = force_[2] / (q * area);
-    const Fluid& fl = kFluids[fluid_];
-    const double qPhys = 0.5 * fl.rho * speed_ * speed_, aPhys = area * dx_ * dx_;
+    const double qPhys = 0.5 * props_.rho * speed_ * speed_, aPhys = area * dx_ * dx_;
     ImGui::Text("C_D  %7.3f   drag %s", cd, formatSi(cd * qPhys * aPhys, "N").c_str());
     ImGui::Text("C_L  %7.3f   lift %s", cl, formatSi(cl * qPhys * aPhys, "N").c_str());
     ImGui::Text("C_S  %7.3f", cs);
@@ -684,6 +735,10 @@ void App::drawStats(float x, float width, float height) {
     ImGui::Text("Re requested  %s", formatSi(reRequested_, "").c_str());
     ImGui::Text("Re simulated  %s", formatSi(reSimulated_, "").c_str());
     ImGui::Text("Mach  %.3f    tau  %.6f", mach_, solver_.flow.tau);
+    // Dynamic pressure, and the temperature the flow reaches where it is
+    // brought to rest (stagnation): T0 = T + V^2 / (2 cp).
+    ImGui::Text("q %s   T0 %.1f C", formatSi(0.5 * props_.rho * speed_ * speed_, "Pa").c_str(),
+                ambient_.T + double(speed_) * speed_ / (2.0 * props_.cp) - 273.15);
     ImGui::Text("dx %s   dt %s", formatSi(dx_, "m").c_str(), formatSi(dt_, "s").c_str());
     ImGui::Text("Peak |u| = %.2f x inlet", stats_.maxU / std::max(u, 1e-6f));
     ImGui::Text("Mean density %.4f", stats_.rhoMean);
@@ -700,6 +755,10 @@ void App::drawStats(float x, float width, float height) {
     if (tauClamped_) ImGui::TextColored(warn, "Requested Re is beyond this grid:\nsimulating Re %s", formatSi(reSimulated_, "").c_str());
     if (reSimulated_ > 2e4) ImGui::TextColored(warn, "High Re: boundary layers are\nunresolved (no wall model); trust\ntrends and wakes, not absolute C_D");
     if (mach_ > 0.3f) ImGui::TextColored(warn, "Mach %.2f: compressibility is not\nmodelled; results are incompressible", mach_);
+    if (!props_.warning.empty()) ImGui::TextColored(warn, "Fluid: %s", props_.warning.c_str());
+    if (flowModel_ == 1 && reSimulated_ > reResolved_)
+        ImGui::TextColored(warn, "Laminar forced above Re %.0f: the grid\ncannot resolve the smallest eddies and\n"
+                                 "the run may diverge (use Auto or LES)", reResolved_);
     if (blockage > 0.1) ImGui::TextColored(warn, "Blockage %.0f%%: tunnel walls\ninflate the forces", 100 * blockage);
     if (stats_.maxU > 0.45f) ImGui::TextColored({1, 0.35f, 0.3f, 1}, "Peak lattice speed %.2f: unstable,\nlower the lattice speed", stats_.maxU);
 
@@ -765,16 +824,20 @@ void App::drawViewport(float x, float width, float height) {
         const ImU32 c = view_.field == Field::Speed ? turboColour(t0) : divergingColour(t0);
         dl->AddRectFilled({bar0.x + (bar1.x - bar0.x) * t0, bar0.y}, {bar0.x + (bar1.x - bar0.x) * t1, bar1.y}, c);
     }
-    const Fluid& fl = kFluids[fluid_];
     auto phys = [&](float v) -> std::string {
+        // Lattice pressure p - p0 = (rho - 1)/3 scales with the dynamic
+        // pressure: p - p_inf = (v / (u^2/2)) * rho V^2 / 2.
+        const double gauge = v / (0.5 * u * u) * 0.5 * props_.rho * speed_ * speed_;
         switch (view_.field) {
         case Field::Speed:     return formatSi(v / u * speed_, "m/s");
-        case Field::Pressure:  return formatSi(v / (0.5 * u * u) * 0.5 * fl.rho * speed_ * speed_, "Pa");
+        case Field::Pressure:  return absolutePressure_ ? formatSi((ambient_.p + gauge) / 1000.0, "kPa")
+                                                       : formatSi(gauge, "Pa");
         case Field::Vorticity: return formatSi(dt_ > 0 ? v / dt_ : 0, "1/s");
         default:               return formatSi(dt_ > 0 ? v / (dt_ * dt_) : 0, "1/s^2");
         }
     };
-    const char* names[] = {"Speed", "Pressure p - p0", "Vorticity (slice normal)", "Q-criterion"};
+    const char* names[] = {"Speed", absolutePressure_ ? "Pressure (absolute)" : "Pressure p - p_inf",
+                           "Vorticity (slice normal)", "Q-criterion"};
     dl->AddText({bar0.x, bar0.y - 22}, IM_COL32(220, 222, 228, 255), names[int(view_.field)]);
     dl->AddText({bar0.x, bar1.y + 3}, IM_COL32(200, 202, 208, 255), phys(view_.lo).c_str());
     const std::string hi = phys(view_.hi);

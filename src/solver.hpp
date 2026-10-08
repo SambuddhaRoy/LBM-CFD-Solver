@@ -25,6 +25,7 @@ struct GridConfig {
     Precision precision = Precision::FP16C;
     bool      farFieldY = true;    // false: periodic in Y
     bool      farFieldZ = true;    // false: periodic in Z (2D runs use nz = 1)
+    bool      periodicX = false;   // true: no inlet/outlet, periodic in X (test flows)
 };
 
 struct FlowParams {
@@ -86,6 +87,7 @@ public:
     uint64_t cells() const { return uint64_t(g_.nx) * g_.ny * g_.nz; }
     gpu::Bindings bindings() const;
     const gpu::Buffer& sdf()   const { return sdf_; }
+    const gpu::Buffer& ddf(uint32_t q) const { return ddf_[q]; }   // tests: direct state upload
     const gpu::Buffer& flags() const { return flags_; }
     const gpu::Buffer& field() const { return field_; }
 

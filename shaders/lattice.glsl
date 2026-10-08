@@ -55,7 +55,7 @@ layout(push_constant) uniform Params {
     float bouzidi;     // 1 = interpolated walls, 0 = halfway bounce-back
     vec4  uin;         // xyz: inlet / far-field velocity
     uint  writeField;  // 1 = write the render field this step
-    uint  faces;       // bit 0: Y faces far field, bit 1: Z faces (else periodic)
+    uint  faces;       // bit 0: Y faces far field, bit 1: Z faces (else periodic), bit 2: X periodic
     uint  pad1, pad2;
 } pc;
 

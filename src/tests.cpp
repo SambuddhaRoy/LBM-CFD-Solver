@@ -12,7 +12,9 @@
 
 #include "tests.hpp"
 
+#include "fluid.hpp"
 #include "geometry.hpp"
+#include "lattice_cpu.hpp"
 #include "solver.hpp"
 
 #include <algorithm>
@@ -28,14 +30,7 @@ namespace wt {
 
 namespace {
 
-constexpr int CX[19] = {0, 1,-1, 0, 0, 0, 0, 1,-1, 1,-1, 0, 0, 1,-1, 1,-1, 0, 0};
-constexpr int CY[19] = {0, 0, 0, 1,-1, 0, 0, 1,-1, 0, 0, 1,-1,-1, 1, 0, 0, 1,-1};
-constexpr int CZ[19] = {0, 0, 0, 0, 0, 1,-1, 0, 0, 1,-1, 1,-1, 0, 0,-1, 1,-1, 1};
-constexpr double WQ[19] = {1.0/3,
-    1.0/18, 1.0/18, 1.0/18, 1.0/18, 1.0/18, 1.0/18,
-    1.0/36, 1.0/36, 1.0/36, 1.0/36, 1.0/36, 1.0/36,
-    1.0/36, 1.0/36, 1.0/36, 1.0/36, 1.0/36, 1.0/36};
-constexpr int OPP[19] = {0, 2,1, 4,3, 6,5, 8,7, 10,9, 12,11, 14,13, 16,15, 18,17};
+using namespace cpu;
 
 constexpr uint8_t SOLID = 1, EQ = 2, OUTLET = 4;
 
@@ -49,28 +44,6 @@ float halfToFloat(uint16_t h) {
     else bits = s | ((e + 112) << 23) | (m << 13);
     float f; std::memcpy(&f, &bits, 4);
     return f;
-}
-
-struct Vec3d { double x = 0, y = 0, z = 0; };
-
-// Equilibrium with the D3Q19 third-order terms, unshifted (same algebra as
-// equilibrium() in lattice.glsl).
-void equilibrium(double rho, Vec3d u, double feq[19]) {
-    const double uu = u.x*u.x + u.y*u.y + u.z*u.z;
-    const double xxy = rho*u.x*u.x*u.y, yzz = rho*u.y*u.z*u.z, xzz = rho*u.x*u.z*u.z;
-    const double xyy = rho*u.x*u.y*u.y, yyz = rho*u.y*u.y*u.z, xxz = rho*u.x*u.x*u.z;
-    const double ap[3] = {xxy + yzz, xzz + xyy, yyz + xxz};
-    const double am[3] = {xxy - yzz, xzz - xyy, yyz - xxz};
-    for (int q = 0; q < 19; ++q) {
-        const double cx = CX[q], cy = CY[q], cz = CZ[q];
-        const double cu = cx*u.x + cy*u.y + cz*u.z;
-        const double hxxy = cy*(cx*cx - 1.0/3), hyzz = cy*(cz*cz - 1.0/3);
-        const double hxzz = cx*(cz*cz - 1.0/3), hxyy = cx*(cy*cy - 1.0/3);
-        const double hyyz = cz*(cy*cy - 1.0/3), hxxz = cz*(cx*cx - 1.0/3);
-        const double hp = (hxxy + hyzz)*ap[0] + (hxzz + hxyy)*ap[1] + (hyyz + hxxz)*ap[2];
-        const double hm = (hxxy - hyzz)*am[0] + (hxzz - hxyy)*am[1] + (hyyz - hxxz)*am[2];
-        feq[q] = WQ[q] * (rho + rho*(3*cu + 4.5*cu*cu - 1.5*uu) + 13.5*hp + 4.5*hm);
-    }
 }
 
 // Recursive regularized collision + Smagorinsky (same algebra as step.comp).
@@ -404,6 +377,7 @@ int runSelfTest(gpu::Context& ctx) {
     std::printf("\nSelf-test: GPU solver vs double-precision CPU reference\n");
     std::printf("  (48 x 26 x 22 grid, inlet + pressure outlet, LES on, 60 steps)\n\n");
     bool ok = equilibriumMoments();
+    ok = fluidSelfTest() && ok;
 
     Body sphere;
     sphere.shape = Shape::Sphere; sphere.center = {16.3f, 12.6f, 10.8f}; sphere.length = 9.f;

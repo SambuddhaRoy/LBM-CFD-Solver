@@ -8,7 +8,8 @@
 // so it starts from their real outgoing populations. A cell the body has just
 // covered needs nothing: neighbours bounce back off the slots they wrote.
 //
-// pc.faces: bit 0 = Y faces are far field, bit 1 = Z faces (else periodic).
+// pc.faces: bit 0 = Y faces are far field, bit 1 = Z faces (else periodic),
+// bit 2 = X periodic (no inlet / outlet; used by test flows).
 #include "lattice.glsl"
 layout(local_size_x = 256) in;
 
@@ -22,8 +23,10 @@ void main() {
     const uvec3 p = coords(n);
 
     uint face = 0u;
-    if (p.x == 0u) face = FLAG_EQ;
-    else if (p.x + 1u == pc.Nx) face = FLAG_OUTLET;
+    if ((pc.faces & 4u) == 0u) {
+        if (p.x == 0u) face = FLAG_EQ;
+        else if (p.x + 1u == pc.Nx) face = FLAG_OUTLET;
+    }
     if ((pc.faces & 1u) != 0u && (p.y == 0u || p.y + 1u == pc.Ny)) face = FLAG_EQ;
     if ((pc.faces & 2u) != 0u && (p.z == 0u || p.z + 1u == pc.Nz)) face = FLAG_EQ;
 

@@ -122,7 +122,7 @@ StepPush Solver::push(bool writeField) const {
     p.bouzidi = flow.bouzidi ? 1.f : 0.f;
     p.uin[0]  = flow.uIn;
     p.writeField = writeField ? 1u : 0u;
-    p.faces = (g_.farFieldY ? 1u : 0u) | (g_.farFieldZ ? 2u : 0u);
+    p.faces = (g_.farFieldY ? 1u : 0u) | (g_.farFieldZ ? 2u : 0u) | (g_.periodicX ? 4u : 0u);
     return p;
 }
 

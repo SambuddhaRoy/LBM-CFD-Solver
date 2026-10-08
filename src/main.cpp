@@ -20,7 +20,11 @@ void usage() {
         "  (no arguments)          interactive wind tunnel\n"
         "  --selftest              GPU solver vs CPU reference, all precisions\n"
         "  --bench                 throughput benchmark (MLUPS)\n"
-        "  --validate              CFD validation suite against published data\n"
+        "  --validate [SUITE]      CFD validation against exact solutions and experiments:\n"
+        "                          standard (default: laminar exact solutions + bluff\n"
+        "                          bodies, ~15 min), laminar, turbulent (cylinder Re 3900,\n"
+        "                          3D LES, ~15 min at D = 40), all\n"
+        "  --diameter D            turbulent suite: cells across the cylinder (default 40)\n"
         "  --grid X Y Z            benchmark grid (default 256 256 256)\n"
         "  --steps N               benchmark steps per timing (default 200)\n"
         "  --precision P           fp32 | fp16s | fp16c | all (default: all for --bench,\n"
@@ -53,9 +57,15 @@ int main(int argc, char** argv) {
     wt::BenchOptions bench;
     std::vector<wt::Precision> precs;
     wt::StartSetup setup;
+    std::string suite = "standard";
+    float diameter = 40.f;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
-        if (a == "--selftest" || a == "--bench" || a == "--validate") mode = a;
+        if (a == "--selftest" || a == "--bench") mode = a;
+        else if (a == "--validate") {
+            mode = a;
+            if (i + 1 < argc && argv[i + 1][0] != '-') suite = argv[++i];
+        }
         else if (a == "--grid" && i + 3 < argc) {
             bench.nx = uint32_t(std::strtoul(argv[++i], nullptr, 10));
             bench.ny = uint32_t(std::strtoul(argv[++i], nullptr, 10));
@@ -69,6 +79,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--preset" && i + 1 < argc) setup.preset = std::atoi(argv[++i]);
         else if (a == "--mesh" && i + 1 < argc)   setup.meshPath = argv[++i];
+        else if (a == "--diameter" && i + 1 < argc) diameter = float(std::atof(argv[++i]));
         else if (a == "--pitch" && i + 1 < argc)  setup.pitch = float(std::atof(argv[++i]));
         else if (a == "--zoom" && i + 1 < argc)   setup.zoom = std::max(1e-3f, float(std::atof(argv[++i])));
         else if (a == "--view" && i + 1 < argc)   setup.view3d = std::string(argv[++i]) == "3d" ? 1 : 0;
@@ -101,7 +112,7 @@ int main(int argc, char** argv) {
         else if (mode == "--bench") {
             if (!precs.empty()) bench.precisions = precs;
             rc = wt::runBenchmark(ctx, bench);
-        } else rc = wt::runValidation(ctx, precs.empty() ? wt::Precision::FP16C : precs.front());
+        } else rc = wt::runValidation(ctx, precs.empty() ? wt::Precision::FP16C : precs.front(), suite, diameter);
         ctx.destroy();
         return rc;
     } catch (const std::exception& e) {

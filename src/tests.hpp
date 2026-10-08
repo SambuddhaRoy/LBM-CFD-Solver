@@ -4,6 +4,7 @@
 
 #include "solver.hpp"
 
+#include <string>
 #include <vector>
 
 namespace wt {
@@ -17,6 +18,10 @@ struct BenchOptions {
 
 int runSelfTest(gpu::Context& ctx);
 int runBenchmark(gpu::Context& ctx, const BenchOptions& o);
-int runValidation(gpu::Context& ctx, Precision prec);
+// suite: "standard" (laminar exact solutions + bluff bodies), "laminar",
+// "turbulent" (long LES runs), or "all".
+// diameter: cells across the cylinder in the turbulent case (default 40).
+int runValidation(gpu::Context& ctx, Precision prec, const std::string& suite = "standard",
+                  float diameter = 40.f);
 
 } // namespace wt

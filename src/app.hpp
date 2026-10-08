@@ -3,6 +3,7 @@
 // app.hpp — the interactive wind tunnel: window, swapchain, frame loop, UI.
 // ============================================================================
 
+#include "fluid.hpp"
 #include "geometry.hpp"
 #include "render.hpp"
 #include "solver.hpp"
@@ -16,15 +17,6 @@
 struct GLFWwindow;
 
 namespace wt {
-
-// Working fluids for physical scaling.
-struct Fluid { const char* name; float rho, nu, sound; };   // kg/m^3, m^2/s, m/s
-inline constexpr Fluid kFluids[] = {
-    {"Air, sea level, 15 C",  1.225f, 1.461e-5f, 340.3f},
-    {"Air, 11 km, -56 C",     0.364f, 3.930e-5f, 295.1f},
-    {"Water, 20 C",           998.2f, 1.004e-6f, 1482.f},
-    {"CO2, Mars surface",     0.020f, 6.600e-4f, 244.0f},
-};
 
 struct GridPreset { const char* name; uint32_t nx, ny, nz; };
 inline constexpr GridPreset kGrids[] = {
@@ -114,7 +106,12 @@ private:
     std::string meshName_;
     bool      running_ = true;
     bool      geometryDirty_ = false, resetRequested_ = false, rebuildRequested_ = false;
-    int       fluid_ = 0;
+    Ambient    ambient_;                     // fluid, temperature, pressure
+    Properties props_;                       // derived from ambient_
+    float      altitude_ = 0.f;              // m, standard-atmosphere helper
+    bool       absolutePressure_ = false;    // colour bar in absolute pressure
+    int        flowModel_ = 0;               // 0 auto, 1 laminar (no model), 2 turbulent (LES)
+    float      reResolved_ = 0.f;            // highest Re the grid resolves without a model
     float     speed_ = 30.f;                 // m/s
     float     length_ = 1.f;                 // m, body reference length
     float     reRequested_ = 0.f, reSimulated_ = 0.f, mach_ = 0.f;
