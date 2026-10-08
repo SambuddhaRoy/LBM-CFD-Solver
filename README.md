@@ -85,9 +85,23 @@ budget.
 - **Lattice:** D3Q19, single-step stream + collide kernel.
 - **Collision:** recursive regularized BGK (Coreixas et al. 2017) with the six
   third-order Hermite terms D3Q19 supports. The non-equilibrium part is
-  rebuilt from the stress tensor, which filters ghost modes and stays stable
-  down to tau -> 1/2.
-- **Turbulence:** Smagorinsky LES from the local non-equilibrium stress.
+  rebuilt from the stress tensor, which filters ghost modes.
+- **Laminar and turbulent flow:** a *Flow model* setting. *Laminar* solves
+  the Navier-Stokes equations directly with no turbulence model. *Turbulent*
+  adds Smagorinsky LES for eddies smaller than a cell. *Auto* (default) turns
+  LES on only above the Reynolds number the grid can resolve, Re > (2 L/dx)^(4/3)
+  from the Kolmogorov scale (about 440 for a 48-cell body). Both halves of
+  that rule are measured, not assumed: in laminar channel flow the
+  Smagorinsky model adds 4-10% spurious viscosity at low tau, and on a
+  turbulent cylinder at Re 3900 running without it diverges.
+- **Fluid properties from temperature and pressure:** air and CO2 as ideal
+  gases (density p/RT, Sutherland viscosity, speed of sound sqrt(gamma R T)),
+  water from the Thiesen, Vogel and Marczak correlations with its boiling
+  point at the set pressure. An ISA altitude slider sets both for air. These
+  set the Reynolds and Mach numbers and every dimensional output (forces in
+  N, pressures in Pa or absolute kPa, stagnation temperature). The flow
+  itself is isothermal and incompressible: temperature enters through the
+  fluid's properties, heat transfer is not simulated.
 - **Walls:** halfway or Bouzidi interpolated bounce-back from a signed
   distance field, so curved walls sit at their true sub-cell position.
 - **Tunnel:** equilibrium inlet (optional perturbation), far-field side faces
@@ -119,54 +133,100 @@ budget.
 
 ![3D view, sphere coloured by surface pressure](docs/screenshots/sphere-3d-pressure.png)
 
-## Validation
+## Validation: is it physically accurate?
 
-Two suites, both exit 0/1.
+Three layers of checks, each exiting 0/1. Every coefficient below is raw: no
+blockage or other correction is applied.
 
-**`--selftest`** checks the GPU solver against a double-precision CPU
-reference written the textbook way: two buffers, plain pull streaming,
-bounce-back spelled out. Sphere (halfway and Bouzidi walls), a pitched cube
-with one-cell gaps, and a pitched NACA 0012, with inlet, pressure outlet and
-LES active. FP32 agrees to 6e-8 in velocity and 2e-6 in force, i.e. float
-round-off; the 16-bit formats track within 7e-5. A mutation check (reverting
-to lag-2 bounce-back) fails it by four orders of magnitude, so it does catch
-bugs. It also voxelizes a rotated icosphere and a rotated torus mesh and
-compares every cell to the exact shape: all misclassified cells lie within
-0.02 cells of the true surface.
+### 1. The code does what the equations say (`--selftest`)
 
-**`--validate`** runs canonical flows against published data. Every
-coefficient is raw: the 2D cases use a domain big enough (5% blockage) that
-no blockage correction is applied.
+The GPU solver against a double-precision CPU reference written the textbook
+way (two buffers, plain pull streaming, bounce-back spelled out), on a
+sphere, a pitched cube with one-cell gaps and a pitched NACA 0012, with
+inlet, outlet and LES active. FP32 agrees to 6e-8 in velocity and 2e-6 in
+force (float round-off); a deliberately broken bounce-back fails it by four
+orders of magnitude. Also: mesh voxelization against exact shapes (all
+misclassified cells within 0.02 cells of the surface), and the fluid
+property models against reference tables (air exact to the ISA, water and
+CO2 within 1%).
+
+### 2. The physics model against exact solutions (`--validate laminar`)
+
+Laminar flows whose answers are known exactly, in FP32:
+
+| test | what it checks | result |
+|---|---|---|
+| Shear wave carried at U = 0, 0.05, 0.1 | viscosity under advection (Galilean invariance) | viscosity within 0.25%, advection speed within 0.07% |
+| Stokes' first problem | viscous diffusion along a wall | within 1.2% of U erf(y / 2 sqrt(nu t)) |
+| Poiseuille channel, tau 0.505 to 0.8 | wall-bounded profile; viscosity from dp/dx = mu u'' | profile within 0.4%, viscosity within 1.3% |
+| Flat-plate boundary layer, Re_x to 13,600 | developing laminar boundary layer | momentum thickness within 1-4% of Thwaites |
+
+The boundary layer is compared two ways. Against Blasius it is 2-8% thin,
+because a plate in any finite tunnel accelerates the outer stream (its drag
+and displacement need a pressure drop): the solver measures that favourable
+gradient, and Bernoulli holds along the edge to 3%. Real flat-plate
+experiments fight the same effect with adjustable ceilings. Thwaites'
+integral method fed with the edge velocity the solver actually produces is
+the fair comparison, and agrees to 1-4%.
+
+### 3. Against real-world measurements (`--validate`, `--validate turbulent`)
+
+Laminar and transitional bluff bodies, 40 cells across, FP16C storage:
 
 ```
-  CYLINDER (2D), D = 40 cells, 1600 x 800, blockage 5%, FP16C storage
-  Re      C_D (published)          St (published)    L_r/D (published)
-  20      2.141 (2.050)  +4.5%          --            0.94 (0.94)
-  40      1.630 (1.520)  +7.2%          --            2.27 (2.13-2.35)
-  100     1.396 (1.330)  +5.0%     0.171 (0.165)          --
-  150     1.377 (1.320)  +4.3%     0.189 (0.184)          --
+  CYLINDER (2D), 1600 x 800, blockage 5%
+  Re      C_D (published)       St (measured)      L_r/D (measured)
+  20      2.141 (2.050)  +4.5%       --             0.94 (0.93)
+  40      1.630 (1.520)  +7.2%       --             2.27 (2.13)
+  100     1.396 (1.330)  +5.0%  0.171 (0.164)           --
+  150     1.377 (1.320)  +4.3%  0.189 (0.183)           --
 
-  SPHERE (3D), D = 40 cells, 480 x 240 x 240, blockage 2.2%
-  100     1.141 (1.092)  +4.5%          --            0.86 (0.88)
-
-  STORAGE PRECISION, cylinder Re = 100
-  FP32    1.384  +4.0%             0.169
-  FP16S   1.392  +4.7%             0.169
-  FP16C   1.396  +5.0%             0.171
+  SPHERE (3D), 480 x 240 x 240, blockage 2.2%
+  Re      C_D (measured drag curve)
+  10      4.545 (4.258)  +6.7%
+  100     1.141 (1.087)  +5.0%     L_r/D 0.86 (0.88, Johnson & Patel)
+  300     0.684 (0.653)  +4.7%
 ```
 
-References: Dennis & Chang (1970) and Coutanceau & Bouard (1977) for the
-steady wake, Park, Kwon & Choi (1998) and Williamson (1996) for drag and
-Strouhal number, Schiller-Naumann for sphere drag, Taneda (1956) for the
-sphere wake. Tolerances: C_D 8%, St 6%, L_r/D 12%.
+Measured: Coutanceau & Bouard 1977 (wake length), Williamson 1996
+(Strouhal), Clift, Grace & Weber 1978 (sphere drag curve fitted to
+experiments). Cylinder drag references are simulations (Dennis & Chang
+1970, Park, Kwon & Choi 1998). Wake geometry and shedding frequency land
+within 1-7%; drag runs 4-7% high, the combined effect of 5% blockage and 40
+cells per diameter.
 
-The wake geometry and shedding frequency land within a few percent. Drag is
-consistently 4-7% high: what remains of blockage plus the finite resolution
-of 40 cells per diameter. Storing the distributions in 16 bits moves C_D by
-under 1% and the Strouhal number by at most 0.002.
+Turbulent: cylinder at Re = 3900, 3D LES with a periodic span of pi D,
+against wind-tunnel measurements (Norberg; Parnaudeau et al. 2008, PIV):
 
-The whole suite takes about five minutes; the 3D sphere (28M cells, 40,000
-steps) takes two of them.
+```
+  D (cells)  cells   C_D (0.98)      St (0.208-0.215)   Cpb (-0.88)   L_r/D (1.51)
+  32          51M    1.001  +2.1%    0.221              -0.817        2.11
+  40         101M    1.005  +2.5%    0.202              -0.844        1.92
+  56         276M    0.968  -1.2%    0.215              -0.832        1.95
+```
+
+Drag, shedding frequency and base pressure match the wind-tunnel data
+within a few percent at every resolution; at D = 56 the Strouhal number
+equals Norberg's 0.215. The recirculation length does not: it settles at
+1.9-2.0 D against 1.51 measured, and does not shorten from D = 40 to 56, so
+it is a model limit rather than a resolution limit. Plain Smagorinsky is
+too dissipative where the separated shear layers turn turbulent, which
+delays their roll-up and stretches the bubble (lowering the constant from
+0.12 to 0.06 shortened it slightly). A wall-adapting subgrid model (WALE,
+Vreman) is the known fix. The recirculation length is printed but not
+asserted; the other three are. The D = 56 case takes an hour on an
+RTX 5070 Ti; D = 40 takes 16 minutes.
+
+### Storage precision
+
+16-bit storage is what doubles the speed, so its cost is measured
+separately. For bluff bodies it is negligible: on the Re 100 cylinder FP16C
+moves C_D by 0.9% and the Strouhal number by 0.002 against FP32. For thin
+laminar boundary layers at low viscosity it is not: the flat plate's
+momentum thickness comes out 2-6% thinner than in FP32, because near
+tau = 1/2 the part of each stored distribution that carries the viscous
+stress is about one 16-bit rounding step. Use FP32 when skin friction
+matters.
 
 ## Accuracy: read before quoting a number
 
@@ -178,9 +238,19 @@ steps) takes two of them.
   meaningful; absolute drag at Re 1e6 is not.
 - **Resolution drives the remaining error.** The validated cases put 40 cells
   across the body. Below 32 the app warns.
+- **Thin features:** walls are placed from the signed distance between cell
+  centres, which assumes it varies linearly across a cell. Sheets thinner
+  than about two cells break that assumption and their walls are misplaced
+  by up to half a cell.
 - **Blockage:** the tunnel's side faces confine the flow. The blockage ratio
-  is shown next to the forces; above 10% it warns. No correction is applied.
+  is shown next to the forces; above 10% it warns.
+- **16-bit storage** costs 2-6% in laminar boundary-layer thickness at low
+  viscosity (see above).
+- **Turbulent separated flow:** drag, shedding frequency and base pressure
+  are validated to a few percent at Re 3900; the length of the separated
+  bubble comes out about 30% long, a limitation of the Smagorinsky model.
 - Incompressible regime: physical Mach above 0.3 is flagged, not modelled.
+  No heat transfer.
 
 ## Building
 
@@ -208,7 +278,7 @@ model onto the window), but the Linux build is untested.
 WindTunnel                      interactive wind tunnel
 WindTunnel --selftest           GPU solver vs CPU reference, all precisions
 WindTunnel --bench [--grid X Y Z] [--precision fp32|fp16s|fp16c|all] [--peak GBs]
-WindTunnel --validate [--precision P]
+WindTunnel --validate [standard|laminar|turbulent|all] [--precision P] [--diameter D]
 WindTunnel --capture out.png [frames]   run the app, save the window, exit
            --mesh FILE --shape S --pitch DEG --view 2d|3d --field F --zoom X --preset N
 ```
@@ -234,10 +304,12 @@ src/
   vk.*         Vulkan context: device, buffers, push-descriptor compute kernels
   solver.*     lattice buffers, step recording, forces, statistics, probe
   geometry.*   analytic bodies, mesh import, GPU signed-distance voxelization
+  fluid.*      fluid properties from temperature and pressure
   render.*     viewport renderer
   app.*        window, swapchain, frame loop, UI
   tests.cpp    CPU reference self-test, benchmark
-  validate.cpp CFD validation suite
+  validate.cpp exact-solution and experimental validation
+  lattice_cpu.hpp  velocity set and equilibrium in double precision
 shaders/
   lattice.glsl   velocity set, storage formats, indexing, equilibrium
   stream.glsl    in-place streaming with bounce-back, moment accumulation

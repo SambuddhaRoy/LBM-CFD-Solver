@@ -724,17 +724,19 @@ int runValidation(gpu::Context& ctx, Precision prec, const std::string& suite, f
                     diameter, cells / 1e6);
         std::printf("  Measured in wind tunnels: Norberg (C_D, Cpb), Parnaudeau et al. 2008 PIV (St, L_r)\n\n");
         Turbulent t = cylinder3900(ctx, prec, diameter);
-        // The recirculation length is reported, not asserted: it hinges on
-        // where the separated shear layers turn turbulent, which needs far
-        // more resolution than the forces do (published simulations scatter
-        // from 1.0 to 1.7 D). It shortens with resolution here, see README.
+        // The recirculation length is reported, not asserted. It hinges on
+        // where the separated shear layers turn turbulent (published
+        // simulations scatter from 1.0 to 1.7 D). Here it sits at 1.92-1.95 D
+        // for D = 40 and 56 alike, so it is not a resolution limit: plain
+        // Smagorinsky is too dissipative in transitional shear layers, which
+        // delays their roll-up and stretches the bubble. See README.
         const double lr = t.m.lr;
         t.m.lrLit = 0;
         row("3900", t.m, ok, 0.10, 0.08, 0.15);
         const bool cpbOk = std::abs(t.cpb / t.cpbLit - 1) < 0.10;
         ok = ok && cpbOk;
         std::printf("  base pressure Cpb %.3f (measured %.2f)  %s\n", t.cpb, t.cpbLit, cpbOk ? "PASS" : "FAIL");
-        std::printf("  recirculation length L_r/D %.2f (measured 1.51; not asserted, resolution-limited)\n", lr);
+        std::printf("  recirculation length L_r/D %.2f (measured 1.51; not asserted, model-limited: see README)\n", lr);
     }
     std::printf("\n%s\n", ok ? "VALIDATION PASSED" : "VALIDATION FAILED");
     return ok ? 0 : 1;
