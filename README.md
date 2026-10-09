@@ -41,8 +41,24 @@ v3 is a ground-up rewrite. Only the idea carries over from v2.
 
 Throughput is flat with grid size: FP16C runs at 9,215 MLUPS on
 1024 x 448 x 448 (205M cells) and 9,241 on 1024 x 512 x 512 (268M cells).
-In the interactive app, with rendering every frame, it sustains 9,200 to
-9,500 MLUPS.
+
+In the interactive app, rendering, force sums and statistics included
+(`--capture` reports this sustained rate):
+
+| grid | sustained | display |
+|---|---|---|
+| 384 x 192 x 192 | 9,021 MLUPS | 24 FPS |
+| 640 x 320 x 320 | 9,258 MLUPS | 24 FPS |
+| 1024 x 448 x 448 | 8,760 MLUPS | 21 FPS |
+
+Each frame packs as many steps as fit 40 ms of GPU time while you watch and
+14 ms while you pan, zoom or drag a slider, so the display stays smooth when
+it matters and the solver gets the GPU otherwise. Every frame also writes
+the render field, sums forces and renders, worth up to a quarter of a step;
+at the earlier fixed 14 ms budget (and a step counter that truncated) the
+big grids ran one step per frame and lost 12-24% to it (6,993 to 8,136 MLUPS).
+The default lattice speed is 0.1 (was 0.08), so each step also covers 25%
+more physical time; see Accuracy.
 
 Bandwidth counts what each cell must move per step: its 19 distributions read
 and written once, plus a flag byte (153 B in FP32, 77 B in FP16).
@@ -87,7 +103,10 @@ budget.
   third-order Hermite terms D3Q19 supports. The non-equilibrium part is
   rebuilt from the stress tensor, which filters ghost modes.
 - **Laminar and turbulent flow:** a *Flow model* setting. *Laminar* solves
-  the Navier-Stokes equations directly with no turbulence model. *Turbulent*
+  the Navier-Stokes equations directly with no turbulence model, up to the
+  Reynolds number the grid resolves; past it a direct simulation diverges
+  within a few hundred steps (every body, from 1 m/s up), so Laminar runs
+  that Re instead and says so. *Turbulent*
   adds Smagorinsky LES for eddies smaller than a cell. *Auto* (default) turns
   LES on only above the Reynolds number the grid can resolve, Re > (2 L/dx)^(4/3)
   from the Kolmogorov scale (about 440 for a 48-cell body). Both halves of
@@ -146,8 +165,6 @@ the whole tunnel, so the mode trades resolution for speed:
 - the resolution is the finest the GPU sustains in real time with a quarter
   of it left for rendering, re-planned from the measured speed if it falls
   behind;
-- the lattice speed rises from 0.08 to 0.1 (lattice Mach 0.17,
-  compressibility error about 3% instead of 2%).
 
 On an RTX 5070 Ti, a 5.6 m F1 car model at 30 m/s runs in real time with 64
 cells along the car (352 x 64 x 92 tunnel, dx = 8.7 cm); a 1 m sphere at
@@ -269,8 +286,10 @@ matters.
 ## Accuracy: read before quoting a number
 
 - **The lattice resolves its own Reynolds number.** Set a 1 m body at 30 m/s
-  in air and the app asks for Re = 2e6. It simulates that Re when the
-  relaxation time allows, otherwise the highest it can and says so. At high
+  in air and the app asks for Re = 2e6, and with LES (Auto) simulates it.
+  The relaxation time can get within 1e-6 of 1/2, which reaches Re 1.4e7 for
+  a 48-cell body (a car at 60 m/s: 1.4e7 of the 2.3e7 asked); beyond it the
+  app says so, and the eddy viscosity dominates the molecular one anyway. At high
   Re the boundary layer is far thinner than a cell and there is no wall
   model: wake structure, trends and comparisons between shapes are
   meaningful; absolute drag at Re 1e6 is not.
@@ -289,6 +308,14 @@ matters.
   bubble comes out about 30% long, a limitation of the Smagorinsky model.
 - **Open (non-watertight) models** are shrink-wrapped, which moves their
   surfaces outward by 0.87 cells; **real-time mode** runs coarser grids.
+- **Lattice speed 0.1** (lattice Mach 0.17) by default, for speed. Measured
+  on the sphere, cube and wing, raising it to 0.15 moves C_D by 0.2-2%;
+  lower it in the Flow panel for the last couple of percent.
+- **Stability:** `--validate stability` runs the default tunnel with a
+  sphere, a cube and a pitched wing at 1 to 300 m/s in both flow models and
+  at lattice speeds 0.1 and 0.15; every case stays bounded (also checked over
+  20,000 steps and with the AMR25 car model). Should a run diverge anyway,
+  the app restarts the flow and says so.
 - Incompressible regime: physical Mach above 0.3 is flagged, not modelled.
   No heat transfer.
 
@@ -318,10 +345,11 @@ model onto the window), but the Linux build is untested.
 WindTunnel                      interactive wind tunnel
 WindTunnel --selftest           GPU solver vs CPU reference, all precisions
 WindTunnel --bench [--grid X Y Z] [--precision fp32|fp16s|fp16c|all] [--peak GBs]
-WindTunnel --validate [standard|laminar|turbulent|all] [--precision P] [--diameter D]
+WindTunnel --validate [standard|laminar|turbulent|stability|all] [--precision P] [--diameter D]
 WindTunnel --mesh-info FILE     list a model's parts, check it is watertight
 WindTunnel --capture out.png [frames]   run the app, save the window, exit
            --realtime   start in real-time mode
+           --speed M    wind speed, m/s     --flow auto|laminar|les
            --mesh FILE --shape S --pitch DEG --view 2d|3d --field F --zoom X --preset N
 ```
 

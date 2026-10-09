@@ -24,6 +24,35 @@ uint32_t bytesPerCell(Precision p) {
     return 19u * ddf + 1u /*flags*/ + 2u /*sdf*/ + 8u /*field*/;
 }
 
+FlowScaling scaleFlow(double re, float cells, float u, int model) {
+    FlowScaling s;
+    cells = std::max(cells, 1.f);
+    re = std::max(re, 1e-3);
+    // A subgrid model is only needed once the grid can no longer resolve the
+    // smallest eddies: with the Kolmogorov scale eta ~ L Re^(-3/4) and a
+    // resolved simulation needing dx <~ 2 eta, that is Re > (2 L / dx)^(4/3).
+    // Below it the flow is computed directly; the Smagorinsky model would only
+    // add spurious viscosity (measured: +4% at tau = 0.515, +10% at 0.505 in
+    // laminar channel flow).
+    s.reResolved = float(std::pow(2.0 * cells, 4.0 / 3.0));
+    const bool les = model == 2 || (model == 0 && re > s.reResolved);
+    s.smagorinsky = les ? 0.12f : 0.f;
+    // Without a model the run cannot go past what the grid resolves: an
+    // under-resolved direct simulation diverges within a few hundred steps
+    // (every body, every speed from 1 m/s up, in --validate stability).
+    // Laminar therefore simulates the highest Re the grid computes directly.
+    const double target = les ? re : std::min(re, double(s.reResolved));
+    // Floor: tau - 1/2 stays 17 FP32 ulps clear of 1/2 (6% viscosity
+    // quantization), enough for Re ~1e7 at 48 cells. LES is on long before
+    // that, and its eddy viscosity dwarfs the molecular one wherever the flow
+    // is turbulent, so the floor barely moves the result.
+    const double tauMin = 0.5 + 1e-6;
+    s.tau = float(std::max(0.5 + 3.0 * u * cells / target, tauMin));
+    s.reSimulated = float(3.0 * u * cells / (double(s.tau) - 0.5));
+    s.limited = s.reSimulated < 0.99 * re;
+    return s;
+}
+
 void Solver::create(gpu::Context& ctx, const GridConfig& g) {
     ctx_ = &ctx;
     g_   = g;

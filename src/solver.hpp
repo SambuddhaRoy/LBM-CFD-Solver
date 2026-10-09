@@ -44,6 +44,18 @@ struct Stats {
     uint32_t samples  = 0;
 };
 
+// Relaxation time and turbulence model for a body `cells` long at lattice
+// speed `u` that should see Reynolds number `re`. model: 0 auto, 1 laminar,
+// 2 LES. Shared by the app and the stability suite, so the suite tests the
+// policy the app runs.
+struct FlowScaling {
+    float tau = 0.6f, smagorinsky = 0.f;
+    float reSimulated = 0.f;
+    float reResolved = 0.f;    // highest Re the grid resolves without a model
+    bool  limited = false;     // reSimulated < re
+};
+FlowScaling scaleFlow(double re, float cells, float u, int model);
+
 // Mirror of `Params` in shaders/lattice.glsl.
 struct StepPush {
     uint32_t nx, ny, nz, t;

@@ -58,8 +58,9 @@ ImU32 divergingColour(float t) {
 std::string formatSi(double v, const char* unit) {
     char buf[64];
     const double a = std::abs(v);
-    if (a != 0 && (a < 1e-2 || a >= 1e5)) std::snprintf(buf, sizeof buf, "%.2e %s", v, unit);
-    else std::snprintf(buf, sizeof buf, "%.3g %s", v, unit);
+    const char* sep = *unit ? " " : "";
+    if (a != 0 && (a < 1e-2 || a >= 1e5)) std::snprintf(buf, sizeof buf, "%.2e%s%s", v, sep, unit);
+    else std::snprintf(buf, sizeof buf, "%.3g%s%s", v, sep, unit);
     return buf;
 }
 
@@ -94,6 +95,8 @@ int App::run(const StartSetup& setup) {
     view_.mode3d   = setup.view3d;
     view_.field    = setup.field;
     startZoom_     = setup.zoom;
+    speed_         = setup.speed;
+    flowModel_     = setup.flowModel;
     initWindow();
     ctx_.init(window_);
     initSwapchain();
@@ -287,10 +290,13 @@ void App::rebuildSolver() {
         body_.center = {0.3f * float(g.nx), 0.5f * float(g.ny) + 0.25f, 0.5f * float(g.nz) + 0.25f};
         body_.length = 0.25f * float(std::min(g.ny, g.nz));
     }
-    // Lattice speed: real time trades a little compressibility error (lattice
-    // Mach 0.17 instead of 0.14, ~3% instead of ~2%) for 25% fewer steps.
-    solver_.flow.uIn = realtime_ ? 0.1f : 0.08f;   // LES is decided in updateScaling()
+    // Lattice speed 0.1 (lattice Mach 0.17) rather than the textbook 0.05-0.08:
+    // each step covers 25% more physical time than at 0.08 for a little more
+    // compressibility error. Measured in --validate stability, going all the
+    // way to 0.15 moves C_D by 0.2-2%.
+    solver_.flow.uIn = 0.1f;   // LES is decided in updateScaling()
     for (auto& f : frames_) f.stepped = false;
+    stepsSmooth_ = 1; stepsPerFrame_ = 1;   // re-measure on the new grid
     applyGeometry();
     resetFlow();
     view_.slice = body_.center.z;
@@ -345,25 +351,12 @@ void App::updateScaling() {
     mach_ = float(speed_ / props_.sound);
     const float cells = std::max(body_.length, 1.f);
     const float u = solver_.flow.uIn;
-    // Viscosity follows from the Reynolds number the body should see. The
-    // floor keeps tau representable in FP32 with a usable margin above 1/2;
-    // below it the requested Re is out of reach and the UI says so.
-    const float tauMin = 0.5f + 2e-5f;
-    float tau = 0.5f + 3.f * u * cells / std::max(reRequested_, 1e-3f);
-    tauClamped_ = tau < tauMin;
-    tau = std::max(tau, tauMin);
-    solver_.flow.tau = tau;
-    reSimulated_ = 3.f * u * cells / (tau - 0.5f);
-
-    // Turbulence model. A subgrid model is only needed once the grid can no
-    // longer resolve the smallest eddies: with the Kolmogorov scale
-    // eta ~ L Re^(-3/4) and a resolved simulation needing dx <~ 2 eta, that
-    // is Re > (2 L / dx)^(4/3). Below it the flow is computed directly; the
-    // Smagorinsky model would only add spurious viscosity (measured: +4% at
-    // tau = 0.515, +10% at 0.505 in laminar channel flow).
-    reResolved_ = std::pow(2.f * cells, 4.f / 3.f);
-    const bool les = flowModel_ == 2 || (flowModel_ == 0 && reSimulated_ > reResolved_);
-    solver_.flow.smagorinsky = les ? 0.12f : 0.f;
+    const FlowScaling s = scaleFlow(reRequested_, cells, u, flowModel_);
+    solver_.flow.tau = s.tau;
+    solver_.flow.smagorinsky = s.smagorinsky;
+    reSimulated_ = s.reSimulated;
+    reResolved_ = s.reResolved;
+    tauClamped_ = s.limited;
     dx_ = length_ / cells;
     dt_ = speed_ > 0 ? u * dx_ / speed_ : 0.f;
 }
@@ -412,11 +405,25 @@ void App::collectResults(Frame& f, uint32_t slot) {
     push(histCd_, float(force_[0] / (q * area)));
     push(histCl_, float(force_[1] / (q * area)));
     push(histResidual_, float(std::log10(std::max(stats_.residual, 1e-12f))));
-    // Fill ~14 ms of GPU time per frame with steps, so the solver runs as
-    // fast as the display allows whatever the grid size.
+    // Safety net: the collision caps |u| at 0.4, so a peak there (or a NaN)
+    // means the run diverged. Restart rather than show a dead field.
+    if (!std::isfinite(stats_.maxU) || stats_.maxU > 0.39f) {
+        resetRequested_ = true;
+        status_ = "The flow diverged and was restarted. Lower the lattice speed if it repeats.";
+        statusUntil_ = glfwGetTime() + 8;
+    }
+    // Fill a GPU-time budget per frame with steps, whatever the grid size.
+    // Every frame also writes the render field, sums forces, gathers stats
+    // and renders: worth up to a quarter of a step, so at one step per frame
+    // the big grids lost 15-24% to it. Hence 14 ms while the user is
+    // interacting (smooth panning), 40 ms when just watching. The smoothed
+    // count is kept fractional: rounding it each frame stalled the
+    // controller at 1-6 steps, well short of its budget.
     if (simMs_ > 0) {
-        const double want = f.steps * 14.0 / simMs_;
-        stepsPerFrame_ = uint32_t(std::clamp(0.7 * stepsPerFrame_ + 0.3 * want, 1.0, 4000.0));
+        const double budget = glfwGetTime() - lastInput_ < 1.0 ? 14.0 : 40.0;
+        const double want = f.steps * budget / simMs_;
+        stepsSmooth_ = std::clamp(0.7 * stepsSmooth_ + 0.3 * want, 1.0, 4000.0);
+        stepsPerFrame_ = uint32_t(std::lround(stepsSmooth_));
     }
 }
 
@@ -444,6 +451,9 @@ void App::frame() {
     drawUi();
     handleKeys();
     ImGui::Render();
+    const ImGuiIO& io = ImGui::GetIO();
+    if (ImGui::IsAnyItemActive() || io.MouseWheel != 0 || io.MouseDown[0] || io.MouseDown[1] || io.MouseDown[2])
+        lastInput_ = glfwGetTime();
 
     if (rebuildRequested_) { rebuildRequested_ = false; geometryDirty_ = false; rebuildSolver(); }
     if (geometryDirty_)    { geometryDirty_ = false; applyGeometry(); }
@@ -523,6 +533,10 @@ void App::frame() {
     vkCmdEndRendering(cmd);
 
     const bool capture = !capturePath_.empty() && frameCount_ == captureFrames_;
+    if (!capturePath_.empty() && frameCount_ == captureFrames_ / 2) {
+        captureSteps0_ = solver_.t;
+        captureWall0_ = glfwGetTime();
+    }
     ib.srcStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
     ib.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
     ib.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -739,10 +753,12 @@ void App::drawControls(float width, float height) {
         const char* models[] = {"Auto", "Laminar (resolved)", "Turbulent (LES)"};
         if (ImGui::Combo("Flow model", &flowModel_, models, 3)) updateScaling();
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Laminar: the Navier-Stokes equations are solved directly, no turbulence model.\n"
+            ImGui::SetTooltip("Laminar: the Navier-Stokes equations are solved directly, no turbulence model,\n"
+                              "up to Re %.0f, the most this grid resolves; above it the run would diverge,\n"
+                              "so Laminar simulates that Re instead.\n"
                               "Turbulent: Smagorinsky LES for eddies smaller than a cell.\n"
                               "Auto: LES only above Re %.0f, where this body's resolution stops\n"
-                              "resolving the smallest eddies.", reResolved_);
+                              "resolving the smallest eddies.", reResolved_, reResolved_);
         ImGui::TextDisabled("Now: %s", solver_.flow.smagorinsky > 0 ? "turbulent, LES on" : "laminar, resolved");
         ImGui::Checkbox("Interpolated walls", &solver_.flow.bouzidi);
         if (ImGui::IsItemHovered())
@@ -879,15 +895,17 @@ void App::drawStats(float x, float width, float height) {
     const ImVec4 warn{1.f, 0.72f, 0.3f, 1.f};
     if (body_.length < 32) ImGui::TextColored(warn, "%.0f cells across the body: forces\nneed >= 32 to be quantitative", body_.length);
     else ImGui::Text("%.0f cells across the body", body_.length);
-    if (tauClamped_) ImGui::TextColored(warn, "Requested Re is beyond this grid:\nsimulating Re %s", formatSi(reSimulated_, "").c_str());
+    if (tauClamped_ && solver_.flow.smagorinsky == 0)
+        ImGui::TextColored(warn, "Laminar: simulating Re %s, the most\nthis grid resolves without a turbulence\n"
+                                 "model (Auto or LES for the full Re)", formatSi(reSimulated_, "").c_str());
+    else if (tauClamped_)
+        ImGui::TextColored(warn, "Simulating Re %s: beyond it the\nmolecular viscosity is too small to\n"
+                                 "represent; the LES eddy viscosity\ndominates, so results barely change",
+                           formatSi(reSimulated_, "").c_str());
     if (reSimulated_ > 2e4) ImGui::TextColored(warn, "High Re: boundary layers are\nunresolved (no wall model); trust\ntrends and wakes, not absolute C_D");
     if (mach_ > 0.3f) ImGui::TextColored(warn, "Mach %.2f: compressibility is not\nmodelled; results are incompressible", mach_);
     if (!props_.warning.empty()) ImGui::TextColored(warn, "Fluid: %s", props_.warning.c_str());
-    if (flowModel_ == 1 && reSimulated_ > reResolved_)
-        ImGui::TextColored(warn, "Laminar forced above Re %.0f: the grid\ncannot resolve the smallest eddies and\n"
-                                 "the run may diverge (use Auto or LES)", reResolved_);
     if (blockage > 0.1) ImGui::TextColored(warn, "Blockage %.0f%%: tunnel walls\ninflate the forces", 100 * blockage);
-    if (stats_.maxU > 0.45f) ImGui::TextColored({1, 0.35f, 0.3f, 1}, "Peak lattice speed %.2f: unstable,\nlower the lattice speed", stats_.maxU);
 
     if (glfwGetTime() < statusUntil_) {
         ImGui::Spacing();
@@ -1079,6 +1097,11 @@ void App::saveCapture(uint32_t width, uint32_t height) {
     for (size_t i = 0; i < px.size(); i += 4) std::swap(px[i], px[i + 2]);   // BGRA -> RGBA
     const bool ok = stbi_write_png(capturePath_.c_str(), int(width), int(height), 4, px.data(), int(width) * 4) != 0;
     std::printf("%s %s (%u x %u)\n", ok ? "captured" : "capture failed:", capturePath_.c_str(), width, height);
+    const double wall = glfwGetTime() - captureWall0_;
+    if (wall > 0 && solver_.t > captureSteps0_)
+        std::printf("sustained %.0f MLUPS over the second half, rendering included (%.0f steps/s, %.0f FPS)\n",
+                    double(solver_.cells()) * double(solver_.t - captureSteps0_) / wall * 1e-6,
+                    double(solver_.t - captureSteps0_) / wall, 0.5 * captureFrames_ / wall);
 }
 
 void App::snapshot() {

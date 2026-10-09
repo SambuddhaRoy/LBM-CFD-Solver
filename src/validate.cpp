@@ -14,6 +14,7 @@
 // LES is off, these are laminar flows.
 // ============================================================================
 
+#include "fluid.hpp"
 #include "geometry.hpp"
 #include "lattice_cpu.hpp"
 #include "solver.hpp"
@@ -682,6 +683,71 @@ void laminarSuite(gpu::Context& ctx, Precision prec, bool& ok) {
     }
 }
 
+// The interactive app's default setup (384 x 192 x 192, body 48 cells long,
+// air at 15 C) at a range of wind speeds: every speed must stay bounded in
+// every flow model. Prints the drag so a run that survives but goes wrong
+// shows too. WT_STAB_STEPS overrides the run length; WT_STAB_MESH adds a
+// model file as a fourth body.
+void stabilitySuite(gpu::Context& ctx, Precision prec, bool& ok) {
+    const uint32_t steps = std::getenv("WT_STAB_STEPS") ? uint32_t(std::atoi(std::getenv("WT_STAB_STEPS"))) : 6000;
+    std::printf("\n  STABILITY: app default, 384 x 192 x 192, body 48 cells, air, %u steps\n", steps);
+    std::printf("  body            model    U m/s  u     Re        Re sim    tau       C_D     max|u|/u_in\n");
+    const double nu = properties(Ambient{}).nu;
+    const float D = 48.f;
+    Geometry geo;
+    geo.create(ctx);
+    std::vector<Body> bodies(3);
+    bodies[1].shape = Shape::Cube;
+    bodies[2].shape = Shape::Wing; bodies[2].pitch = 10.f;
+    if (const char* mesh = std::getenv("WT_STAB_MESH")) {
+        std::vector<Triangle> tris; std::string err; MeshReport rep;
+        if (loadMesh(mesh, tris, err, &rep)) {
+            geo.setMesh(std::move(tris), rep.watertight());
+            bodies.push_back(Body{}); bodies.back().shape = Shape::Mesh;
+        }
+    }
+    // Flow model, wind speed, lattice speed: both models over the speed
+    // range at the default lattice speed, then the slider's maximum.
+    struct Case { int model; double U; float u; };
+    const Case cases[] = {{0, 1, 0.1f}, {0, 5, 0.1f}, {0, 30, 0.1f}, {0, 300, 0.1f},
+                          {1, 1, 0.1f}, {1, 5, 0.1f}, {1, 30, 0.1f}, {1, 300, 0.1f},
+                          {0, 300, 0.15f}, {1, 300, 0.15f}};
+    for (Body b : bodies) {
+        for (const Case& c : cases) {
+            GridConfig g;
+            g.nx = 384; g.ny = 192; g.nz = 192; g.precision = prec;
+            Solver s;
+            s.create(ctx, g);
+            const double re = c.U * 1.0 / nu;
+            const FlowScaling sc = scaleFlow(re, D, c.u, c.model);
+            s.flow.uIn = c.u;
+            s.flow.tau = sc.tau;
+            s.flow.smagorinsky = sc.smagorinsky;
+            b.center = {0.3f * 384, 96.25f, 96.25f};
+            b.length = D;
+            geo.apply(s, b);
+            ctx.submitNow([&](VkCommandBuffer cmd) { s.reset(cmd); });
+            float worst = 0; double cd = 0; uint64_t blew = 0;
+            while (s.t < steps && !blew) {
+                ctx.submitNow([&](VkCommandBuffer cmd) { s.recordSteps(cmd, 500, true, true); s.recordStats(cmd); });
+                const Stats st = s.stats();
+                const auto f = s.forces();
+                cd = f[0] / (0.5 * c.u * c.u * std::max<uint32_t>(geo.frontalCells(), 1));
+                worst = std::max(worst, st.maxU / c.u);
+                if (!std::isfinite(st.maxU) || !std::isfinite(cd) || st.maxU > 0.39f) blew = s.t;
+            }
+            ok = ok && !blew;
+            char res[32];
+            if (blew) std::snprintf(res, sizeof res, "DIVERGED by %llu", (unsigned long long)blew);
+            else      std::snprintf(res, sizeof res, "ok");
+            std::printf("  %-15s %-8s %5.0f  %.2f  %-9.3g %-9.3g %.7f %6.3f  %5.2f   %s\n", shapeName(b.shape),
+                        c.model == 0 ? "auto" : "laminar", c.U, c.u, re, sc.reSimulated, s.flow.tau, cd, worst, res);
+            s.destroy();
+        }
+    }
+    geo.destroy();
+}
+
 } // namespace
 
 int runValidation(gpu::Context& ctx, Precision prec, const std::string& suite, float diameter) {
@@ -691,6 +757,7 @@ int runValidation(gpu::Context& ctx, Precision prec, const std::string& suite, f
     bool ok = true;
     std::printf("\nCFD validation (%s suite), %s storage\n", suite.c_str(), precisionName(prec));
     if (doLaminar) laminarSuite(ctx, prec, ok);
+    if (suite == "stability" || suite == "all") stabilitySuite(ctx, prec, ok);
     if (doBluff) {
         std::printf("\n  BLUFF BODIES. Measured (published) values; tolerances C_D 8%%, St 6%%, L_r/D 12%%.\n");
         std::printf("  Experiments: Coutanceau & Bouard 1977 (wake length), Williamson 1996 (Strouhal),\n");

@@ -42,6 +42,8 @@ struct StartSetup {
     float       zoom = 1.f;              // relative to the fitted view
     std::string meshPath;                // model to load at start
     bool        realtime = false;        // start in real-time mode
+    float       speed = 30.f;            // wind speed, m/s
+    int         flowModel = 0;           // 0 auto, 1 laminar, 2 LES
     std::string capturePath;
     uint32_t    captureFrames = 300;
 };
@@ -137,6 +139,7 @@ private:
 
     // Measurements.
     uint32_t stepsPerFrame_ = 4;
+    double   stepsSmooth_ = 4;               // controller state behind stepsPerFrame_
     double   mlups_ = 0, simMs_ = 0;
     std::array<double, 3> force_{};
     Stats    stats_;
@@ -152,6 +155,9 @@ private:
     std::string capturePath_;
     uint32_t    captureFrames_ = 0;
     gpu::Buffer captureBuf_;
+    uint64_t    captureSteps0_ = 0;       // steps and wall time at the half-way frame:
+    double      captureWall0_ = 0;        // the capture reports the sustained rate since
+    double      lastInput_ = -10;         // wall time of the last mouse / widget input
     std::string status_;
     double statusUntil_ = 0;
 };

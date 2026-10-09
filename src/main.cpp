@@ -24,7 +24,9 @@ void usage() {
         "  --validate [SUITE]      CFD validation against exact solutions and experiments:\n"
         "                          standard (default: laminar exact solutions + bluff\n"
         "                          bodies, ~15 min), laminar, turbulent (cylinder Re 3900,\n"
-        "                          3D LES, ~15 min at D = 40), all\n"
+        "                          3D LES, ~15 min at D = 40), stability (default tunnel,\n"
+        "                          every body, flow model and speed stays bounded, ~5 min),\n"
+        "                          all\n"
         "  --diameter D            turbulent suite: cells across the cylinder (default 40)\n"
         "  --grid X Y Z            benchmark grid (default 256 256 256)\n"
         "  --steps N               benchmark steps per timing (default 200)\n"
@@ -37,6 +39,8 @@ void usage() {
         "  --preset N              grid preset index (default 1)\n"
         "  --mesh FILE             load a model (STL, OBJ, glTF, FBX, PLY, ...)\n"
         "  --realtime              start in real-time mode\n"
+        "  --speed M               wind speed in m/s (default 30)\n"
+        "  --flow F                auto | laminar | les\n"
         "  --mesh-info FILE        list a model's parts, check it is watertight, and exit\n"
         "  --shape S               sphere | cube | cylinder | wing\n"
         "  --pitch DEG             body pitch (angle of attack)\n"
@@ -84,6 +88,11 @@ int main(int argc, char** argv) {
         else if (a == "--preset" && i + 1 < argc) setup.preset = std::atoi(argv[++i]);
         else if (a == "--mesh" && i + 1 < argc)   setup.meshPath = argv[++i];
         else if (a == "--realtime")               setup.realtime = true;
+        else if (a == "--speed" && i + 1 < argc)  setup.speed = float(std::atof(argv[++i]));
+        else if (a == "--flow" && i + 1 < argc) {
+            const std::string s = argv[++i];
+            setup.flowModel = s == "laminar" ? 1 : s == "les" ? 2 : 0;
+        }
         else if (a == "--diameter" && i + 1 < argc) diameter = float(std::atof(argv[++i]));
         else if (a == "--pitch" && i + 1 < argc)  setup.pitch = float(std::atof(argv[++i]));
         else if (a == "--zoom" && i + 1 < argc)   setup.zoom = std::max(1e-3f, float(std::atof(argv[++i])));
