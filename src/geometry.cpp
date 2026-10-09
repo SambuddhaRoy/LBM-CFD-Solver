@@ -10,9 +10,14 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <algorithm>
+#include <array>
 #include <bit>
+#include <cctype>
 #include <cmath>
+#include <cstdio>
+#include <filesystem>
 #include <limits>
+#include <unordered_map>
 
 namespace wt {
 
@@ -83,7 +88,35 @@ glm::mat3 bodyRotation(const Body& b) {
     return glm::transpose(glm::mat3(m));    // world -> body
 }
 
-bool loadMesh(const std::string& path, std::vector<Triangle>& tris, std::string& error) {
+MeshReport checkTopology(const std::vector<Triangle>& tris) {
+    // In a closed surface every edge is shared by exactly two triangles.
+    // Vertices are welded by position at 1e-6 of the model's size.
+    struct KeyHash {
+        size_t operator()(const std::array<int64_t, 3>& k) const {
+            return size_t(k[0] * 73856093) ^ size_t(k[1] * 19349663) ^ size_t(k[2] * 83492791);
+        }
+    };
+    std::unordered_map<std::array<int64_t, 3>, uint32_t, KeyHash> ids;
+    auto id = [&](const glm::vec3& p) {
+        const std::array<int64_t, 3> k{std::llround(p.x * 1e6), std::llround(p.y * 1e6), std::llround(p.z * 1e6)};
+        return ids.emplace(k, uint32_t(ids.size())).first->second;
+    };
+    std::unordered_map<uint64_t, uint32_t> edges;
+    edges.reserve(tris.size() * 2);
+    for (const auto& t : tris) {
+        const uint32_t v[3] = {id(t.a), id(t.b), id(t.c)};
+        for (int e = 0; e < 3; ++e) {
+            const auto [lo, hi] = std::minmax(v[e], v[(e + 1) % 3]);
+            ++edges[uint64_t(lo) << 32 | hi];
+        }
+    }
+    MeshReport r;
+    r.edges = edges.size();
+    for (const auto& [e, n] : edges) { r.openEdges += n == 1; r.nonManifoldEdges += n > 2; }
+    return r;
+}
+
+bool loadMesh(const std::string& path, std::vector<Triangle>& tris, std::string& error, MeshReport* report) {
     Assimp::Importer imp;
     const aiScene* sc = imp.ReadFile(path, aiProcess_Triangulate | aiProcess_JoinIdenticalVertices
                                            | aiProcess_PreTransformVertices);
@@ -107,10 +140,65 @@ bool loadMesh(const std::string& path, std::vector<Triangle>& tris, std::string&
         }
     }
     if (tris.empty()) { error = "no triangles in file"; return false; }
+
+    // Orient the model in the tunnel (wind along +x, y up). Up follows the
+    // file format's convention: Y for glTF, FBX, OBJ and Collada, Z for the
+    // CAD formats (STL, PLY, 3MF). The longer of the two horizontal extents
+    // is the length, aligned with the wind, with the front (+axis; glTF
+    // defines +Z as forward) facing upstream (-x).
+    std::string ext = std::filesystem::path(path).extension().string();
+    for (auto& ch : ext) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+    const bool yUp = ext == ".gltf" || ext == ".glb" || ext == ".fbx" || ext == ".obj" || ext == ".dae";
+    const int up = yUp ? 1 : 2;
+    const glm::vec3 ext3 = hi - lo;
+    const int a0 = 0, a1 = up == 1 ? 2 : 1;                     // the two horizontal axes
+    const int fwd = ext3[a1] > ext3[a0] ? a1 : a0;
+    glm::vec3 F(0), U(0);
+    F[fwd] = 1; U[up] = 1;
+    const glm::vec3 S = glm::cross(F, U);
+    auto toTunnel = [&](const glm::vec3& p) { return glm::vec3(-glm::dot(p, F), glm::dot(p, U), -glm::dot(p, S)); };
+
     const glm::vec3 c = 0.5f * (lo + hi);
-    const float s = 1.f / std::max({hi.x - lo.x, hi.y - lo.y, hi.z - lo.z, 1e-9f});
-    for (auto& t : tris) { t.a = (t.a - c) * s; t.b = (t.b - c) * s; t.c = (t.c - c) * s; }
+    const float s = 1.f / std::max({ext3.x, ext3.y, ext3.z, 1e-9f});
+    for (auto& t : tris) {
+        t.a = toTunnel((t.a - c) * s); t.b = toTunnel((t.b - c) * s); t.c = toTunnel((t.c - c) * s);
+    }
+    if (report) {
+        *report = checkTopology(tris);
+        const char* names = "xyz";
+        report->alignment = std::string("file ") + names[up] + " up, front +" + names[fwd] + " facing the wind";
+        report->extent = std::max({ext3.x, ext3.y, ext3.z});
+        report->metres = ext == ".gltf" || ext == ".glb";
+    }
     return true;
+}
+
+int printMeshInfo(const std::string& path) {
+    Assimp::Importer imp;
+    const aiScene* sc = imp.ReadFile(path, aiProcess_Triangulate | aiProcess_JoinIdenticalVertices
+                                           | aiProcess_PreTransformVertices);
+    if (!sc || !sc->mRootNode) { std::printf("load failed: %s\n", imp.GetErrorString()); return 1; }
+    std::printf("%u meshes\n", sc->mNumMeshes);
+    for (unsigned m = 0; m < sc->mNumMeshes; ++m) {
+        const aiMesh* mesh = sc->mMeshes[m];
+        glm::vec3 lo(1e30f), hi(-1e30f);
+        for (unsigned v = 0; v < mesh->mNumVertices; ++v) {
+            const glm::vec3 p(mesh->mVertices[v].x, mesh->mVertices[v].y, mesh->mVertices[v].z);
+            lo = glm::min(lo, p); hi = glm::max(hi, p);
+        }
+        std::printf("  %3u %-32.32s %8u tris  x[%8.3f %8.3f] y[%8.3f %8.3f] z[%8.3f %8.3f]\n", m,
+                    mesh->mName.C_Str(), mesh->mNumFaces, lo.x, hi.x, lo.y, hi.y, lo.z, hi.z);
+    }
+    std::vector<Triangle> tris;
+    std::string err;
+    MeshReport r;
+    loadMesh(path, tris, err, &r);
+    std::printf("%zu triangles, %zu edges: %zu open (one triangle), %zu shared by more than two\n",
+                tris.size(), r.edges, r.openEdges, r.nonManifoldEdges);
+    std::printf("%s\n", r.watertight() ? "watertight: exact inside/outside by ray parity"
+                                       : "not watertight: voxelized by shrink-wrap (flood fill from outside)");
+    std::printf("orientation: %s\n", r.alignment.c_str());
+    return 0;
 }
 
 void Geometry::create(gpu::Context& ctx) {
@@ -128,16 +216,49 @@ void Geometry::destroy() {
     ctx_ = nullptr;
 }
 
-void Geometry::setMesh(std::vector<Triangle> tris) { mesh_ = std::move(tris); }
+glm::vec3 Geometry::extent(const Body& b, bool& through) const {
+    const glm::mat3 toWorld = glm::transpose(bodyRotation(b));
+    glm::vec3 lo(1e30f), hi(-1e30f);
+    auto add = [&](const glm::vec3& p) { const glm::vec3 w = toWorld * p; lo = glm::min(lo, w); hi = glm::max(hi, w); };
+    through = (b.shape == Shape::Cylinder || b.shape == Shape::Wing) && b.span <= 0;
+    if (b.shape == Shape::Mesh) {
+        for (const auto& t : mesh_) { add(t.a); add(t.b); add(t.c); }
+    } else if (b.shape == Shape::Sphere) {
+        return glm::vec3(1.f);
+    } else {
+        // Oriented boxes: cube, cylinder (diameter 1 x span), wing (chord 1,
+        // 12% thick, x span). A spanning body counts one length of span.
+        glm::vec3 h(0.5f);
+        const float span = through ? 1.f : b.span / std::max(b.length, 1.f);
+        if (b.shape == Shape::Cylinder) h = {0.5f, 0.5f, 0.5f * span};
+        if (b.shape == Shape::Wing)     h = {0.5f, 0.06f, 0.5f * span};
+        for (int k = 0; k < 8; ++k)
+            add({(k & 1) ? h.x : -h.x, (k & 2) ? h.y : -h.y, (k & 4) ? h.z : -h.z});
+    }
+    return hi - lo;
+}
+
+void Geometry::setMesh(std::vector<Triangle> tris, bool watertight) {
+    mesh_ = std::move(tris);
+    watertight_ = watertight;
+}
 
 void Geometry::apply(Solver& solver, const Body& body) {
     if (body.shape == Shape::Mesh)      prepareMesh(solver, body);
     else if (body.shape == Shape::Wing) prepareWing(body);
-    ctx_->submitNow([&](VkCommandBuffer cmd) {
-        if (body.shape == Shape::Mesh) writeMesh(cmd, solver);
-        else                           writeAnalytic(cmd, solver, body);
-        solver.applyGeometry(cmd);
-    });
+    if (body.shape == Shape::Mesh && !watertight_) {
+        // Shrink-wrap needs a CPU flood fill between the distance pass and
+        // the copy into the solver, so it runs as two submissions.
+        ctx_->submitNow([&](VkCommandBuffer cmd) { writeMeshDistance(cmd, false); });
+        shrinkWrap();
+        ctx_->submitNow([&](VkCommandBuffer cmd) { writeMeshFinal(cmd, solver); solver.applyGeometry(cmd); });
+    } else {
+        ctx_->submitNow([&](VkCommandBuffer cmd) {
+            if (body.shape == Shape::Mesh) { writeMeshDistance(cmd, true); writeMeshFinal(cmd, solver); }
+            else writeAnalytic(cmd, solver, body);
+            solver.applyGeometry(cmd);
+        });
+    }
     frontal_ = measureFrontal(solver);
 }
 
@@ -242,16 +363,14 @@ void Geometry::prepareMesh(Solver& s, const Body& b) {
     ctx_->upload(bins_, bins.data(), bins.size() * 4);
 }
 
-void Geometry::writeMesh(VkCommandBuffer cmd, Solver& s) {
-    const auto& g = s.grid();
+// Band-limited unsigned distance in the scratch box, plus the inside/outside
+// sign by ray parity when the mesh is closed (exact for closed surfaces).
+void Geometry::writeMeshDistance(VkCommandBuffer cmd, bool parity) {
     MeshPush mp{};
     mp.origin[0] = boxOrigin_.x; mp.origin[1] = boxOrigin_.y; mp.origin[2] = boxOrigin_.z;
     mp.dims[0] = uint32_t(boxDims_.x); mp.dims[1] = uint32_t(boxDims_.y); mp.dims[2] = uint32_t(boxDims_.z);
     mp.nTris = nTris_; mp.nbY = nbY_; mp.nbZ = nbZ_; mp.binSize = kBin;
     mp.band  = kBand;
-
-    // Unsigned distance (band-limited), then the sign by ray parity, then the
-    // whole-grid pass that copies the box into the SDF.
     vkCmdFillBuffer(cmd, scratch_.buf, 0, VK_WHOLE_SIZE, std::bit_cast<uint32_t>(1e30f));
     gpu::Context::computeBarrier(cmd);
     gpu::Bindings bnd = ctx_->emptyBindings();
@@ -261,10 +380,16 @@ void Geometry::writeMesh(VkCommandBuffer cmd, Solver& s) {
     ctx_->bind(cmd, sdfSplat_, bnd, &mp, sizeof mp);
     gpu::Context::dispatchThreads(cmd, uint64_t(nTris_) * 256);     // one group per triangle
     gpu::Context::computeBarrier(cmd);
-    ctx_->bind(cmd, sdfSign_, bnd, &mp, sizeof mp);
-    gpu::Context::dispatchThreads(cmd, uint64_t(boxDims_.y) * boxDims_.z);
-    gpu::Context::computeBarrier(cmd);
+    if (parity) {
+        ctx_->bind(cmd, sdfSign_, bnd, &mp, sizeof mp);
+        gpu::Context::dispatchThreads(cmd, uint64_t(boxDims_.y) * boxDims_.z);
+        gpu::Context::computeBarrier(cmd);
+    }
+}
 
+// Copies the scratch box into the solver's SDF (outside the box: distance to it).
+void Geometry::writeMeshFinal(VkCommandBuffer cmd, Solver& s) {
+    const auto& g = s.grid();
     ShapePush p{};
     p.nx = g.nx; p.ny = g.ny; p.nz = g.nz;
     p.shape  = 4;
@@ -276,6 +401,49 @@ void Geometry::writeMesh(VkCommandBuffer cmd, Solver& s) {
     fb[23] = scratch_.buf;
     ctx_->bind(cmd, sdfShape_, fb, &p, sizeof p);
     gpu::Context::dispatchThreads(cmd, s.cells());
+}
+
+// Shrink-wrap for meshes that are not closed (typical of visualisation
+// models: separate parts, gaps between panels, single-sheet surfaces), where
+// ray parity flips inside/outside at every hole and leaves solid streaks.
+// Every cell within kWrap of a triangle becomes a wall; a flood fill from the
+// box boundary marks what the outside air can reach; the rest is interior.
+// Gaps narrower than ~2 kWrap are sealed and single sheets become solid
+// layers, at the price of offsetting surfaces outward by kWrap.
+// kWrap = sqrt(3)/2 makes the wall layer around any surface at least one
+// cell thick in every orientation, so neither the flood nor the flow leaks.
+void Geometry::shrinkWrap() {
+    constexpr float kWrap = 0.866f;
+    const size_t nx = size_t(boxDims_.x), ny = size_t(boxDims_.y), nz = size_t(boxDims_.z);
+    const size_t n = nx * ny * nz;
+    std::vector<float> d(n);
+    ctx_->download(scratch_, d.data(), n * 4);
+
+    std::vector<uint8_t> state(n, 0);               // 0 unknown, 1 wall, 2 outside
+    for (size_t c = 0; c < n; ++c) if (d[c] < kWrap) state[c] = 1;
+    std::vector<size_t> queue;
+    queue.reserve(n / 4);
+    auto seed = [&](size_t c) { if (state[c] == 0) { state[c] = 2; queue.push_back(c); } };
+    for (size_t z = 0; z < nz; ++z)
+        for (size_t y = 0; y < ny; ++y)
+            for (size_t x = 0; x < nx; ++x)
+                if (x == 0 || y == 0 || z == 0 || x + 1 == nx || y + 1 == ny || z + 1 == nz)
+                    seed((z * ny + y) * nx + x);
+    for (size_t head = 0; head < queue.size(); ++head) {
+        const size_t c = queue[head];
+        const size_t x = c % nx, y = (c / nx) % ny, z = c / (nx * ny);
+        if (x > 0)      seed(c - 1);
+        if (x + 1 < nx) seed(c + 1);
+        if (y > 0)      seed(c - nx);
+        if (y + 1 < ny) seed(c + nx);
+        if (z > 0)      seed(c - nx * ny);
+        if (z + 1 < nz) seed(c + nx * ny);
+    }
+    // Walls and outside measure distance from the offset surface, so the
+    // interpolated walls see a consistent surface at d = kWrap; the interior
+    // is just negative.
+    for (size_t c = 0; c < n; ++c) d[c] = state[c] == 0 ? -(d[c] + kWrap) : d[c] - kWrap;
+    ctx_->upload(scratch_, d.data(), n * 4);
 }
 
 uint32_t Geometry::measureFrontal(Solver& s) {

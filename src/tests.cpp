@@ -334,7 +334,10 @@ bool meshCase(gpu::Context& ctx, const char* name, std::vector<Triangle> tris,
     Geometry geo;
     geo.create(ctx);
     const size_t nTris = tris.size();
-    geo.setMesh(std::move(tris));
+    // Open meshes are shrink-wrapped: their surface moves out by ~0.866 cells.
+    const bool closed = checkTopology(tris).watertight();
+    const double offset = closed ? 0.0 : 0.866;
+    geo.setMesh(std::move(tris), closed);
     Body b;
     b.shape = Shape::Mesh;
     b.center = {35.6f, 31.3f, 32.2f};
@@ -355,17 +358,22 @@ bool meshCase(gpu::Context& ctx, const char* name, std::vector<Triangle> tris,
             for (uint32_t x = 1; x + 1 < g.nx; ++x) {
                 const size_t c = (size_t(z) * g.ny + y) * g.nx + x;
                 const glm::vec3 p = toBody * (glm::vec3(float(x), float(y), float(z)) - b.center) / b.length;
-                const double d = double(exact(p)) * b.length;            // cells
+                const double d = double(exact(p)) * b.length - offset;   // cells
                 const bool gpuSolid = (flags[c] & SOLID) != 0;
                 solid += gpuSolid;
                 if (gpuSolid != (d < 0)) { ++wrong; worst = std::max(worst, std::abs(d)); }
-                if (std::abs(d) < 3) sdfErr = std::max(sdfErr, std::abs(double(halfToFloat(sdfHalf[c])) - d));
+                // Shrink-wrapped interiors measure distance to the nearest
+                // triangle that exists, which overestimates next to a hole;
+                // only the fluid side (what the walls use) is exact there.
+                if (std::abs(d) < 3 && (closed || d > 0))
+                    sdfErr = std::max(sdfErr, std::abs(double(halfToFloat(sdfHalf[c])) - d));
             }
     // Faceting moves the surface by at most the chord sagitta (well under a
     // cell here); fp16 storage rounds distances to ~0.002 cells.
     const bool pass = solid > 0 && worst < 1.0 && sdfErr < 0.35;
-    std::printf("  mesh %-26s %6zu tris  %6zu solid  %3zu misclassified (all within %.2f cells of the surface)"
-                "  max SDF error %.3f  %s\n", name, nTris, solid, wrong, worst, sdfErr, pass ? "PASS" : "FAIL");
+    std::printf("  mesh %-30s %-11s %6zu tris  %6zu solid  %3zu misclassified (all within %.2f cells of the surface)"
+                "  max SDF error %.3f  %s\n", name, closed ? "exact" : "shrink-wrap", nTris, solid, wrong, worst,
+                sdfErr, pass ? "PASS" : "FAIL");
     geo.destroy();
     s.destroy();
     return pass;
@@ -416,6 +424,21 @@ int runSelfTest(gpu::Context& ctx) {
                       const glm::vec2 q(glm::length(glm::vec2(p.x, p.y)) - 0.32f, p.z);
                       return glm::length(q) - 0.18f;
                   }) && ok;
+    // Open meshes, as exported from visualisation models: a sphere with a
+    // scattering of missing triangles (ray parity would streak through every
+    // hole), and a single zero-thickness sheet (no inside at all).
+    {
+        auto holed = icosphere(4);
+        for (size_t i = holed.size(); i-- > 0;) if (i % 37 == 0) holed.erase(holed.begin() + std::ptrdiff_t(i));
+        ok = meshCase(ctx, "icosphere with holes, rotated", std::move(holed),
+                      [](glm::vec3 p) { return glm::length(p) - 0.5f; }) && ok;
+        const std::vector<Triangle> sheet = {{{-0.5f, -0.5f, 0}, {0.5f, -0.5f, 0}, {0.5f, 0.5f, 0}},
+                                             {{-0.5f, -0.5f, 0}, {0.5f, 0.5f, 0}, {-0.5f, 0.5f, 0}}};
+        ok = meshCase(ctx, "single sheet, rotated", sheet, [](glm::vec3 p) {
+                          const glm::vec2 e = glm::max(glm::abs(glm::vec2(p.x, p.y)) - 0.5f, 0.f);
+                          return std::sqrt(glm::dot(e, e) + p.z * p.z);
+                      }) && ok;
+    }
 
     std::printf("\n%s\n", ok ? "SELF-TEST PASSED" : "SELF-TEST FAILED");
     return ok ? 0 : 1;

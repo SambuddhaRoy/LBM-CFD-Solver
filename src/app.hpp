@@ -41,6 +41,7 @@ struct StartSetup {
     Field       field = Field::Speed;
     float       zoom = 1.f;              // relative to the fitted view
     std::string meshPath;                // model to load at start
+    bool        realtime = false;        // start in real-time mode
     std::string capturePath;
     uint32_t    captureFrames = 300;
 };
@@ -103,7 +104,7 @@ private:
     int       gridIndex_ = 1;
     Precision precision_ = Precision::FP16C;
     Body      body_;
-    std::string meshName_;
+    std::string meshName_, meshNote_;
     bool      running_ = true;
     bool      geometryDirty_ = false, resetRequested_ = false, rebuildRequested_ = false;
     Ambient    ambient_;                     // fluid, temperature, pressure
@@ -117,6 +118,22 @@ private:
     float     reRequested_ = 0.f, reSimulated_ = 0.f, mach_ = 0.f;
     float     dx_ = 0.f, dt_ = 0.f;          // m, s per cell / step
     bool      tauClamped_ = false;
+
+    // Real-time mode: the simulated clock keeps pace with the wall clock, so
+    // the air crosses the model at its actual speed. The tunnel is fitted
+    // around the body and the resolution chosen so the GPU can keep up.
+    bool      realtime_ = false;
+    int       savedGridIndex_ = 1;          // preset to return to
+    Body      savedBody_;                   // size and place in that preset
+    bool      restoreBody_ = false;         // leaving real time: put them back
+    uint32_t  rtGrid_[3] = {0, 0, 0};       // fitted tunnel, cells
+    float     rtLength_ = 0.f;              // planned cells along the body
+    glm::vec3 rtCenter_{0.f};
+    double    rtDebt_ = 0, rtLastWall_ = 0; // simulated seconds owed; last frame time
+    float     rtRatio_ = 0.f;               // achieved simulated / wall time
+    double    rtCheckAt_ = 0;               // next pacing check (wall clock)
+    double    rtThroughput_ = 0;            // throughput the current fit assumed, LUPS
+    void planRealtime(double throughput);
 
     // Measurements.
     uint32_t stepsPerFrame_ = 4;

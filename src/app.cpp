@@ -118,6 +118,15 @@ int App::run(const StartSetup& setup) {
     renderer_.create(ctx_);
     rebuildSolver();
     if (!setup.meshPath.empty()) loadMeshFile(setup.meshPath);
+    if (setup.realtime) {
+        // No throughput measured yet: plan with a typical figure; the pacing
+        // check refits within a few seconds if it was optimistic.
+        realtime_ = true;
+        savedGridIndex_ = gridIndex_;
+        savedBody_ = body_;
+        planRealtime(8e9);
+        rebuildRequested_ = true;
+    }
 
     while (!glfwWindowShouldClose(window_)) frame();
 
@@ -237,21 +246,38 @@ void App::rebuildSolver() {
     const bool had = solver_.created();
     solver_.destroy();
 
-    const GridPreset& p = kGrids[gridIndex_];
     GridConfig g;
-    g.nx = p.nx; g.ny = p.ny; g.nz = p.nz; g.precision = precision_;
+    if (realtime_) { g.nx = rtGrid_[0]; g.ny = rtGrid_[1]; g.nz = rtGrid_[2]; }
+    else { g.nx = kGrids[gridIndex_].nx; g.ny = kGrids[gridIndex_].ny; g.nz = kGrids[gridIndex_].nz; }
+    g.precision = precision_;
     try {
         solver_.create(ctx_, g);
     } catch (const std::exception& e) {
         status_ = std::string("Grid not created: ") + e.what();
         statusUntil_ = glfwGetTime() + 6;
         gridIndex_ = 0;
+        realtime_ = false;
         g.nx = kGrids[0].nx; g.ny = kGrids[0].ny; g.nz = kGrids[0].nz;
         solver_.create(ctx_, g);
     }
 
-    // Keep the body where it was relative to the tunnel, scaled with it.
-    if (had && old.ny > 0) {
+    // Keep the body where it was relative to the tunnel, scaled with it; in
+    // real time the planner has placed it in the fitted tunnel.
+    if (realtime_) {
+        rtRatio_ = 0.f;
+        rtDebt_ = 0;
+        rtCheckAt_ = glfwGetTime() + 4.0;       // let the step budget settle first
+        if (body_.length > 0) body_.span *= rtLength_ / body_.length;
+        body_.length = rtLength_;
+        body_.center = rtCenter_;
+    } else if (restoreBody_) {
+        // Back from the fitted real-time tunnel: the preset's own body size
+        // and place, with the current shape and angles.
+        restoreBody_ = false;
+        body_.length = savedBody_.length;
+        body_.span   = savedBody_.span;
+        body_.center = savedBody_.center;
+    } else if (had && old.ny > 0) {
         const glm::vec3 frac = body_.center / glm::vec3(float(old.nx), float(old.ny), float(old.nz));
         body_.center = frac * glm::vec3(float(g.nx), float(g.ny), float(g.nz));
         const float s = float(g.ny) / float(old.ny);
@@ -261,12 +287,41 @@ void App::rebuildSolver() {
         body_.center = {0.3f * float(g.nx), 0.5f * float(g.ny) + 0.25f, 0.5f * float(g.nz) + 0.25f};
         body_.length = 0.25f * float(std::min(g.ny, g.nz));
     }
-    solver_.flow.uIn = 0.08f;          // LES is decided in updateScaling()
+    // Lattice speed: real time trades a little compressibility error (lattice
+    // Mach 0.17 instead of 0.14, ~3% instead of ~2%) for 25% fewer steps.
+    solver_.flow.uIn = realtime_ ? 0.1f : 0.08f;   // LES is decided in updateScaling()
     for (auto& f : frames_) f.stepped = false;
     applyGeometry();
     resetFlow();
     view_.slice = body_.center.z;
     fitPending_ = true;
+}
+
+// Real time needs one step per dt = u_lat dx / U of simulated time, i.e.
+// U N / (u_lat L) steps per wall-clock second with N cells along the body of
+// length L, and every step updates every cell. The tunnel is fitted around
+// the body (one length upstream, three downstream, 1.5 body sizes of
+// clearance across, which keeps blockage near 5%), so it holds vol * N^3
+// cells. Real time is affordable while vol N^4 U / (u_lat L) stays within a
+// share of the GPU's throughput, which fixes N.
+void App::planRealtime(double throughput) {
+    bool through = false;
+    const glm::vec3 e = geometry_.extent(body_, through);        // body lengths
+    const float my = std::max(1.5f * e.y, 0.35f), mz = std::max(1.5f * e.z, 0.35f);
+    const glm::vec3 V(1.f + e.x + 3.f, e.y + 2.f * my, through ? 1.f : e.z + 2.f * mz);
+    const double vol = double(V.x) * V.y * V.z;
+    rtThroughput_ = throughput;
+    const double uLat = 0.1, share = 0.75;      // leave a quarter of the GPU for rendering
+    const double stepsPerCell = speed_ / (uLat * length_);       // per wall second, per cell along L
+    double n = std::pow(share * throughput / (vol * stepsPerCell), 0.25);
+    const double maxCells = 0.85 * double(ctx_.vramBytes) / bytesPerCell(precision_);
+    n = std::clamp(n, 12.0, std::min(std::cbrt(maxCells / vol), 600.0));
+    // Rows a multiple of the 32 x 8 workgroup so no lanes idle at the edges.
+    rtGrid_[0] = std::max(32u, uint32_t(std::ceil(V.x * n / 32.0)) * 32u);
+    rtGrid_[1] = std::max(8u, uint32_t(std::ceil(V.y * n / 8.0)) * 8u);
+    rtGrid_[2] = std::max(8u, uint32_t(std::ceil(V.z * n)));
+    rtLength_ = float(n);
+    rtCenter_ = {float((1.0 + 0.5 * e.x) * n), 0.5f * float(rtGrid_[1]) + 0.25f, 0.5f * float(rtGrid_[2]) + 0.25f};
 }
 
 void App::applyGeometry() {
@@ -406,11 +461,35 @@ void App::frame() {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &bi);
     gpu::Context::computeBarrier(cmd);
-    if (running_) {
-        solver_.recordSteps(cmd, stepsPerFrame_, true, true, slot, true);
+    // Steps this frame. Normally as many as fit the GPU budget. In real time,
+    // exactly as many as the wall clock has moved on (up to the budget); if
+    // the GPU falls behind, the debt is dropped rather than allowed to grow.
+    uint32_t steps = stepsPerFrame_;
+    const double now = glfwGetTime();
+    if (realtime_ && running_) {
+        const double wall = std::min(now - rtLastWall_, 0.1);
+        rtDebt_ += wall;
+        steps = dt_ > 0 ? uint32_t(std::min(rtDebt_ / double(dt_), double(stepsPerFrame_))) : 0u;
+        rtDebt_ = std::min(rtDebt_ - steps * double(dt_), 0.05);
+        if (wall > 0) rtRatio_ = 0.9f * rtRatio_ + 0.1f * float(steps * double(dt_) / wall);
+        // Falling behind for a while: refit with fewer cells. The needed
+        // throughput scales as N^4, so N shrinks by the fourth root.
+        if (now > rtCheckAt_) {
+            rtCheckAt_ = now + 3.0;
+            if (rtRatio_ < 0.85f && rtRatio_ > 0.f) {
+                planRealtime(rtThroughput_ * rtRatio_ * 0.885);   // N shrinks by (ratio)^(1/4) x 0.97
+                rebuildRequested_ = true;
+                status_ = "Real time: GPU falling behind, refitting with fewer cells";
+                statusUntil_ = now + 4;
+            }
+        }
+    }
+    rtLastWall_ = now;
+    if (running_ && steps > 0) {
+        solver_.recordSteps(cmd, steps, true, true, slot, true);
         solver_.recordStats(cmd, slot);
         f.stepped = true;
-        f.steps = stepsPerFrame_;
+        f.steps = steps;
     }
     const glm::vec3 half = bodyBoundsHalf();
     renderer_.record(cmd, slot, solver_, view_, body_.center - half, body_.center + half);
@@ -522,6 +601,21 @@ void App::drawControls(float width, float height) {
         running_ = !running_;
     ImGui::SameLine();
     if (ImGui::Button("Reset flow (R)", {-1, 0})) resetRequested_ = true;
+    if (ImGui::Checkbox("Real time", &realtime_)) {
+        if (realtime_) {
+            savedGridIndex_ = gridIndex_;
+            savedBody_ = body_;
+            planRealtime(mlups_ > 0 ? mlups_ * 1e6 : 8e9);
+        } else {
+            gridIndex_ = savedGridIndex_;
+            restoreBody_ = true;
+        }
+        rebuildRequested_ = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Air crosses the model at its actual speed: simulated time runs with the clock.\n"
+                          "The tunnel is fitted around the body and the resolution set so the GPU keeps\n"
+                          "up; expect fewer cells than in the presets. Lattice speed rises to 0.1.");
 
     if (ImGui::CollapsingHeader("Body", ImGuiTreeNodeFlags_DefaultOpen)) {
         const char* shapes[] = {"Sphere", "Cube", "Cylinder", "NACA 0012 wing", "Imported model"};
@@ -538,6 +632,11 @@ void App::drawControls(float width, float height) {
             } else {
                 body_.shape = Shape(s);
                 geometryDirty_ = true;
+                if (realtime_) { planRealtime(rtThroughput_); rebuildRequested_ = true; }
+                // A different body is a new experiment. Keeping the old flow
+                // would revive the vacated cells at rest, and that slug of
+                // still air drifts downstream looking like a second obstacle.
+                resetRequested_ = true;
             }
         }
 #ifdef _WIN32
@@ -546,7 +645,12 @@ void App::drawControls(float width, float height) {
             if (!p.empty()) loadMeshFile(p);
         }
 #endif
-        if (body_.shape == Shape::Mesh) ImGui::TextDisabled("%s", meshName_.c_str());
+        if (body_.shape == Shape::Mesh) {
+            ImGui::TextDisabled("%s", meshName_.c_str());
+            ImGui::PushTextWrapPos(0);
+            ImGui::TextDisabled("%s", meshNote_.c_str());
+            ImGui::PopTextWrapPos();
+        }
         else ImGui::TextDisabled("Or drop an STL/OBJ/glTF/FBX/PLY file on the window");
 
         const auto& g = solver_.grid();
@@ -608,14 +712,30 @@ void App::drawControls(float width, float height) {
         if (ImGui::Button("Water", {-1, 0})) { ambient_ = {FluidKind::Water, 293.15, 101325.0}; ch = true; }
         ImGui::TextDisabled("rho %.4g kg/m3   mu %.3g Pa s\nnu %.3g m2/s   c %.0f m/s",
                             props_.rho, props_.mu, props_.nu, props_.sound);
+        // In real time the step rate depends on speed and length, so the
+        // tunnel is refitted when either settles (on release, not mid-drag).
+        bool refit = false;
         ch |= ImGui::SliderFloat("Wind speed", &speed_, 0.5f, 340.f, "%.1f m/s", ImGuiSliderFlags_Logarithmic);
+        refit |= ImGui::IsItemDeactivatedAfterEdit();
         ch |= ImGui::SliderFloat("Body length", &length_, 0.005f, 50.f, "%.3f m", ImGuiSliderFlags_Logarithmic);
+        refit |= ImGui::IsItemDeactivatedAfterEdit();
+        ImGui::BeginDisabled(realtime_);
         ch |= ImGui::SliderFloat("Lattice speed", &solver_.flow.uIn, 0.02f, 0.15f, "%.3f");
+        ImGui::EndDisabled();
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Inlet speed in lattice units. Higher develops the flow faster per step;\n"
                               "above ~0.1 compressibility error grows (lattice Mach = %.2f).",
                               solver_.flow.uIn * std::sqrt(3.f));
         if (ch) updateScaling();
+        if (realtime_ && refit) {
+            // Rebuild only for a real change of resolution: a rebuild restarts the flow.
+            const float before = rtLength_;
+            uint32_t grid[3] = {rtGrid_[0], rtGrid_[1], rtGrid_[2]};
+            const glm::vec3 center = rtCenter_;
+            planRealtime(rtThroughput_);
+            if (std::abs(rtLength_ / before - 1.f) > 0.15f) rebuildRequested_ = true;
+            else { rtLength_ = before; rtCenter_ = center; std::copy(grid, grid + 3, rtGrid_); }
+        }
         const char* models[] = {"Auto", "Laminar (resolved)", "Turbulent (LES)"};
         if (ImGui::Combo("Flow model", &flowModel_, models, 3)) updateScaling();
         if (ImGui::IsItemHovered())
@@ -640,7 +760,10 @@ void App::drawControls(float width, float height) {
                           cells * bytesPerCell(precision_) / double(1ull << 30));
             return buf;
         };
-        if (ImGui::BeginCombo("Cells", label(gridIndex_))) {
+        if (realtime_)
+            ImGui::TextDisabled("Fitted for real time: %u x %u x %u (%.1fM)", rtGrid_[0], rtGrid_[1], rtGrid_[2],
+                                double(rtGrid_[0]) * rtGrid_[1] * rtGrid_[2] / 1e6);
+        else if (ImGui::BeginCombo("Cells", label(gridIndex_))) {
             for (int i = 0; i < int(std::size(kGrids)); ++i) {
                 const double need = double(kGrids[i].nx) * kGrids[i].ny * kGrids[i].nz * bytesPerCell(precision_);
                 const bool fits = need < 0.92 * double(ctx_.vramBytes);
@@ -709,6 +832,10 @@ void App::drawStats(float x, float width, float height) {
     ImGui::Text("%.0f FPS", ImGui::GetIO().Framerate);
     ImGui::Text("t = %s (%llu steps)", formatSi(double(solver_.t) * dt_, "s").c_str(),
                 (unsigned long long)solver_.t);
+    if (realtime_) {
+        const ImVec4 col = rtRatio_ >= 0.95f ? ImVec4(0.45f, 0.9f, 0.55f, 1) : ImVec4(1.f, 0.72f, 0.3f, 1);
+        ImGui::TextColored(col, "Real time x%.2f, %.0f cells along the body", rtRatio_, rtLength_);
+    }
 
     ImGui::Spacing();
     ImGui::TextDisabled("AERODYNAMICS");
@@ -919,16 +1046,28 @@ void App::handleKeys() {
 void App::loadMeshFile(const std::string& path) {
     std::vector<Triangle> tris;
     std::string err;
-    if (!loadMesh(path, tris, err)) {
+    MeshReport report;
+    if (!loadMesh(path, tris, err, &report)) {
         status_ = "Could not load " + path + ": " + err;
         statusUntil_ = glfwGetTime() + 6;
         return;
     }
     meshName_ = std::filesystem::path(path).filename().string() + "  (" + std::to_string(tris.size()) + " triangles)";
-    geometry_.setMesh(std::move(tris));
+    meshNote_ = report.watertight()
+        ? "Closed surface: exact voxelization."
+        : "Not watertight (" + std::to_string(report.openEdges) + " open edges): shrink-wrapped, "
+          "surfaces offset ~0.9 cells.";
+    meshNote_ += "\nOriented: " + report.alignment + ". Yaw 180 if it faces backwards.";
+    geometry_.setMesh(std::move(tris), report.watertight());
+    if (report.metres) {
+        length_ = float(report.extent);       // glTF is in metres: real size
+        updateScaling();
+    }
+    if (realtime_) { planRealtime(rtThroughput_); rebuildRequested_ = true; }
     body_.shape = Shape::Mesh;
     body_.pitch = body_.yaw = body_.roll = 0;
     geometryDirty_ = true;
+    resetRequested_ = true;     // new body: start from a clean flow (see the shape combo)
     status_ = "Loaded " + meshName_;
     statusUntil_ = glfwGetTime() + 4;
 }

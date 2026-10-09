@@ -133,6 +133,44 @@ budget.
 
 ![3D view, sphere coloured by surface pressure](docs/screenshots/sphere-3d-pressure.png)
 
+## Real-time mode
+
+Tick *Real time* and the simulated clock runs with the wall clock: the air
+crosses the model at its actual speed. That takes U N / (u L) steps per
+second (N cells along a body of length L, lattice speed u), each updating
+the whole tunnel, so the mode trades resolution for speed:
+
+- the tunnel is fitted around the body (one length upstream, three
+  downstream, 1.5 body sizes of clearance across, about 5% blockage)
+  instead of the presets' 2:1:1 box, which for a car needs about 20x fewer cells;
+- the resolution is the finest the GPU sustains in real time with a quarter
+  of it left for rendering, re-planned from the measured speed if it falls
+  behind;
+- the lattice speed rises from 0.08 to 0.1 (lattice Mach 0.17,
+  compressibility error about 3% instead of 2%).
+
+On an RTX 5070 Ti, a 5.6 m F1 car model at 30 m/s runs in real time with 64
+cells along the car (352 x 64 x 92 tunnel, dx = 8.7 cm); a 1 m sphere at
+30 m/s gets 22 cells across. Faster or smaller bodies get fewer cells, and
+the accuracy panel says when that drops below the 32 cells forces need.
+
+## Imported models
+
+- **Orientation:** models are turned so the wind blows along their length:
+  up follows the format's convention (Y for glTF, FBX, OBJ, Collada; Z for
+  STL, PLY, 3MF), and the front (+Z in glTF, which defines it) faces
+  upstream. Yaw 180 if a model faces backwards.
+- **Size:** glTF is in metres by specification, so its real length is used
+  for the Reynolds number and forces; other formats keep the length slider.
+- **Closed vs open meshes:** a watertight mesh is voxelized exactly (inside
+  and outside by ray parity, validated against exact shapes). Visualisation
+  models rarely are: separate parts, gaps between panels, single-sheet
+  wings. Those are shrink-wrapped instead: every cell within 0.87 cells of a
+  triangle becomes wall, a flood fill marks what the outside air reaches,
+  and the rest is interior. That seals gaps and gives sheets thickness, at
+  the price of moving surfaces outward by 0.87 cells. `--mesh-info FILE`
+  lists a model's parts and reports which path it takes.
+
 ## Validation: is it physically accurate?
 
 Three layers of checks, each exiting 0/1. Every coefficient below is raw: no
@@ -249,6 +287,8 @@ matters.
 - **Turbulent separated flow:** drag, shedding frequency and base pressure
   are validated to a few percent at Re 3900; the length of the separated
   bubble comes out about 30% long, a limitation of the Smagorinsky model.
+- **Open (non-watertight) models** are shrink-wrapped, which moves their
+  surfaces outward by 0.87 cells; **real-time mode** runs coarser grids.
 - Incompressible regime: physical Mach above 0.3 is flagged, not modelled.
   No heat transfer.
 
@@ -279,7 +319,9 @@ WindTunnel                      interactive wind tunnel
 WindTunnel --selftest           GPU solver vs CPU reference, all precisions
 WindTunnel --bench [--grid X Y Z] [--precision fp32|fp16s|fp16c|all] [--peak GBs]
 WindTunnel --validate [standard|laminar|turbulent|all] [--precision P] [--diameter D]
+WindTunnel --mesh-info FILE     list a model's parts, check it is watertight
 WindTunnel --capture out.png [frames]   run the app, save the window, exit
+           --realtime   start in real-time mode
            --mesh FILE --shape S --pitch DEG --view 2d|3d --field F --zoom X --preset N
 ```
 

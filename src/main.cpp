@@ -3,6 +3,7 @@
 // ============================================================================
 
 #include "app.hpp"
+#include "geometry.hpp"
 #include "tests.hpp"
 #include "vk.hpp"
 
@@ -35,6 +36,8 @@ void usage() {
         "Initial state of the interactive app:\n"
         "  --preset N              grid preset index (default 1)\n"
         "  --mesh FILE             load a model (STL, OBJ, glTF, FBX, PLY, ...)\n"
+        "  --realtime              start in real-time mode\n"
+        "  --mesh-info FILE        list a model's parts, check it is watertight, and exit\n"
         "  --shape S               sphere | cube | cylinder | wing\n"
         "  --pitch DEG             body pitch (angle of attack)\n"
         "  --view 2d|3d            slice or 3D camera\n"
@@ -61,6 +64,7 @@ int main(int argc, char** argv) {
     float diameter = 40.f;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
+        if (a == "--mesh-info" && i + 1 < argc) return wt::printMeshInfo(argv[++i]);
         if (a == "--selftest" || a == "--bench") mode = a;
         else if (a == "--validate") {
             mode = a;
@@ -79,6 +83,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--preset" && i + 1 < argc) setup.preset = std::atoi(argv[++i]);
         else if (a == "--mesh" && i + 1 < argc)   setup.meshPath = argv[++i];
+        else if (a == "--realtime")               setup.realtime = true;
         else if (a == "--diameter" && i + 1 < argc) diameter = float(std::atof(argv[++i]));
         else if (a == "--pitch" && i + 1 < argc)  setup.pitch = float(std::atof(argv[++i]));
         else if (a == "--zoom" && i + 1 < argc)   setup.zoom = std::max(1e-3f, float(std::atof(argv[++i])));

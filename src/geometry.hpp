@@ -33,10 +33,26 @@ glm::mat3 bodyRotation(const Body& b);
 
 struct Triangle { glm::vec3 a, b, c; };
 
+struct MeshReport {
+    size_t edges = 0, openEdges = 0, nonManifoldEdges = 0;
+    std::string alignment;              // how the model was oriented in the tunnel
+    double extent = 0;                  // longest extent in file units
+    bool   metres = false;              // file units are metres (glTF by specification)
+    bool watertight() const { return openEdges == 0 && nonManifoldEdges == 0; }
+};
+
+// Edge topology of a triangle soup: closed surfaces share every edge between
+// exactly two triangles.
+MeshReport checkTopology(const std::vector<Triangle>& tris);
+
 // Loads any Assimp-supported mesh (STL, OBJ, glTF, FBX, PLY, ...) into a flat
-// triangle list, centred on its bounding box and scaled so its longest
-// extent is 1. Returns false and sets `error` on failure.
-bool loadMesh(const std::string& path, std::vector<Triangle>& tris, std::string& error);
+// triangle list, centred, scaled so its longest extent is 1, and oriented in
+// the tunnel (see loadMesh). Returns false and sets `error` on failure.
+bool loadMesh(const std::string& path, std::vector<Triangle>& tris, std::string& error,
+              MeshReport* report = nullptr);
+
+// Lists every mesh in a model file with its triangle count and bounds.
+int printMeshInfo(const std::string& path);
 
 class Geometry {
 public:
@@ -44,7 +60,8 @@ public:
     void destroy();
 
     // Mesh to use when body.shape == Shape::Mesh (unit-scaled, see loadMesh).
-    void setMesh(std::vector<Triangle> tris);
+    // watertight selects exact ray-parity voxelization; otherwise shrink-wrap.
+    void setMesh(std::vector<Triangle> tris, bool watertight);
     bool hasMesh() const { return !mesh_.empty(); }
 
     // Writes the solver's SDF for `body`, then classifies cells (keeping the
@@ -53,6 +70,10 @@ public:
 
     uint32_t frontalCells() const { return frontal_; }   // projected area, cells
 
+    // Axis-aligned size of the body as placed in the tunnel, in units of its
+    // length; `through` is set for cylinders and wings spanning the domain.
+    glm::vec3 extent(const Body& b, bool& through) const;
+
 private:
     static constexpr uint32_t kBin = 4;     // parity-ray bin size, cells
 
@@ -60,7 +81,9 @@ private:
     void prepareWing(const Body& b);
     void prepareMesh(Solver& s, const Body& b);
     void writeAnalytic(VkCommandBuffer cmd, Solver& s, const Body& b);
-    void writeMesh(VkCommandBuffer cmd, Solver& s);
+    void writeMeshDistance(VkCommandBuffer cmd, bool parity);
+    void writeMeshFinal(VkCommandBuffer cmd, Solver& s);
+    void shrinkWrap();
     uint32_t measureFrontal(Solver& s);
 
     gpu::Context* ctx_ = nullptr;
@@ -69,6 +92,7 @@ private:
     uint32_t    polyCount_ = 0;
     glm::vec4   polyBounds_{0};
     std::vector<Triangle> mesh_;
+    bool        watertight_ = true;
     gpu::Buffer tris_, bins_, scratch_; // mesh voxelization working set
     uint32_t    nTris_ = 0, nbY_ = 0, nbZ_ = 0;
     glm::ivec3  boxOrigin_{0}, boxDims_{1};
