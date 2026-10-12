@@ -1,0 +1,43 @@
+#version 460
+// pinch.comp — close unresolvable pockets on the road, after classify.comp.
+//
+// The moving road pumps momentum into the cells just above it. Under
+// bodywork less than four cells up, or in a pocket walled in on more than
+// two sides (11+ of 18 neighbours solid; the road alone is 5, a corner of
+// road and one wall 9) in the first three rows, the flow cannot be resolved
+// (density -4.9, then NaN, under a car 48-76 cells long; density 0.13 at 3.4x
+// the inlet speed in a two-cell gap). Such cells become solid: a car's floor
+// gap closes on coarse grids and stays open from about four cells up.
+//
+// Filling one cell can wall in the next, so the solver runs a few rounds of
+// two passes: pc.pad1 = 0 marks candidates from the solid bits alone (which
+// no thread changes in that pass), pc.pad1 = 1 turns the marks solid. Each
+// thread writes only its own byte, as in wallmask.comp.
+#include "lattice.glsl"
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 1) buffer Flags { uint8_t flags[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer Field { f16vec4 field[]; };
+
+const uint FLAG_FILL = 16u;
+
+void main() {
+    const uint n = cellIndex();
+    if (n >= cellCount()) return;
+    const uint fl = uint(flags[n]);
+    if (pc.pad1 == 1u) {
+        if ((fl & FLAG_FILL) != 0u) { flags[n] = uint8_t(FLAG_SOLID); field[n] = f16vec4(0.0); }
+        return;
+    }
+    if ((fl & (FLAG_SOLID | FLAG_EQ | FLAG_OUTLET)) != 0u) return;
+    const uvec3 p = coords(n);
+    if (p.y < 1u || p.y > 3u || p.y + 4u > pc.Ny) return;
+    const Nbr b = neighbourhood(p);
+    uint walls = 0u;
+    [[unroll]] for (uint q = 1u; q < 19u; ++q)
+        walls += (uint(flags[nb(b, q)]) & FLAG_SOLID) != 0u ? 1u : 0u;
+    // Gap between the road and the bodywork above, in cells: closed below 4.
+    bool thin = false;
+    for (uint k = 1u; k + p.y <= 4u; ++k) thin = thin || (uint(flags[n + k * pc.Nx]) & FLAG_SOLID) != 0u;
+    if (thin || walls >= 11u) flags[n] = uint8_t(fl | FLAG_FILL);
+}

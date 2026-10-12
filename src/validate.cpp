@@ -763,13 +763,19 @@ void stabilitySuite(gpu::Context& ctx, Precision prec, bool& ok) {
 // at 300 km/h, i.e. C_L A ~ 5-8 m^2; independent CFD of a 2021 Williams
 // (10 mm mesh, moving ground, rotating wheels) gives C_L A 5.6, C_D A 1.83 m^2.
 void carSuite(gpu::Context& ctx, Precision prec, const std::string& mesh, float cells, float speed, bool& ok) {
+    // Uniform flow is a steady state: it only shows that the moving-wall term
+    // has the right sign and size. A perturbed inflow tests stability, which
+    // the uniform case cannot: with tau - 1/2 ~ 1e-6 a 0.1% disturbance grew
+    // into a blow-up within a few hundred steps before the road row got its
+    // viscosity floor (step.comp).
     std::printf("\n  ROAD: empty tunnel, moving ground at the inlet speed, LES at tau - 1/2 = 3e-6, 8000 steps\n");
-    {
+    for (const float turb : {0.f, 0.01f}) {
         GridConfig g;
         g.nx = 256; g.ny = 64; g.nz = 64; g.precision = prec;
         Solver s;
         s.create(ctx, g);
         s.flow.uIn = 0.1f; s.flow.tau = 0.500003f; s.flow.smagorinsky = 0.12f; s.flow.ground = true;
+        s.flow.turbulence = turb;
         uploadSdf(ctx, s, [](double, double, double) { return 8.0; });
         advance(ctx, s, 8000);
         std::vector<float> rhoU;
@@ -782,10 +788,12 @@ void carSuite(gpu::Context& ctx, Precision prec, const std::string& mesh, float 
                     worst = std::max({worst, std::abs(double(v[1]) - 0.1), std::abs(double(v[2])),
                                       std::abs(double(v[3]))});
                 }
-        const bool pass = worst < 1e-4;
+        // Unperturbed: uniform to storage precision. Perturbed by 1%: stays
+        // within a few times that.
+        const bool pass = std::isfinite(worst) && worst / 0.1 < (turb > 0 ? 5 * turb : 1e-4);
         ok = ok && pass;
-        std::printf("  largest departure from uniform flow: %.2e of the inlet speed  %s\n", worst / 0.1,
-                    pass ? "PASS" : "FAIL");
+        std::printf("  %s: largest departure from uniform flow %.2e of the inlet speed  %s\n",
+                    turb > 0 ? "inflow perturbed by 1%" : "uniform inflow        ", worst / 0.1, pass ? "PASS" : "FAIL");
         s.destroy();
     }
     if (mesh.empty()) { std::printf("  (no --mesh given: car runs skipped)\n"); return; }
@@ -877,6 +885,33 @@ void carSuite(gpu::Context& ctx, Precision prec, const std::string& mesh, float 
         const uint32_t warm = uint32_t(4.0 * cells / u), window = uint32_t(3.0 * cells / u);
         const uint32_t every = uint32_t(std::clamp<uint64_t>(4'000'000'000ull / s.cells(), 10, 100));  // see advance()
         const ForceHistory h = run(ctx, s, warm, window, every, 0.f);
+        if (std::getenv("WT_CAR_DEBUG")) {   // where the fastest cell is, and what surrounds it
+            std::vector<float> rhoU;
+            s.probe(rhoU);
+            std::vector<uint8_t> fl(s.cells());
+            ctx.download(s.flags(), fl.data(), fl.size());
+            size_t worst = 0; double wu = 0;
+            for (size_t c = 0; c < s.cells(); ++c) {
+                const double v = std::hypot(rhoU[4 * c + 1], rhoU[4 * c + 2], rhoU[4 * c + 3]);
+                if (!(fl[c] & 1u) && (v > wu || !std::isfinite(v))) { wu = v; worst = c; if (!std::isfinite(v)) break; }
+            }
+            const uint32_t x = uint32_t(worst % g.nx), y = uint32_t(worst / g.nx % g.ny), z = uint32_t(worst / (size_t(g.nx) * g.ny));
+            std::printf("  debug: max |u| %.3f (u_in %.2f) at (%u, %u, %u), rho %.3f, flags %u; solid neighbours:", wu, u, x, y, z,
+                        rhoU[4 * worst], fl[worst]);
+            for (int q = 1; q < 19; ++q) {
+                const size_t m = (size_t(int(z) + cpu::CZ[q]) * g.ny + size_t(int(y) + cpu::CY[q])) * g.nx + size_t(int(x) + cpu::CX[q]);
+                if (fl[m] & 1u) std::printf(" (%d,%d,%d)", cpu::CX[q], cpu::CY[q], cpu::CZ[q]);
+            }
+            uint32_t up = y + 1;
+            while (up < g.ny && !(fl[(size_t(z) * g.ny + up) * g.nx + x] & 1u)) ++up;
+            std::printf("; first solid above at y = %u\n", up);
+            for (const uint32_t px : {2u, 4u, 8u, 16u, 32u}) {
+                std::printf("  debug: x = %2u, u_x/u_in for y = 1..8:", px);
+                for (uint32_t py = 1; py <= 8; ++py)
+                    std::printf(" %5.2f", rhoU[4 * ((size_t(g.nz / 2) * g.ny + py) * g.nx + px) + 1] / u);
+                std::printf("   rho y=1: %.4f\n", rhoU[4 * ((size_t(g.nz / 2) * g.ny + 1) * g.nx + px)]);
+            }
+        }
         double fx = 0, fy = 0;
         for (size_t k = 0; k < h.drag.size(); ++k) { fx += h.drag[k]; fy += h.lift[k]; }
         fx /= double(h.drag.size()); fy /= double(h.drag.size());

@@ -94,6 +94,7 @@ void Context::init(GLFWwindow* window) {
     VkPhysicalDeviceVulkan13Features f13{};
     f13.synchronization2 = VK_TRUE;
     f13.dynamicRendering = VK_TRUE;
+    f13.maintenance4 = VK_TRUE;      // workgroup size from specialization constants (LocalSizeId)
 
     vkb::PhysicalDeviceSelector sel(inst.value());
     sel.set_minimum_version(1, 3)

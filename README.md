@@ -124,7 +124,10 @@ budget.
 - **Walls:** halfway or Bouzidi interpolated bounce-back from a signed
   distance field, so curved walls sit at their true sub-cell position.
 - **Tunnel:** equilibrium inlet (optional perturbation), far-field side faces
-  or periodic, pressure outlet pinned at rho = 1.
+  or periodic, pressure outlet pinned at rho = 1. The outlet admits no
+  backflow, and a sponge (viscosity ramping up over the last 16 cells)
+  damps eddies before they reach it: a turbulent wake arriving at the outlet
+  once pulled fluid back in and diverged (caught by `--ui-test`).
 - **Forces:** momentum exchange summed inside the step kernel on demand,
   in gauge pressure (shifted populations): identical for a body surrounded
   by fluid, and the only correct choice for one standing on the road, whose
@@ -197,7 +200,13 @@ the accuracy panel says when that drops below the 32 cells forces need.
   A car's floor and diffuser make most of its downforce against the road, so
   without it a car's lift is meaningless. The road is a halfway bounce-back
   wall with the moving-wall term, left out of the body's force and frontal
-  area; with nothing on it the flow stays uniform to 2e-5 (`--validate car`).
+  area. With nothing on it the flow stays uniform to 2e-5, and a 1%
+  disturbed inflow stays bounded (`--validate car`); that second check
+  needed a viscosity floor (tau >= 0.55) in the row above the road, where at
+  high Re a 0.1% disturbance otherwise grew into a blow-up. Over open road
+  there is no shear, so the floor changes nothing there. Gaps between the
+  road and the body thinner than four cells, and pockets walled in on more
+  than two sides, close: they cannot be resolved and diverged.
 
 ### Test bench: an F1 car (`--validate car --mesh FILE`)
 
@@ -211,17 +220,19 @@ ground and rotating wheels gives C_L A 5.6 and C_D A 1.83 m^2.
 
 | cells along the car | speed | downforce | drag | C_L A | C_D A |
 |---|---|---|---|---|---|
-| 140 (40 mm) | 252 km/h | 4 kg | 3,954 N | 0.01 | 1.32 |
-| 280 (20 mm) | 180 km/h | 12 kg | 1,676 N | 0.08 | 1.09 |
-| 280 (20 mm) | 252 km/h | 36 kg | 3,324 N | 0.12 | 1.11 |
-| 280 (20 mm) | 324 km/h | 48 kg | 5,455 N | 0.10 | 1.10 |
-| 374 (15 mm) | 252 km/h | 102 kg | 3,217 N | 0.33 | 1.07 |
+| 140 (40 mm) | 252 km/h | -782 kg (lift) | 7,390 N | -2.55 | 2.46 |
+| 280 (20 mm) | 180 km/h | 32 kg | 2,917 N | 0.21 | 1.90 |
+| 280 (20 mm) | 252 km/h | 61 kg | 5,696 N | 0.20 | 1.90 |
+| 280 (20 mm) | 324 km/h | 120 kg | 9,431 N | 0.24 | 1.90 |
+| 374 (15 mm) | 252 km/h | 115 kg | 5,175 N | 0.37 | 1.72 |
 
-**Drag is in the published range (and settles as the grid refines); downforce
-is not: 102 kg at 252 km/h against roughly 2,000-2,500 kg, a factor of ~20.**
-Downforce grows with resolution (C_L A 0.01, 0.12, 0.33 at 40, 20, 15 mm) as
-the gaps under and between the parts open up, but nowhere near enough to
-close the gap. The suite's diagnostics say why. It maps the underside as voxelized: this
+**Drag matches: C_D A 1.72-1.90 m^2 against 1.83 for the independent CFD of
+the 2021 Williams. Downforce does not: about 115 kg at 252 km/h against
+roughly 2,000-2,500 kg, a factor of ~20.** At 40 mm the floor gap is under
+four cells and closes (see the road above), so the car is a lump on the road
+and lifts; from 20 mm the floor is open and downforce grows with resolution
+(C_L A 0.20, 0.37 at 20, 15 mm), but nowhere near enough to close the gap.
+The suite's diagnostics say why. It maps the underside as voxelized: this
 model has venturi tunnels (150-210 mm channels beside an 83 mm plank) and a
 diffuser rising to 300 mm, but no floor beyond about 0.67 m from the centre
 line, where the real floor runs to about 0.8 m with edge fences that seal
@@ -259,6 +270,15 @@ misclassified cells within 0.02 cells of the surface), and the fluid
 property models against reference tables (air exact to the ISA, water and
 CO2 within 1%).
 
+**The interactive app (`--ui-test DIR [--mesh FILE]`)** drives every control
+with scripted mouse and keyboard input through Dear ImGui's input queue:
+clicks, drags, typed slider values, combo picks, wheel, keys, window
+resizes, a model dropped on the window, real time on and off. After each of
+its 73 steps it checks the viewport geometry, how much of it a fitted view
+fills, solver rebuilds and flow resets against what the step should cause,
+flow sanity, real-time pacing and (with `WT_VALIDATION=1`) Vulkan validation
+messages, and saves a screenshot. It runs for about six minutes.
+
 ### 2. The physics model against exact solutions (`--validate laminar`)
 
 Laminar flows whose answers are known exactly, in FP32:
@@ -286,15 +306,15 @@ Laminar and transitional bluff bodies, 40 cells across, FP16C storage:
   CYLINDER (2D), 1600 x 800, blockage 5%
   Re      C_D (published)       St (measured)      L_r/D (measured)
   20      2.141 (2.050)  +4.5%       --             0.94 (0.93)
-  40      1.630 (1.520)  +7.2%       --             2.27 (2.13)
+  40      1.630 (1.520)  +7.2%       --             2.29 (2.13)
   100     1.396 (1.330)  +5.0%  0.171 (0.164)           --
   150     1.377 (1.320)  +4.3%  0.189 (0.183)           --
 
   SPHERE (3D), 480 x 240 x 240, blockage 2.2%
   Re      C_D (measured drag curve)
   10      4.545 (4.258)  +6.7%
-  100     1.141 (1.087)  +5.0%     L_r/D 0.86 (0.88, Johnson & Patel)
-  300     0.684 (0.653)  +4.7%
+  100     1.141 (1.087)  +4.9%     L_r/D 0.86 (0.88, Johnson & Patel)
+  300     0.683 (0.653)  +4.7%
 ```
 
 Measured: Coutanceau & Bouard 1977 (wake length), Williamson 1996

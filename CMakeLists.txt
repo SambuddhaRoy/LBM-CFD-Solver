@@ -72,10 +72,14 @@ foreach(P 0 1 2)
     add_shader(step.comp     step_p${P}       -DSTORE=${P} -DFORCES=0)
     add_shader(step.comp     step_force_p${P} -DSTORE=${P} -DFORCES=1)
     add_shader(init.comp     init_p${P}       -DSTORE=${P})
-    add_shader(classify.comp classify_p${P}   -DSTORE=${P})
+    # -O0: the optimizer folds the at-rest revival store into a 16-bit constant
+    # and then drops the Int16 capability that constant needs (invalid SPIR-V).
+    # The kernel only runs when the geometry changes.
+    add_shader(classify.comp classify_p${P}   -DSTORE=${P} -O0)
     add_shader(probe.comp    probe_p${P}      -DSTORE=${P})
 endforeach()
 add_shader(wallmask.comp   wallmask)
+add_shader(pinch.comp      pinch)
 add_shader(reduce.comp     reduce)
 add_shader(stats.comp      stats)
 add_shader(sdf_shape.comp  sdf_shape)

@@ -43,6 +43,9 @@ layout(local_size_x_id = 1, local_size_y_id = 2, local_size_z = 1) in;
 // would make every access an indexed descriptor lookup.
 layout(constant_id = 0) const uint PARITY = 0u;
 const bool ODD = PARITY != 0u;
+#ifndef ROAD_TAU
+#define ROAD_TAU 0.55
+#endif
 
 layout(std430, set = 0, binding = 3) buffer Field { f16vec4 field[]; };
 #if FORCES
@@ -179,8 +182,11 @@ void cell(uvec3 p, inout vec3 force) {
         // Pressure outlet: pinning rho = 1 instead of letting it float stops
         // the outlet reflecting pressure back into the domain. Velocity is
         // the upstream cell's from the previous step (see OutletPlane).
+        // No backflow: an eddy reaching the outlet must not pull fluid in
+        // through it (that grew into a blow-up behind a turbulent wake).
         k.u = (fl & FLAG_OUTLET) != 0u ? plane[planeIndex(p, (pc.t + 1u) & 1u)].xyz
                                       : inletVelocity(p);
+        if ((fl & FLAG_OUTLET) != 0u) k.u.x = max(k.u.x, 0.0);
     }
     const vec3 u = k.u;
     k.uu15 = 1.5 * dot(u, u);
@@ -204,6 +210,20 @@ void cell(uvec3 p, inout vec3 force) {
         const float Q = sqrt(k.pxx*k.pxx + k.pyy*k.pyy + k.pzz*k.pzz
                              + 2.0*(k.pxy*k.pxy + k.pyz*k.pyz + k.pxz*k.pxz));
         tau = 0.5 * (pc.tau0 + sqrt(pc.tau0*pc.tau0 + 25.45584412 * pc.smag2 * Q / k.rho));
+    }
+    // The row above a moving road needs some viscosity: at tau - 1/2 ~ 1e-6
+    // any disturbance there grew a hundredfold in 100 steps into a blow-up
+    // (stable from tau 0.6 everywhere). Over open road the flow moves with
+    // the road, so there is no shear and the floor changes nothing; under a
+    // car it acts on a layer a few cells thick, unresolved at these grids.
+    if (road) tau = max(tau, ROAD_TAU);
+    // Sponge: viscosity ramping up over the last 16 cells before the outlet
+    // (at most 1/16 of the tunnel) damps eddies before they reach it. Far
+    // behind the body, it does not touch the forces.
+    const uint sponge = min(16u, pc.Nx / 16u);
+    if ((pc.faces & 4u) == 0u && p.x + sponge >= pc.Nx) {
+        const float s = float(p.x + sponge + 1u - pc.Nx) / float(sponge);
+        tau = max(tau, 0.5 + 0.3 * s * s);
     }
     k.keep = 1.0 - 1.0 / tau;
 

@@ -140,6 +140,7 @@ private:
     double    rtDebt_ = 0, rtLastWall_ = 0; // simulated seconds owed; last frame time
     float     rtRatio_ = 0.f;               // achieved simulated / wall time
     double    rtCheckAt_ = 0;               // next pacing check (wall clock)
+    double    rtCalibrateUntil_ = 0;        // automatic refits only before this
     double    rtThroughput_ = 0;            // throughput the current fit assumed, LUPS
     void planRealtime(double throughput);
 

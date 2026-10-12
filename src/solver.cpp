@@ -97,6 +97,7 @@ void Solver::create(gpu::Context& ctx, const GridConfig& g) {
     classify_  = ctx.loadKernel("classify_p" + p);
     probe_     = ctx.loadKernel("probe_p" + p);
     wallmask_  = ctx.loadKernel("wallmask");
+    pinch_     = ctx.loadKernel("pinch");
     stats_     = ctx.loadKernel("stats");
     reduce_    = ctx.loadKernel("reduce");
 
@@ -121,7 +122,7 @@ void Solver::destroy() {
         c.destroyBuffer(*b);
     for (uint32_t s = 0; s < kSlots; ++s) { c.destroyBuffer(forceOut_[s]); c.destroyBuffer(statOut_[s]); }
     for (auto* k : {&step_[0], &step_[1], &stepForce_[0], &stepForce_[1], &init_, &classify_,
-                    &wallmask_, &probe_, &stats_, &reduce_})
+                    &wallmask_, &pinch_, &probe_, &stats_, &reduce_})
         c.destroyKernel(*k);
     vkDestroyQueryPool(c.device, queries_, nullptr);
     ctx_ = nullptr;
@@ -163,6 +164,16 @@ void Solver::applyGeometry(VkCommandBuffer cmd) {
     c.bind(cmd, classify_, bindings(), &p, sizeof p);
     gpu::Context::dispatchThreads(cmd, cells());
     gpu::Context::computeBarrier(cmd);
+    // Close pockets on the road (pinch.comp): a few mark-and-fill rounds,
+    // since each fill can wall in a neighbour.
+    for (int round = 0; flow.ground && round < 4; ++round)
+        for (uint32_t pass = 0; pass < 2; ++pass) {
+            StepPush q = p;
+            q.pad1 = pass;
+            c.bind(cmd, pinch_, bindings(), &q, sizeof q);
+            gpu::Context::dispatchThreads(cmd, cells());
+            gpu::Context::computeBarrier(cmd);
+        }
     c.bind(cmd, wallmask_, bindings(), &p, sizeof p);
     gpu::Context::dispatchThreads(cmd, cells());
     gpu::Context::computeBarrier(cmd);

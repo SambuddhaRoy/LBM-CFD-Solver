@@ -33,7 +33,7 @@ void main() {
 
     const bool wasSolid = (uint(flags[n]) & FLAG_SOLID) != 0u;
     const bool road = (pc.faces & 8u) != 0u && p.y == 0u;
-    const bool solid = road || (face == 0u && float(sdf[n]) < 0.0);
+    const bool solid = road || (face == 0u && float(sdf[n]) < 0.0);   // pockets on the road: pinch.comp
 
     if (wasSolid && !solid) {
         float f[19];

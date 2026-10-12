@@ -265,6 +265,17 @@ void UiTest::buildScenario(const std::string& meshPath) {
     };
     auto near = [](double a, double b, double tol = 1e-3) { return std::abs(a - b) <= tol * std::max(1.0, std::abs(b)); };
     static float before = 0;   // a value captured by an action for its check
+    // A fitted 2D view must use the screen: at least half of it both ways.
+    auto filled = [this](App& a) {
+        const auto& g = a.solver_.grid();
+        const glm::vec3 n(float(g.nx), float(g.ny), float(g.nz));
+        const int ax = a.view_.axis;
+        const glm::vec2 plane = ax == 2 ? glm::vec2(n.x, n.y) : ax == 1 ? glm::vec2(n.x, n.z) : glm::vec2(n.z, n.y);
+        const float fw = std::min(1.f, plane.x / a.view_.cellsPerPixel / a.viewportW_);
+        const float fh = std::min(1.f, plane.y / a.view_.cellsPerPixel / a.viewportH_);
+        expect(std::min(fw, fh) >= 0.5f, "fitted view fills only " + std::to_string(int(100 * fw)) + "% x " +
+                                             std::to_string(int(100 * fh)) + "% of the viewport");
+    };
 
     // ── Non-real-time basics ──────────────────────────────────────────────
     add("start-up", nullptr, 2, 0, 0, nullptr);
@@ -299,7 +310,7 @@ void UiTest::buildScenario(const std::string& meshPath) {
         [this](App& a) { expect(a.view_.cellsPerPixel < 0.6f * before, "did not zoom in"); });
     add("drag pan", [this](App& a) { before = a.view_.center.x; dragViewport(0.5f, 0.5f, 0.3f, 0.6f); }, 0.5, 0, 0,
         [this](App& a) { expect(a.view_.center.x != before, "did not pan"); });
-    add("H fits the view", [this](App&) { key(ImGuiKey_H); }, 0.5, 0, 0, nullptr);
+    add("H fits the view", [this](App&) { key(ImGuiKey_H); }, 0.5, 0, 0, filled);
     add("slice normal X", [this](App&) { click("X"); }, 0.5, 0, 0,
         [this](App& a) { expect(a.view_.axis == 0 && a.view_.slice == a.body_.center.x, "X slice wrong"); });
     add("slice normal Y", [this](App&) { click("Y"); }, 0.5, 0, 0,
@@ -420,13 +431,23 @@ void UiTest::buildScenario(const std::string& meshPath) {
                 expect(a.body_.shape == Shape::Mesh, "not the model");
                 expect(std::abs(a.length_ - 5.612f) < 0.01f, "glTF length not used: " + std::to_string(a.length_));
             });
+    add("Road on: the body stands on it", [this](App&) { click("Road"); }, 3, 0, 1,
+        [this](App& a) {
+            bool through = false;
+            const float bottom = a.body_.center.y - 0.5f * a.geometry_.extent(a.body_, through).y * a.body_.length;
+            expect(a.road_ && a.solver_.flow.ground, "road not on");
+            expect(std::abs(bottom - 0.5f) < 0.01f, "body bottom at y = " + std::to_string(bottom) + ", not on the road");
+        });
 
     // ── Real time ──────────────────────────────────────────────────────────
     static Body saved;
     static int savedGrid = 0;
     add("Real time on",
         [this](App& a) { saved = a.body_; savedGrid = a.gridIndex_; click("Real time"); }, 6, 1, 0,
-        [this](App& a) { expect(a.realtime_ && a.body_.length == a.rtLength_, "real time body not planned"); });
+        [this, filled](App& a) {
+            expect(a.realtime_ && a.body_.length == a.rtLength_, "real time body not planned");
+            filled(a);
+        });
     add("real time: idle 10 s (no refits)", nullptr, 10, 0, 0, nullptr);
     add("real time: 3D view, orbiting 4 s",
         [this](App&) {
@@ -437,9 +458,10 @@ void UiTest::buildScenario(const std::string& meshPath) {
     add("real time: zoom and pan stay put",
         [this](App& a) { wheel(0.4f, 0.5f, 4); dragViewport(0.5f, 0.5f, 0.6f, 0.5f); frame([&a](App&) { before = a.view_.cellsPerPixel; }); },
         6, 0, 0, [this](App& a) { expect(a.view_.cellsPerPixel == before, "the view was reset"); });
-    add("real time: H fits the view", [this](App&) { key(ImGuiKey_H); }, 1, 0, 0, nullptr);
-    add("real time: Size slider typed",
-        [this](App& a) { before = a.body_.length; typeInto("Size (cells)", "30"); }, 8, 0, 0, nullptr);
+    add("real time: H fits the view", [this](App&) { key(ImGuiKey_H); }, 1, 0, 0, filled);
+    add("real time: Size slider is locked",
+        [this](App& a) { before = a.body_.length; typeInto("Size (cells)", "30"); }, 8, 0, 0,
+        [this](App& a) { expect(a.body_.length == before, "size changed to " + std::to_string(a.body_.length)); });
     add("real time: pitch 5 deg", [this](App&) { typeInto("Pitch", "5"); }, 6, 0, 0,
         [this](App& a) { expect(a.body_.pitch == 5.f, "pitch not applied"); });
     add("real time: wind speed 60 (refit)", [this](App&) { typeInto("Pitch", "0"); typeInto("Wind speed", "60"); }, 6, 1, 0,
@@ -463,8 +485,17 @@ void UiTest::buildScenario(const std::string& meshPath) {
         [this](App&) { click("Real time"); }, 2, 1, 0,
         [this](App& a) {
             expect(!a.realtime_ && a.gridIndex_ == savedGrid, "preset not restored");
-            expect(a.body_.length == saved.length && a.body_.center == saved.center,
-                   "body not restored: length " + std::to_string(a.body_.length) + " vs " + std::to_string(saved.length));
+            // Size and place come back; with the road on, the height is
+            // wherever the current shape stands on it (it changed to a sphere
+            // during real time).
+            bool through = false;
+            const float onRoad = 0.5f + 0.5f * a.geometry_.extent(a.body_, through).y * a.body_.length;
+            const float y = a.road_ ? onRoad : saved.center.y;
+            expect(a.body_.length == saved.length && a.body_.center.x == saved.center.x &&
+                       a.body_.center.z == saved.center.z && std::abs(a.body_.center.y - y) < 1e-3f,
+                   "body not restored: centre (" + std::to_string(a.body_.center.x) + ", " + std::to_string(a.body_.center.y) +
+                       ", " + std::to_string(a.body_.center.z) + "), expected (" + std::to_string(saved.center.x) + ", " +
+                       std::to_string(y) + ", " + std::to_string(saved.center.z) + ")");
         });
     if (!meshPath.empty()) {
         add("Real time on, then a model dropped",

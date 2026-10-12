@@ -47,7 +47,8 @@ float halfToFloat(uint16_t h) {
 }
 
 // Recursive regularized collision + Smagorinsky (same algebra as step.comp).
-void collide(const double f[19], double tau0, double smag2, double post[19], Vec3d& uOut, double& rhoOut) {
+void collide(const double f[19], double tau0, double smag2, double post[19], Vec3d& uOut, double& rhoOut,
+             double tauMin = 0) {
     double rho = 0; Vec3d u;
     for (int q = 0; q < 19; ++q) { rho += f[q]; u.x += CX[q]*f[q]; u.y += CY[q]*f[q]; u.z += CZ[q]*f[q]; }
     u.x /= rho; u.y /= rho; u.z /= rho;
@@ -66,6 +67,7 @@ void collide(const double f[19], double tau0, double smag2, double post[19], Vec
         const double Q = std::sqrt(pxx*pxx + pyy*pyy + pzz*pzz + 2*(pxy*pxy + pyz*pyz + pxz*pxz));
         tau = 0.5 * (tau0 + std::sqrt(tau0*tau0 + 18*std::sqrt(2.0)*smag2*Q/rho));
     }
+    tau = std::max(tau, tauMin);
     const double keep = 1 - 1/tau;
     const double a1[6] = {2*u.x*pxy + u.y*pxx, 2*u.z*pyz + u.y*pzz, 2*u.z*pxz + u.x*pzz,
                           2*u.y*pxy + u.x*pyy, 2*u.y*pyz + u.z*pyy, 2*u.x*pxz + u.z*pxx};
@@ -113,6 +115,13 @@ public:
             wallIn[q] = (flags_[s] & SOLID) != 0;
             if (!wallIn[q]) { f[q] = post_[s * 19 + q]; continue; }
             const int d = OPP[q];                                // towards the wall
+            if (fp_.ground && y - CY[q] == 0) {
+                // The road: halfway bounce-back off a wall moving at the inlet
+                // velocity, not part of the body's force.
+                f[q] = post_[c * 19 + d] + 6 * WQ[q] * CX[q] * fp_.uIn;
+                wallIn[q] = false;
+                continue;
+            }
             const size_t other = wrap(x + CX[q], y + CY[q], z + CZ[q]);
             const bool otherSolid = (flags_[other] & SOLID) != 0;
             double qw = 0.5;
@@ -143,12 +152,21 @@ public:
             double* out = &next[c * 19];
             if (flags_[c] & (EQ | OUTLET)) {
                 u = (flags_[c] & OUTLET) ? plane_[(t_ + 1) & 1][size_t(z)*ny_ + y] : Vec3d{fp_.uIn, 0, 0};
+                if (flags_[c] & OUTLET) u.x = std::max(u.x, 0.0);         // no backflow
                 equilibrium(1.0, u, out);
             } else {
                 double f[19]; bool wallIn[19];
                 incoming(c, f, wallIn);
                 double rho;
-                collide(f, fp_.tau, double(fp_.smagorinsky) * fp_.smagorinsky, out, u, rho);
+                // Viscosity floors: the row above the road, and the sponge
+                // before the outlet (see step.comp).
+                double tauMin = fp_.ground && y == 1 ? 0.55 : 0.0;
+                const int sponge = std::min(16, nx_ / 16);
+                if (x + sponge >= nx_) {
+                    const double sp = double(x + sponge + 1 - nx_) / sponge;
+                    tauMin = std::max(tauMin, 0.5 + 0.3 * sp * sp);
+                }
+                collide(f, fp_.tau, double(fp_.smagorinsky) * fp_.smagorinsky, out, u, rho, tauMin);
                 for (int q = 1; q < 19; ++q) {
                     if (!wallIn[q]) continue;
                     const int d = OPP[q];
@@ -195,7 +213,7 @@ private:
 struct CaseResult { double maxDu, maxDrho, forceRel; };
 
 CaseResult compareCase(gpu::Context& ctx, Precision prec, const Body& body, bool bouzidi,
-                       uint32_t steps, bool farY, bool farZ) {
+                       uint32_t steps, bool farY, bool farZ, bool ground = false) {
     GridConfig g;
     g.nx = 48; g.ny = 26; g.nz = 22;
     g.precision = prec; g.farFieldY = farY; g.farFieldZ = farZ;
@@ -205,6 +223,7 @@ CaseResult compareCase(gpu::Context& ctx, Precision prec, const Body& body, bool
     s.flow.smagorinsky = 0.12f;
     s.flow.uIn = 0.08f;
     s.flow.bouzidi = bouzidi;
+    s.flow.ground = ground;
     Geometry geo;
     geo.create(ctx);
     geo.apply(s, body);
@@ -395,8 +414,11 @@ int runSelfTest(gpu::Context& ctx) {
     Body wing;
     wing.shape = Shape::Wing; wing.center = {17.f, 13.f, 11.f}; wing.length = 16.f; wing.pitch = 12.f;
 
-    struct Case { const char* name; Body body; bool bouzidi, farY, farZ; };
+    Body low = sphere;                // over the road: disturbs the flow next to it
+    low.center.y = 9.f;
+    struct Case { const char* name; Body body; bool bouzidi, farY, farZ, ground = false; };
     const Case cases[] = {
+        {"sphere over a moving road",      low,    true,  true,  true, true},
         {"sphere, halfway walls",          sphere, false, true,  true },
         {"sphere, Bouzidi walls",          sphere, true,  true,  true },
         {"pitched cube, Bouzidi, periodic Z", plate, true, true,  false},
@@ -408,7 +430,7 @@ int runSelfTest(gpu::Context& ctx) {
         const double tolU = prec == Precision::FP32 ? 2e-6 : 2e-3;
         const double tolF = prec == Precision::FP32 ? 1e-4 : 5e-2;
         for (const Case& c : cases) {
-            const CaseResult r = compareCase(ctx, prec, c.body, c.bouzidi, 60, c.farY, c.farZ);
+            const CaseResult r = compareCase(ctx, prec, c.body, c.bouzidi, 60, c.farY, c.farZ, c.ground);
             const bool pass = r.maxDu < tolU && r.maxDrho < tolU && r.forceRel < tolF;
             ok = ok && pass;
             std::printf("  %-6s %-36s max|du| %.2e  max|drho| %.2e  force rel %.2e  %s\n",

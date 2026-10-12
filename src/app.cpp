@@ -276,6 +276,7 @@ void App::rebuildSolver() {
         rtRatio_ = 0.f;
         rtDebt_ = 0;
         rtCheckAt_ = glfwGetTime() + 4.0;       // let the step budget settle first
+        rtCalibrateUntil_ = glfwGetTime() + 12.0;
         if (body_.length > 0) body_.span *= rtLength_ / body_.length;
         body_.length = rtLength_;
         body_.center = rtCenter_;
@@ -403,7 +404,26 @@ void App::fitView() {
     glm::vec2 plane = view_.axis == 2 ? glm::vec2(n.x, n.y) : view_.axis == 1 ? glm::vec2(n.x, n.z)
                                                                               : glm::vec2(n.z, n.y);
     view_.center = 0.5f * (plane - 1.f);
-    view_.cellsPerPixel = 1.04f * std::max(plane.x / std::max(viewportW_, 1.f), plane.y / std::max(viewportH_, 1.f));
+    const glm::vec2 fit = plane / glm::vec2(std::max(viewportW_, 1.f), std::max(viewportH_, 1.f));   // cells per pixel
+    view_.cellsPerPixel = 1.04f * std::max(fit.x, fit.y);
+    // A tunnel much flatter (or narrower) than the viewport, like the one
+    // real time fits around a car, would be a thin strip with most of the
+    // screen empty. Zoom in towards filling the short way, but keep 1.8 body
+    // lengths in view along the tunnel, the body a third of the way in with
+    // its wake behind it; panning shows the rest.
+    if (std::min(fit.x, fit.y) < 0.5f * std::max(fit.x, fit.y)) {
+        const int along = fit.x > fit.y ? 0 : 1;
+        const float longPx = along == 0 ? viewportW_ : viewportH_;
+        view_.cellsPerPixel = std::max(1.04f * std::min(fit.x, fit.y), 1.8f * body_.length / std::max(longPx, 1.f));
+        view_.cellsPerPixel = std::min(view_.cellsPerPixel, 1.04f * std::max(fit.x, fit.y));
+        const glm::vec3 c = body_.center;
+        const glm::vec2 body = view_.axis == 2 ? glm::vec2(c.x, c.y) : view_.axis == 1 ? glm::vec2(c.x, c.z)
+                                                                                      : glm::vec2(c.z, c.y);
+        const float visible = view_.cellsPerPixel * (along == 0 ? viewportW_ : viewportH_);
+        const bool downstream = view_.axis != 0 && along == 0;     // the long way is the flow direction
+        view_.center[along] = std::clamp(body[along] + (downstream ? visible / 6.f : 0.f), 0.5f * visible,
+                                         plane[along] - 0.5f * visible);
+    }
     view_.target = 0.5f * (n - 1.f);
     view_.distance = 1.4f * std::max({n.x, n.y, n.z});
     view_.yaw = -55.f; view_.pitch = 28.f;
@@ -426,6 +446,19 @@ void App::collectResults(Frame& f, uint32_t slot) {
     // Safety net: the collision caps |u| at 0.4, so a peak there (or a NaN)
     // means the run diverged. Restart rather than show a dead field.
     if (!std::isfinite(stats_.maxU) || stats_.maxU > 0.39f) {
+        // Report where (rare, so the full readback is affordable).
+        std::vector<float> rhoU;
+        solver_.probe(rhoU);
+        const auto& g = solver_.grid();
+        size_t worst = 0; double wu = -1;
+        for (size_t c = 0; c < solver_.cells(); ++c) {
+            const double v = std::hypot(rhoU[4 * c + 1], rhoU[4 * c + 2], rhoU[4 * c + 3]);
+            if (!std::isfinite(v)) { worst = c; break; }
+            if (v > wu) { wu = v; worst = c; }
+        }
+        std::fprintf(stderr, "flow diverged: |u| %.3f, rho %.3f at (%zu, %zu, %zu) of %u x %u x %u, body at (%.0f, %.0f, %.0f)\n",
+                     wu, rhoU[4 * worst], worst % g.nx, worst / g.nx % g.ny, worst / (size_t(g.nx) * g.ny),
+                     g.nx, g.ny, g.nz, body_.center.x, body_.center.y, body_.center.z);
         resetRequested_ = true;
         status_ = "The flow diverged and was restarted. Lower the lattice speed if it repeats.";
         statusUntil_ = glfwGetTime() + 8;
@@ -501,9 +534,14 @@ void App::frame() {
         steps = dt_ > 0 ? uint32_t(std::min(rtDebt_ / double(dt_), double(stepsPerFrame_))) : 0u;
         rtDebt_ = std::min(rtDebt_ - steps * double(dt_), 0.05);
         if (wall > 0) rtRatio_ = 0.9f * rtRatio_ + 0.1f * float(steps * double(dt_) / wall);
-        // Falling behind for a while: refit with fewer cells. The needed
-        // throughput scales as N^4, so N shrinks by the fourth root.
-        if (now > rtCheckAt_) {
+        // Falling behind while a new tunnel calibrates: the throughput the
+        // plan assumed was optimistic, so refit with fewer cells (the needed
+        // throughput scales as N^4: N shrinks by the fourth root). Only then:
+        // a refit rebuilds the tunnel, rescaling the model and restarting the
+        // flow, and later slowdowns are usually passing (3D view, dragging,
+        // another program on the GPU). Those show as a ratio below 1 instead.
+        const bool interacting = now - lastInput_ < 1.0;
+        if (now > rtCheckAt_ && now < rtCalibrateUntil_ && !interacting) {
             rtCheckAt_ = now + 3.0;
             if (rtRatio_ < 0.85f && rtRatio_ > 0.f) {
                 planRealtime(rtThroughput_ * rtRatio_ * 0.885);   // N shrinks by (ratio)^(1/4) x 0.97
@@ -655,7 +693,7 @@ void App::drawControls(float width, float height) {
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Air crosses the model at its actual speed: simulated time runs with the clock.\n"
                           "The tunnel is fitted around the body and the resolution set so the GPU keeps\n"
-                          "up; expect fewer cells than in the presets. Lattice speed rises to 0.1.");
+                          "up; expect fewer cells than in the presets. Size (cells) is set by the fit.");
 
     const bool bodyOpen = ImGui::CollapsingHeader("Body", ImGuiTreeNodeFlags_DefaultOpen);
     tag("Body");
@@ -701,8 +739,16 @@ void App::drawControls(float width, float height) {
         const auto& g = solver_.grid();
         const float maxLen = 0.9f * float(std::max({g.nx, g.ny, g.nz}));
         bool ch = false;
+        // In real time the size in cells is the resolution the GPU can keep
+        // up with, planned with the tunnel; a hand-set size was overwritten
+        // at the next refit, rescaling the model. Body length (m) scales it.
+        ImGui::BeginDisabled(realtime_);
         ch |= ImGui::SliderFloat("Size (cells)", &body_.length, 4.f, maxLen, "%.0f");
         tag("Size (cells)");
+        ImGui::EndDisabled();
+        if (realtime_ && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Set by real time: the finest resolution the GPU keeps up with.\n"
+                              "Body length (m) changes the model's real size.");
         if (body_.shape == Shape::Cylinder || body_.shape == Shape::Wing) {
             ch |= ImGui::SliderFloat("Span (cells)", &body_.span, 0.f, float(g.nz), body_.span <= 0 ? "full" : "%.0f");
             tag("Span (cells)");
@@ -943,6 +989,8 @@ void App::drawStats(float x, float width, float height) {
     if (realtime_) {
         const ImVec4 col = rtRatio_ >= 0.95f ? ImVec4(0.45f, 0.9f, 0.55f, 1) : ImVec4(1.f, 0.72f, 0.3f, 1);
         ImGui::TextColored(col, "Real time x%.2f, %.0f cells along the body", rtRatio_, rtLength_);
+        if (rtRatio_ < 0.9f && glfwGetTime() > rtCalibrateUntil_)
+            ImGui::TextColored(col, "Behind the clock: toggle Real time\noff and on to refit with fewer cells");
     }
 
     ImGui::Spacing();
@@ -995,6 +1043,8 @@ void App::drawStats(float x, float width, float height) {
                                  "represent; the LES eddy viscosity\ndominates, so results barely change",
                            formatSi(reSimulated_, "").c_str());
     if (reSimulated_ > 2e4) ImGui::TextColored(warn, "High Re: boundary layers are\nunresolved (no wall model); trust\ntrends and wakes, not absolute C_D");
+    if (road_) ImGui::TextColored(warn, "Road: gaps under the body thinner\nthan 4 cells (%s) are closed",
+                                  formatSi(4.0 * dx_, "m").c_str());
     if (mach_ > 0.3f) ImGui::TextColored(warn, "Mach %.2f: compressibility is not\nmodelled; results are incompressible", mach_);
     if (!props_.warning.empty()) ImGui::TextColored(warn, "Fluid: %s", props_.warning.c_str());
     if (blockage > 0.1) ImGui::TextColored(warn, "Blockage %.0f%%: tunnel walls\ninflate the forces", 100 * blockage);

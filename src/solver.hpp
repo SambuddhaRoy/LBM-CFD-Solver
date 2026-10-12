@@ -123,7 +123,7 @@ private:
     static constexpr uint32_t wgx_ = 32, wgy_ = 8;
 
     gpu::Kernel step_[2], stepForce_[2];      // [parity]
-    gpu::Kernel init_, classify_, wallmask_, probe_, stats_, reduce_;
+    gpu::Kernel init_, classify_, wallmask_, pinch_, probe_, stats_, reduce_;
     VkQueryPool queries_ = VK_NULL_HANDLE;
 };
 
