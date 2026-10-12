@@ -125,7 +125,12 @@ budget.
   distance field, so curved walls sit at their true sub-cell position.
 - **Tunnel:** equilibrium inlet (optional perturbation), far-field side faces
   or periodic, pressure outlet pinned at rho = 1.
-- **Forces:** momentum exchange summed inside the step kernel on demand.
+- **Forces:** momentum exchange summed inside the step kernel on demand,
+  in gauge pressure (shifted populations): identical for a body surrounded
+  by fluid, and the only correct choice for one standing on the road, whose
+  contact patches would otherwise leave the ambient pressure unbalanced
+  (about 67x the dynamic pressure in lattice units: tonnes of phantom
+  downforce).
   Coefficients use planform area (chord x span) for the wing and projected
   frontal area for every other body.
 - **Geometry:** voxelized on the GPU as a signed distance field. Analytic
@@ -187,6 +192,55 @@ the accuracy panel says when that drops below the 32 cells forces need.
   and the rest is interior. That seals gaps and gives sheets thickness, at
   the price of moving surfaces outward by 0.87 cells. `--mesh-info FILE`
   lists a model's parts and reports which path it takes.
+- **Road:** *Road (moving ground)* turns the tunnel floor into a road
+  moving at the wind speed, as under a real car, and stands the body on it.
+  A car's floor and diffuser make most of its downforce against the road, so
+  without it a car's lift is meaningless. The road is a halfway bounce-back
+  wall with the moving-wall term, left out of the body's force and frontal
+  area; with nothing on it the flow stays uniform to 2e-5 (`--validate car`).
+
+### Test bench: an F1 car (`--validate car --mesh FILE`)
+
+The AMR25 display model (5.61 m, 1.99 m wide) on the road, LES at the full
+Reynolds number, forces averaged over three car lengths of flow after four
+to develop. Teams do not publish downforce, so the references are estimates:
+for 2022-25 cars, downforce about the car's weight at 150 km/h and 3-4x it at
+top speed, quoted as 1,200 kg at 200 km/h to 3,200-3,600 kg at 300 km/h
+(C_L A about 5-8 m^2); independent CFD of a 2021 Williams with a moving
+ground and rotating wheels gives C_L A 5.6 and C_D A 1.83 m^2.
+
+| cells along the car | speed | downforce | drag | C_L A | C_D A |
+|---|---|---|---|---|---|
+| 140 (40 mm) | 252 km/h | 4 kg | 3,954 N | 0.01 | 1.32 |
+| 280 (20 mm) | 180 km/h | 12 kg | 1,676 N | 0.08 | 1.09 |
+| 280 (20 mm) | 252 km/h | 36 kg | 3,324 N | 0.12 | 1.11 |
+| 280 (20 mm) | 324 km/h | 48 kg | 5,455 N | 0.10 | 1.10 |
+| 374 (15 mm) | 252 km/h | 102 kg | 3,217 N | 0.33 | 1.07 |
+
+**Drag is in the published range (and settles as the grid refines); downforce
+is not: 102 kg at 252 km/h against roughly 2,000-2,500 kg, a factor of ~20.**
+Downforce grows with resolution (C_L A 0.01, 0.12, 0.33 at 40, 20, 15 mm) as
+the gaps under and between the parts open up, but nowhere near enough to
+close the gap. The suite's diagnostics say why. It maps the underside as voxelized: this
+model has venturi tunnels (150-210 mm channels beside an 83 mm plank) and a
+diffuser rising to 300 mm, but no floor beyond about 0.67 m from the centre
+line, where the real floor runs to about 0.8 m with edge fences that seal
+the tunnels. Its lift breakdown by position shows weak suction under the
+floor (-0.1 m^2 per tenth of the length, against a total of several m^2 on
+the real car) and positive pressure under the front wing. Behind that:
+
+- a display model, not the race car: no sealed floor edges, a static ride
+  height of 83 mm (racing is lower), shapes simplified;
+- shrink-wrapping thickens every surface by 0.87 cells (13-17 mm here),
+  which closes the slots between wing elements;
+- 15-20 mm cells against the 1-10 mm of team CFD, and no wall model, so
+  boundary layers are unresolved;
+- stationary wheels.
+
+So this benchmark does not validate downforce. It needs a CAD-accurate car,
+or first a ground-effect experiment with known geometry (an inverted wing
+over a moving belt) to separate the solver's share of the gap from the
+model's.
 
 ## Validation: is it physically accurate?
 
@@ -346,10 +400,12 @@ WindTunnel                      interactive wind tunnel
 WindTunnel --selftest           GPU solver vs CPU reference, all precisions
 WindTunnel --bench [--grid X Y Z] [--precision fp32|fp16s|fp16c|all] [--peak GBs]
 WindTunnel --validate [standard|laminar|turbulent|stability|all] [--precision P] [--diameter D]
+WindTunnel --validate car --mesh FILE [--diameter CELLS] [--speed M]   car on a moving road
+WindTunnel --ui-test DIR [--mesh FILE]   drive every control, check, screenshot each step
 WindTunnel --mesh-info FILE     list a model's parts, check it is watertight
 WindTunnel --capture out.png [frames]   run the app, save the window, exit
            --realtime   start in real-time mode
-           --speed M    wind speed, m/s     --flow auto|laminar|les
+           --speed M    wind speed, m/s     --flow auto|laminar|les     --road
            --mesh FILE --shape S --pitch DEG --view 2d|3d --field F --zoom X --preset N
 ```
 

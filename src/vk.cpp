@@ -57,9 +57,21 @@ std::vector<char> readFile(const std::filesystem::path& p) {
 void Context::init(GLFWwindow* window) {
     vkb::InstanceBuilder ib;
     ib.set_app_name("Wind Tunnel").require_api_version(1, 3, 0);
-#ifndef NDEBUG
-    ib.request_validation_layers(true).use_default_debug_messenger();
+#ifdef NDEBUG
+    const bool validate = std::getenv("WT_VALIDATION") != nullptr;
+#else
+    const bool validate = true;
 #endif
+    if (validate)
+        ib.request_validation_layers(true).set_debug_callback(
+            [](VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT,
+               const VkDebugUtilsMessengerCallbackDataEXT* d, void*) -> VkBool32 {
+                if (sev >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
+                    ++validationMessages;
+                    std::fprintf(stderr, "vulkan: %s\n", d->pMessage);
+                }
+                return VK_FALSE;
+            });
     if (!window) ib.set_headless(true);
     auto inst = ib.build();
     if (!inst) throw std::runtime_error("Vulkan instance: " + inst.error().message());

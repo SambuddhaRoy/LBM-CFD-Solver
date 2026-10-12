@@ -7,10 +7,12 @@
 #include "geometry.hpp"
 #include "render.hpp"
 #include "solver.hpp"
+#include "uitest.hpp"
 #include "vk.hpp"
 
 #include <array>
 #include <deque>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -42,9 +44,11 @@ struct StartSetup {
     float       zoom = 1.f;              // relative to the fitted view
     std::string meshPath;                // model to load at start
     bool        realtime = false;        // start in real-time mode
+    bool        road = false;            // moving ground under the body
     float       speed = 30.f;            // wind speed, m/s
     int         flowModel = 0;           // 0 auto, 1 laminar, 2 LES
     std::string capturePath;
+    std::string uiTestDir;               // run the GUI interaction test, screenshots here
     uint32_t    captureFrames = 300;
 };
 
@@ -53,6 +57,7 @@ public:
     int run(const StartSetup& setup);
 
 private:
+    friend struct UiTest;
     struct Frame {
         VkCommandPool   pool = VK_NULL_HANDLE;
         VkCommandBuffer cmd  = VK_NULL_HANDLE;
@@ -84,7 +89,8 @@ private:
     void handleKeys();
     void loadMeshFile(const std::string& path);
     void snapshot();
-    void saveCapture(uint32_t width, uint32_t height);
+    void saveCapture(const std::string& path, uint32_t width, uint32_t height);
+    void tag(const char* name) { if (uiTest_) uiTest_->place(name); }   // UI test: where a control is
 
     GLFWwindow*  window_ = nullptr;
     gpu::Context ctx_;
@@ -137,6 +143,11 @@ private:
     double    rtThroughput_ = 0;            // throughput the current fit assumed, LUPS
     void planRealtime(double throughput);
 
+    // Road: a moving ground (the tunnel floor runs at the wind speed, as the
+    // road does under a car); bodies stand on it.
+    bool      road_ = false;
+    void placeOnRoad();
+
     // Measurements.
     uint32_t stepsPerFrame_ = 4;
     double   stepsSmooth_ = 4;               // controller state behind stepsPerFrame_
@@ -158,6 +169,8 @@ private:
     uint64_t    captureSteps0_ = 0;       // steps and wall time at the half-way frame:
     double      captureWall0_ = 0;        // the capture reports the sustained rate since
     double      lastInput_ = -10;         // wall time of the last mouse / widget input
+    std::unique_ptr<UiTest> uiTest_;
+    uint64_t    rebuildCount_ = 0, resetCount_ = 0;   // for the UI test
     std::string status_;
     double statusUntil_ = 0;
 };

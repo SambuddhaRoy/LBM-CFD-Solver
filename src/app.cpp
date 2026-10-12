@@ -96,6 +96,7 @@ int App::run(const StartSetup& setup) {
     view_.field    = setup.field;
     startZoom_     = setup.zoom;
     speed_         = setup.speed;
+    road_          = setup.road;
     flowModel_     = setup.flowModel;
     initWindow();
     ctx_.init(window_);
@@ -120,7 +121,11 @@ int App::run(const StartSetup& setup) {
     geometry_.create(ctx_);
     renderer_.create(ctx_);
     rebuildSolver();
-    if (!setup.meshPath.empty()) loadMeshFile(setup.meshPath);
+    if (!setup.uiTestDir.empty()) {
+        // The test drops the model itself, part way through.
+        uiTest_ = std::make_unique<UiTest>(setup.uiTestDir);
+        uiTest_->buildScenario(setup.meshPath);
+    } else if (!setup.meshPath.empty()) loadMeshFile(setup.meshPath);
     if (setup.realtime) {
         // No throughput measured yet: plan with a typical figure; the pacing
         // check refits within a few seconds if it was optimistic.
@@ -150,7 +155,7 @@ int App::run(const StartSetup& setup) {
     ctx_.destroy();
     glfwDestroyWindow(window_);
     glfwTerminate();
-    return 0;
+    return uiTest_ ? uiTest_->result() : 0;
 }
 
 void App::initWindow() {
@@ -245,6 +250,7 @@ void App::initImGui() {
 
 void App::rebuildSolver() {
     vkDeviceWaitIdle(ctx_.device);
+    ++rebuildCount_;
     const GridConfig old = solver_.grid();
     const bool had = solver_.created();
     solver_.destroy();
@@ -295,6 +301,8 @@ void App::rebuildSolver() {
     // compressibility error. Measured in --validate stability, going all the
     // way to 0.15 moves C_D by 0.2-2%.
     solver_.flow.uIn = 0.1f;   // LES is decided in updateScaling()
+    solver_.flow.ground = road_;
+    placeOnRoad();
     for (auto& f : frames_) f.stepped = false;
     stepsSmooth_ = 1; stepsPerFrame_ = 1;   // re-measure on the new grid
     applyGeometry();
@@ -314,7 +322,8 @@ void App::planRealtime(double throughput) {
     bool through = false;
     const glm::vec3 e = geometry_.extent(body_, through);        // body lengths
     const float my = std::max(1.5f * e.y, 0.35f), mz = std::max(1.5f * e.z, 0.35f);
-    const glm::vec3 V(1.f + e.x + 3.f, e.y + 2.f * my, through ? 1.f : e.z + 2.f * mz);
+    // On the road the body needs clearance above only.
+    const glm::vec3 V(1.f + e.x + 3.f, e.y + (road_ ? 1.f : 2.f) * my, through ? 1.f : e.z + 2.f * mz);
     const double vol = double(V.x) * V.y * V.z;
     rtThroughput_ = throughput;
     const double uLat = 0.1, share = 0.75;      // leave a quarter of the GPU for rendering
@@ -327,7 +336,15 @@ void App::planRealtime(double throughput) {
     rtGrid_[1] = std::max(8u, uint32_t(std::ceil(V.y * n / 8.0)) * 8u);
     rtGrid_[2] = std::max(8u, uint32_t(std::ceil(V.z * n)));
     rtLength_ = float(n);
-    rtCenter_ = {float((1.0 + 0.5 * e.x) * n), 0.5f * float(rtGrid_[1]) + 0.25f, 0.5f * float(rtGrid_[2]) + 0.25f};
+    rtCenter_ = {float((1.0 + 0.5 * e.x) * n), road_ ? 0.5f + 0.5f * e.y * float(n) : 0.5f * float(rtGrid_[1]) + 0.25f,
+                 0.5f * float(rtGrid_[2]) + 0.25f};
+}
+
+// The body's lowest point on the road's wall plane, y = 1/2.
+void App::placeOnRoad() {
+    if (!road_) return;
+    bool through = false;
+    body_.center.y = 0.5f + 0.5f * geometry_.extent(body_, through).y * body_.length;
 }
 
 void App::applyGeometry() {
@@ -339,6 +356,7 @@ void App::applyGeometry() {
 
 void App::resetFlow() {
     vkDeviceWaitIdle(ctx_.device);
+    ++resetCount_;
     updateScaling();
     ctx_.submitNow([&](VkCommandBuffer cmd) { solver_.reset(cmd); });
     histResidual_.clear(); histCd_.clear(); histCl_.clear();
@@ -447,6 +465,7 @@ void App::frame() {
 
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplGlfw_NewFrame();
+    if (uiTest_) uiTest_->input(*this);
     ImGui::NewFrame();
     drawUi();
     handleKeys();
@@ -532,7 +551,9 @@ void App::frame() {
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
     vkCmdEndRendering(cmd);
 
-    const bool capture = !capturePath_.empty() && frameCount_ == captureFrames_;
+    std::string shot = !capturePath_.empty() && frameCount_ == captureFrames_ ? capturePath_ : std::string();
+    if (uiTest_ && !uiTest_->shotPath.empty()) { shot = uiTest_->shotPath; uiTest_->shotPath.clear(); }
+    const bool capture = !shot.empty();
     if (!capturePath_.empty() && frameCount_ == captureFrames_ / 2) {
         captureSteps0_ = solver_.t;
         captureWall0_ = glfwGetTime();
@@ -586,9 +607,10 @@ void App::frame() {
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) swapDirty_ = true;
     if (capture) {
         vkDeviceWaitIdle(ctx_.device);
-        saveCapture(swapExtent_.width, swapExtent_.height);
-        glfwSetWindowShouldClose(window_, GLFW_TRUE);
+        saveCapture(shot, swapExtent_.width, swapExtent_.height);
+        if (shot == capturePath_) glfwSetWindowShouldClose(window_, GLFW_TRUE);
     }
+    if (uiTest_) uiTest_->afterFrame(*this);
     ++frameCount_;
 }
 
@@ -613,9 +635,13 @@ void App::drawControls(float width, float height) {
     ImGui::TextDisabled("WIND TUNNEL v3");
     if (ImGui::Button(running_ ? "Pause (Space)" : "Run (Space)", {ImGui::GetContentRegionAvail().x * 0.5f - 4, 0}))
         running_ = !running_;
+    tag("Pause");
     ImGui::SameLine();
     if (ImGui::Button("Reset flow (R)", {-1, 0})) resetRequested_ = true;
-    if (ImGui::Checkbox("Real time", &realtime_)) {
+    tag("Reset flow");
+    const bool rtToggled = ImGui::Checkbox("Real time", &realtime_);
+    tag("Real time");
+    if (rtToggled) {
         if (realtime_) {
             savedGridIndex_ = gridIndex_;
             savedBody_ = body_;
@@ -631,10 +657,14 @@ void App::drawControls(float width, float height) {
                           "The tunnel is fitted around the body and the resolution set so the GPU keeps\n"
                           "up; expect fewer cells than in the presets. Lattice speed rises to 0.1.");
 
-    if (ImGui::CollapsingHeader("Body", ImGuiTreeNodeFlags_DefaultOpen)) {
+    const bool bodyOpen = ImGui::CollapsingHeader("Body", ImGuiTreeNodeFlags_DefaultOpen);
+    tag("Body");
+    if (bodyOpen) {
         const char* shapes[] = {"Sphere", "Cube", "Cylinder", "NACA 0012 wing", "Imported model"};
         int s = int(body_.shape);
-        if (ImGui::Combo("Shape", &s, shapes, 5)) {
+        const bool shapeChanged = ImGui::Combo("Shape", &s, shapes, 5);
+        tag("Shape");
+        if (shapeChanged) {
             if (Shape(s) == Shape::Mesh && !geometry_.hasMesh()) {
 #ifdef _WIN32
                 const std::string p = openModelDialog(window_);
@@ -645,6 +675,7 @@ void App::drawControls(float width, float height) {
 #endif
             } else {
                 body_.shape = Shape(s);
+                placeOnRoad();
                 geometryDirty_ = true;
                 if (realtime_) { planRealtime(rtThroughput_); rebuildRequested_ = true; }
                 // A different body is a new experiment. Keeping the old flow
@@ -671,25 +702,53 @@ void App::drawControls(float width, float height) {
         const float maxLen = 0.9f * float(std::max({g.nx, g.ny, g.nz}));
         bool ch = false;
         ch |= ImGui::SliderFloat("Size (cells)", &body_.length, 4.f, maxLen, "%.0f");
-        if (body_.shape == Shape::Cylinder || body_.shape == Shape::Wing)
+        tag("Size (cells)");
+        if (body_.shape == Shape::Cylinder || body_.shape == Shape::Wing) {
             ch |= ImGui::SliderFloat("Span (cells)", &body_.span, 0.f, float(g.nz), body_.span <= 0 ? "full" : "%.0f");
+            tag("Span (cells)");
+        }
         ch |= ImGui::SliderFloat("Pitch", &body_.pitch, -90.f, 90.f, "%.1f deg");
+        tag("Pitch");
         ch |= ImGui::SliderFloat("Yaw", &body_.yaw, -180.f, 180.f, "%.1f deg");
+        tag("Yaw");
         ch |= ImGui::SliderFloat("Roll", &body_.roll, -180.f, 180.f, "%.1f deg");
+        tag("Roll");
         ch |= ImGui::SliderFloat("Position x", &body_.center.x, 0.f, float(g.nx), "%.0f");
+        tag("Position x");
+        ImGui::BeginDisabled(road_);
         ch |= ImGui::SliderFloat("Position y", &body_.center.y, 0.f, float(g.ny), "%.0f");
+        tag("Position y");
+        ImGui::EndDisabled();
         ch |= ImGui::SliderFloat("Position z", &body_.center.z, 0.f, float(g.nz), "%.0f");
+        tag("Position z");
         if (ImGui::Button("Zero angles", {-1, 0})) { body_.pitch = body_.yaw = body_.roll = 0; ch = true; }
+        tag("Zero angles");
+        if (ImGui::Checkbox("Road (moving ground)", &road_)) {
+            solver_.flow.ground = road_;
+            if (realtime_) { planRealtime(rtThroughput_); rebuildRequested_ = true; }
+            ch = true;
+            resetRequested_ = true;
+        }
+        tag("Road");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The tunnel floor becomes a road moving at the wind speed, as under a real car,\n"
+                              "and the body stands on it. Needed for ground effect: a car's floor and\n"
+                              "diffuser make most of its downforce against the road.");
+        if (ch) placeOnRoad();      // size and angles change the lowest point
         // The geometry is re-voxelized on the GPU while the flow keeps
         // running, so rotating the body visibly reorganises the wake.
         geometryDirty_ |= ch;
     }
 
-    if (ImGui::CollapsingHeader("Flow", ImGuiTreeNodeFlags_DefaultOpen)) {
+    const bool flowOpen = ImGui::CollapsingHeader("Flow", ImGuiTreeNodeFlags_DefaultOpen);
+    tag("Flow");
+    if (flowOpen) {
         bool ch = false;
         int kind = int(ambient_.kind);
         const char* kinds[] = {"Air", "Water", "Carbon dioxide"};
-        if (ImGui::Combo("Fluid", &kind, kinds, 3)) {
+        const bool fluidChanged = ImGui::Combo("Fluid", &kind, kinds, 3);
+        tag("Fluid");
+        if (fluidChanged) {
             ambient_ = {FluidKind(kind), 293.15, 101325.0};
             ch = true;
         }
@@ -702,15 +761,19 @@ void App::drawControls(float width, float height) {
             ambient_.T = double(tC) + 273.15;
             ch = true;
         }
+        tag("Temperature");
         float pKpa = float(ambient_.p / 1000.0);
         if (ImGui::SliderFloat("Pressure", &pKpa, 0.1f, 10000.f, "%.2f kPa", ImGuiSliderFlags_Logarithmic)) {
             ambient_.p = double(pKpa) * 1000.0;
             ch = true;
         }
-        if (ambient_.kind == FluidKind::Air &&
-            ImGui::SliderFloat("ISA altitude", &altitude_, 0.f, 20000.f, "%.0f m")) {
-            standardAtmosphere(altitude_, ambient_.T, ambient_.p);
-            ch = true;
+        tag("Pressure");
+        if (ambient_.kind == FluidKind::Air) {
+            if (ImGui::SliderFloat("ISA altitude", &altitude_, 0.f, 20000.f, "%.0f m")) {
+                standardAtmosphere(altitude_, ambient_.T, ambient_.p);
+                ch = true;
+            }
+            tag("ISA altitude");
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("International Standard Atmosphere: sets temperature and pressure\n"
@@ -718,12 +781,15 @@ void App::drawControls(float width, float height) {
         if (ImGui::Button("Sea level", {ImGui::GetContentRegionAvail().x / 3 - 4, 0})) {
             ambient_ = {FluidKind::Air, 288.15, 101325.0}; altitude_ = 0; ch = true;
         }
+        tag("Sea level");
         ImGui::SameLine();
         if (ImGui::Button("Mars", {ImGui::GetContentRegionAvail().x / 2 - 4, 0})) {
             ambient_ = {FluidKind::CO2, 210.0, 610.0}; ch = true;   // mean surface conditions
         }
+        tag("Mars");
         ImGui::SameLine();
         if (ImGui::Button("Water", {-1, 0})) { ambient_ = {FluidKind::Water, 293.15, 101325.0}; ch = true; }
+        tag("Water");
         ImGui::TextDisabled("rho %.4g kg/m3   mu %.3g Pa s\nnu %.3g m2/s   c %.0f m/s",
                             props_.rho, props_.mu, props_.nu, props_.sound);
         // In real time the step rate depends on speed and length, so the
@@ -731,10 +797,13 @@ void App::drawControls(float width, float height) {
         bool refit = false;
         ch |= ImGui::SliderFloat("Wind speed", &speed_, 0.5f, 340.f, "%.1f m/s", ImGuiSliderFlags_Logarithmic);
         refit |= ImGui::IsItemDeactivatedAfterEdit();
+        tag("Wind speed");
         ch |= ImGui::SliderFloat("Body length", &length_, 0.005f, 50.f, "%.3f m", ImGuiSliderFlags_Logarithmic);
         refit |= ImGui::IsItemDeactivatedAfterEdit();
+        tag("Body length");
         ImGui::BeginDisabled(realtime_);
         ch |= ImGui::SliderFloat("Lattice speed", &solver_.flow.uIn, 0.02f, 0.15f, "%.3f");
+        tag("Lattice speed");
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Inlet speed in lattice units. Higher develops the flow faster per step;\n"
@@ -752,6 +821,7 @@ void App::drawControls(float width, float height) {
         }
         const char* models[] = {"Auto", "Laminar (resolved)", "Turbulent (LES)"};
         if (ImGui::Combo("Flow model", &flowModel_, models, 3)) updateScaling();
+        tag("Flow model");
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Laminar: the Navier-Stokes equations are solved directly, no turbulence model,\n"
                               "up to Re %.0f, the most this grid resolves; above it the run would diverge,\n"
@@ -761,13 +831,17 @@ void App::drawControls(float width, float height) {
                               "resolving the smallest eddies.", reResolved_, reResolved_);
         ImGui::TextDisabled("Now: %s", solver_.flow.smagorinsky > 0 ? "turbulent, LES on" : "laminar, resolved");
         ImGui::Checkbox("Interpolated walls", &solver_.flow.bouzidi);
+        tag("Interpolated walls");
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Bouzidi bounce-back: the wall sits at its true sub-cell position\n"
                               "instead of on the voxel staircase.");
         ImGui::SliderFloat("Inlet turbulence", &solver_.flow.turbulence, 0.f, 0.1f, "%.3f");
+        tag("Inlet turbulence");
     }
 
-    if (ImGui::CollapsingHeader("Grid", ImGuiTreeNodeFlags_DefaultOpen)) {
+    const bool gridOpen = ImGui::CollapsingHeader("Grid", ImGuiTreeNodeFlags_DefaultOpen);
+    tag("Grid");
+    if (gridOpen) {
         auto label = [&](int i) {
             const auto& p = kGrids[i];
             const double cells = double(p.nx) * p.ny * p.nz;
@@ -780,6 +854,7 @@ void App::drawControls(float width, float height) {
             ImGui::TextDisabled("Fitted for real time: %u x %u x %u (%.1fM)", rtGrid_[0], rtGrid_[1], rtGrid_[2],
                                 double(rtGrid_[0]) * rtGrid_[1] * rtGrid_[2] / 1e6);
         else if (ImGui::BeginCombo("Cells", label(gridIndex_))) {
+            tag("Cells");
             for (int i = 0; i < int(std::size(kGrids)); ++i) {
                 const double need = double(kGrids[i].nx) * kGrids[i].ny * kGrids[i].nz * bytesPerCell(precision_);
                 const bool fits = need < 0.92 * double(ctx_.vramBytes);
@@ -789,10 +864,11 @@ void App::drawControls(float width, float height) {
                 }
             }
             ImGui::EndCombo();
-        }
+        } else tag("Cells");
         const char* precs[] = {"FP32", "FP16S", "FP16C"};
         int p = int(precision_);
         if (ImGui::Combo("Storage", &p, precs, 3)) { precision_ = Precision(p); rebuildRequested_ = true; }
+        tag("Storage");
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Memory format of the distribution functions; arithmetic is always FP32.\n"
                               "FP16C halves memory and roughly doubles speed. Against FP32 it moves bluff-body\n"
@@ -800,17 +876,20 @@ void App::drawControls(float width, float height) {
                               "low viscosity come out 2-6%% thinner: use FP32 for skin friction.");
     }
 
-    if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::RadioButton("2D slice", &view_.mode3d, 0); ImGui::SameLine();
-        ImGui::RadioButton("3D (V)", &view_.mode3d, 1);
+    const bool viewOpen = ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen);
+    tag("View");
+    if (viewOpen) {
+        ImGui::RadioButton("2D slice", &view_.mode3d, 0); tag("2D slice"); ImGui::SameLine();
+        ImGui::RadioButton("3D (V)", &view_.mode3d, 1); tag("3D (V)");
         const char* fields[] = {"Velocity", "Pressure", "Vorticity", "Q-criterion"};
         int fi = int(view_.field);
         if (ImGui::Combo("Field (1-4)", &fi, fields, 4)) view_.field = Field(fi);
+        tag("Field");
         const int oldAxis = view_.axis;
         ImGui::Text("Slice normal"); ImGui::SameLine();
-        ImGui::RadioButton("X", &view_.axis, 0); ImGui::SameLine();
-        ImGui::RadioButton("Y", &view_.axis, 1); ImGui::SameLine();
-        ImGui::RadioButton("Z", &view_.axis, 2);
+        ImGui::RadioButton("X", &view_.axis, 0); tag("X"); ImGui::SameLine();
+        ImGui::RadioButton("Y", &view_.axis, 1); tag("Y"); ImGui::SameLine();
+        ImGui::RadioButton("Z", &view_.axis, 2); tag("Z");
         const auto& g = solver_.grid();
         const float axisLen = float(view_.axis == 0 ? g.nx : view_.axis == 1 ? g.ny : g.nz);
         if (view_.axis != oldAxis) {
@@ -818,14 +897,27 @@ void App::drawControls(float width, float height) {
             fitView();
         }
         ImGui::SliderFloat("Slice ([ ])", &view_.slice, 0.f, axisLen - 1.f, "%.1f");
+        tag("Slice");
         ImGui::Checkbox("Auto colour range", &autoRange_);
-        if (autoRange_) ImGui::SliderFloat("Range scale", &rangeScale_, 0.05f, 20.f, "%.2fx", ImGuiSliderFlags_Logarithmic);
-        else { ImGui::DragFloat("Low", &view_.lo, 1e-4f, 0, 0, "%.5f"); ImGui::DragFloat("High", &view_.hi, 1e-4f, 0, 0, "%.5f"); }
+        tag("Auto colour range");
+        if (autoRange_) {
+            ImGui::SliderFloat("Range scale", &rangeScale_, 0.05f, 20.f, "%.2fx", ImGuiSliderFlags_Logarithmic);
+            tag("Range scale");
+        } else {
+            ImGui::DragFloat("Low", &view_.lo, 1e-4f, 0, 0, "%.5f"); tag("Low");
+            ImGui::DragFloat("High", &view_.hi, 1e-4f, 0, 0, "%.5f"); tag("High");
+        }
         ImGui::Checkbox("Show lattice when zoomed", &view_.grid);
-        if (view_.field == Field::Pressure) ImGui::Checkbox("Absolute pressure", &absolutePressure_);
+        tag("Show lattice when zoomed");
+        if (view_.field == Field::Pressure) {
+            ImGui::Checkbox("Absolute pressure", &absolutePressure_);
+            tag("Absolute pressure");
+        }
         if (ImGui::Button("Fit view (H)", {ImGui::GetContentRegionAvail().x * 0.5f - 4, 0})) fitView();
+        tag("Fit view");
         ImGui::SameLine();
         if (ImGui::Button("Snapshot (S)", {-1, 0})) snapshot();
+        tag("Snapshot");
     }
     ImGui::PopItemWidth();
 
@@ -946,6 +1038,7 @@ void App::drawViewport(float x, float width, float height) {
         ImGui::Image(ImTextureRef(ImTextureID(renderer_.texture(slot))), avail);
     else
         ImGui::Dummy(avail);
+    tag("Viewport");
     handleViewportInput(avail.x, avail.y);
 
     // Colour range in lattice units, from the inlet speed and body size.
@@ -1084,19 +1177,21 @@ void App::loadMeshFile(const std::string& path) {
     if (realtime_) { planRealtime(rtThroughput_); rebuildRequested_ = true; }
     body_.shape = Shape::Mesh;
     body_.pitch = body_.yaw = body_.roll = 0;
+    placeOnRoad();
     geometryDirty_ = true;
     resetRequested_ = true;     // new body: start from a clean flow (see the shape combo)
     status_ = "Loaded " + meshName_;
     statusUntil_ = glfwGetTime() + 4;
 }
 
-void App::saveCapture(uint32_t width, uint32_t height) {
+void App::saveCapture(const std::string& path, uint32_t width, uint32_t height) {
     vmaInvalidateAllocation(ctx_.vma, captureBuf_.alloc, 0, VK_WHOLE_SIZE);
     std::vector<uint8_t> px(size_t(width) * height * 4);
     std::memcpy(px.data(), captureBuf_.map, px.size());
     for (size_t i = 0; i < px.size(); i += 4) std::swap(px[i], px[i + 2]);   // BGRA -> RGBA
-    const bool ok = stbi_write_png(capturePath_.c_str(), int(width), int(height), 4, px.data(), int(width) * 4) != 0;
-    std::printf("%s %s (%u x %u)\n", ok ? "captured" : "capture failed:", capturePath_.c_str(), width, height);
+    const bool ok = stbi_write_png(path.c_str(), int(width), int(height), 4, px.data(), int(width) * 4) != 0;
+    if (uiTest_) return;
+    std::printf("%s %s (%u x %u)\n", ok ? "captured" : "capture failed:", path.c_str(), width, height);
     const double wall = glfwGetTime() - captureWall0_;
     if (wall > 0 && solver_.t > captureSteps0_)
         std::printf("sustained %.0f MLUPS over the second half, rendering included (%.0f steps/s, %.0f FPS)\n",

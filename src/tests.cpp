@@ -152,7 +152,7 @@ public:
                 for (int q = 1; q < 19; ++q) {
                     if (!wallIn[q]) continue;
                     const int d = OPP[q];
-                    const double m = f[q] + out[d] + 2*WQ[d];
+                    const double m = f[q] + out[d];     // shifted: gauge pressure (see stream.glsl)
                     force.x += CX[d]*m; force.y += CY[d]*m; force.z += CZ[d]*m;
                 }
             }

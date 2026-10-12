@@ -34,6 +34,7 @@ struct FlowParams {
     float turbulence  = 0.f;       // inlet perturbation, fraction of the inlet speed
     float uIn         = 0.08f;     // inlet speed along +x, lattice units
     bool  bouzidi     = true;      // interpolated walls (else halfway bounce-back)
+    bool  ground      = false;     // moving road at y = 0, wall at y = 1/2 (apply geometry after changing)
 };
 
 struct Stats {

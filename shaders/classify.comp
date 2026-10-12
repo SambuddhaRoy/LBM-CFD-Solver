@@ -9,7 +9,8 @@
 // covered needs nothing: neighbours bounce back off the slots they wrote.
 //
 // pc.faces: bit 0 = Y faces are far field, bit 1 = Z faces (else periodic),
-// bit 2 = X periodic (no inlet / outlet; used by test flows).
+// bit 2 = X periodic (no inlet / outlet; used by test flows), bit 3 = moving
+// ground: the row y = 0 is a solid road (see streamIn in stream.glsl).
 #include "lattice.glsl"
 layout(local_size_x = 256) in;
 
@@ -31,7 +32,8 @@ void main() {
     if ((pc.faces & 2u) != 0u && (p.z == 0u || p.z + 1u == pc.Nz)) face = FLAG_EQ;
 
     const bool wasSolid = (uint(flags[n]) & FLAG_SOLID) != 0u;
-    const bool solid = face == 0u && float(sdf[n]) < 0.0;
+    const bool road = (pc.faces & 8u) != 0u && p.y == 0u;
+    const bool solid = road || (face == 0u && float(sdf[n]) < 0.0);
 
     if (wasSolid && !solid) {
         float f[19];

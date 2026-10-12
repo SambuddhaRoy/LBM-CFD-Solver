@@ -30,6 +30,7 @@ add_executable(WindTunnel
     src/tests.cpp
     src/validate.cpp
     src/fluid.cpp
+    src/uitest.cpp
 )
 target_link_libraries(WindTunnel PRIVATE
     Vulkan::Vulkan glfw imgui::imgui assimp::assimp glm::glm

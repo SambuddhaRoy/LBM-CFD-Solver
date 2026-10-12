@@ -50,7 +50,12 @@ void addPop(inout Moments m, uint q, float f) {
 // Streams in the populations arriving at fluid cell b.n one opposite pair at
 // a time and folds them into raw moments, so no 19-entry array is ever live.
 // `fin` collects the incoming half of the momentum exchange on wall links.
-Moments streamIn(const Nbr b, bool odd, uint solid, inout vec3 fin) {
+//
+// `road`: this cell is in the first row above a moving ground (the solid row
+// y = 0, wall halfway at y = 1/2, moving at the inlet velocity like a road
+// under a car). Its links into the road bounce back with the moving-wall
+// term 6 w_q (c_q . u_road) and are left out of the body's force.
+Moments streamIn(const Nbr b, bool odd, uint solid, bool road, inout vec3 fin) {
     Moments m;
     m.rhom1 = 0.0; m.mom = vec3(0.0);
     m.sxx = 0.0; m.syy = 0.0; m.szz = 0.0; m.sxy = 0.0; m.syz = 0.0; m.sxz = 0.0;
@@ -65,6 +70,10 @@ Moments streamIn(const Nbr b, bool odd, uint solid, inout vec3 fin) {
         // runtime.
         float a = sm ? ddfLoad(slotOwn(i, !odd), b.n)      : ddfLoad(slotOwn(i, odd), b.n);
         float c = sp ? ddfLoad(slotNbr(i, !odd), nb(b, i)) : ddfLoad(slotNbr(i, odd), nb(b, i));
+        // a arrives along c_i from n - c_i, c along -c_i from n + c_i: below
+        // this cell when c_i points up, respectively down.
+        const bool rA = sm && road && C[i].y > 0;
+        const bool rC = sp && road && C[i].y < 0;
 
         // Bouzidi with the wall closer than halfway (q < 1/2): interpolate
         // the bounced value with the population that arrived from the
@@ -72,7 +81,7 @@ Moments streamIn(const Nbr b, bool odd, uint solid, inout vec3 fin) {
         // cell's post-collision values, so step.comp applies it at store
         // time; that split is what keeps interpolated walls race-free under
         // in-place streaming. A one-cell gap (both sides solid) is halfway.
-        if (sm != sp && pc.bouzidi != 0.0) {
+        if (sm != sp && pc.bouzidi != 0.0 && !rA && !rC) {
             const float a0 = a, c0 = c;
             if (sp) {
                 const float q = linkQ(b.n, nb(b, i));
@@ -84,9 +93,16 @@ Moments streamIn(const Nbr b, bool odd, uint solid, inout vec3 fin) {
         }
         // Incoming half of the momentum exchange: for a population that came
         // back off a wall along c_q the wall-bound direction is -c_q, so its
-        // share c_out * f_in is -c_q (f_q + w_q) (unshifted).
-        if (sm) fin -= vec3(C[i])      * (a + W[i]);
-        if (sp) fin -= vec3(C[i + 1u]) * (c + W[i]);
+        // share c_out * f_in is -c_q f_q. Shifted populations (f - w) are
+        // used, which takes out the ambient pressure: on a closed body it
+        // sums to zero anyway, but a body standing on the road has no fluid
+        // under its contact patches, and the ambient pressure (rho/3, ~67x
+        // the dynamic pressure at u = 0.1) on the rest of it would read as
+        // tonnes of downforce.
+        if (rA) a += 6.0 * W[i] * dot(vec3(C[i]), pc.uin.xyz);
+        if (rC) c += 6.0 * W[i] * dot(vec3(C[i + 1u]), pc.uin.xyz);
+        if (sm && !rA) fin -= vec3(C[i])      * a;
+        if (sp && !rC) fin -= vec3(C[i + 1u]) * c;
         addPop(m, i, a);
         addPop(m, i + 1u, c);
     }

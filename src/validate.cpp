@@ -343,8 +343,11 @@ void uploadSdf(gpu::Context& ctx, Solver& s, const std::function<double(double, 
 }
 
 void advance(gpu::Context& ctx, Solver& s, uint32_t steps) {
-    for (uint32_t done = 0; done < steps; done += 2000)
-        ctx.submitNow([&](VkCommandBuffer cmd) { s.recordSteps(cmd, std::min(2000u, steps - done), false, false); });
+    // At most ~0.5 s of GPU work per submission: Windows resets a GPU that
+    // stays busy on one submission for a few seconds.
+    const uint32_t chunk = uint32_t(std::clamp<uint64_t>(4'000'000'000ull / s.cells(), 1, 2000));
+    for (uint32_t done = 0; done < steps; done += chunk)
+        ctx.submitNow([&](VkCommandBuffer cmd) { s.recordSteps(cmd, std::min(chunk, steps - done), false, false); });
 }
 
 double slope(const std::vector<double>& x, const std::vector<double>& v) {
@@ -748,9 +751,205 @@ void stabilitySuite(gpu::Context& ctx, Precision prec, bool& ok) {
     geo.destroy();
 }
 
+// A car on a moving road. First the road alone: with the road moving at the
+// wind speed, uniform flow is the exact solution, so any shear the road
+// introduces (wrong sign or size of the moving-wall term) shows up as a
+// departure from it. Then the model at three speeds, fitted tunnel, LES at
+// the requested Re, forces averaged once the wake has developed.
+//
+// Published references for 2022-25 ground-effect F1 cars are estimates (teams
+// do not publish downforce): downforce ~ the car's weight (~800 kg) at
+// 150 km/h, 3-4x it at top speed, quoted 1,200 kg at 200 km/h to 3,200-3,600 kg
+// at 300 km/h, i.e. C_L A ~ 5-8 m^2; independent CFD of a 2021 Williams
+// (10 mm mesh, moving ground, rotating wheels) gives C_L A 5.6, C_D A 1.83 m^2.
+void carSuite(gpu::Context& ctx, Precision prec, const std::string& mesh, float cells, float speed, bool& ok) {
+    std::printf("\n  ROAD: empty tunnel, moving ground at the inlet speed, LES at tau - 1/2 = 3e-6, 8000 steps\n");
+    {
+        GridConfig g;
+        g.nx = 256; g.ny = 64; g.nz = 64; g.precision = prec;
+        Solver s;
+        s.create(ctx, g);
+        s.flow.uIn = 0.1f; s.flow.tau = 0.500003f; s.flow.smagorinsky = 0.12f; s.flow.ground = true;
+        uploadSdf(ctx, s, [](double, double, double) { return 8.0; });
+        advance(ctx, s, 8000);
+        std::vector<float> rhoU;
+        s.probe(rhoU);
+        double worst = 0;
+        for (uint32_t z = 0; z < g.nz; ++z)
+            for (uint32_t y = 1; y < g.ny; ++y)            // y = 0 is the road
+                for (uint32_t x = 0; x < g.nx; ++x) {
+                    const float* v = &rhoU[((size_t(z) * g.ny + y) * g.nx + x) * 4];
+                    worst = std::max({worst, std::abs(double(v[1]) - 0.1), std::abs(double(v[2])),
+                                      std::abs(double(v[3]))});
+                }
+        const bool pass = worst < 1e-4;
+        ok = ok && pass;
+        std::printf("  largest departure from uniform flow: %.2e of the inlet speed  %s\n", worst / 0.1,
+                    pass ? "PASS" : "FAIL");
+        s.destroy();
+    }
+    if (mesh.empty()) { std::printf("  (no --mesh given: car runs skipped)\n"); return; }
+
+    std::vector<Triangle> tris; std::string err; MeshReport rep;
+    if (!loadMesh(mesh, tris, err, &rep)) {
+        std::printf("  cannot load %s: %s\n", mesh.c_str(), err.c_str());
+        ok = false;
+        return;
+    }
+    const double L = rep.metres ? rep.extent : 5.6;     // m, the model's longest extent
+    Geometry geo;
+    geo.create(ctx);
+    geo.setMesh(std::move(tris), rep.watertight());
+    Body b;
+    b.shape = Shape::Mesh;
+    b.length = cells;
+    bool through = false;
+    const glm::vec3 e = geo.extent(b, through);          // body lengths
+    // Tunnel: 1 L ahead of the nose, 2 L behind the tail, 4x the car's height
+    // and width (blockage ~5%). The road is the bottom face; the tyres sit on
+    // its wall plane, y = 1/2.
+    GridConfig g;
+    g.nx = uint32_t(std::ceil((3.f + e.x) * cells / 32.f)) * 32u;
+    g.ny = uint32_t(std::ceil(4.f * e.y * cells / 8.f)) * 8u;
+    g.nz = uint32_t(std::ceil(4.f * e.z * cells));
+    g.precision = prec;
+    b.center = {(1.f + 0.5f * e.x) * cells, 0.5f + 0.5f * e.y * cells, 0.5f * float(g.nz) + 0.25f};
+    const double dx = L / cells, u = 0.1;
+    std::printf("\n  F1 CAR: %s, %.3f m long, %.0f cells along it (dx = %.1f mm)\n", mesh.c_str(), L, cells, 1e3 * dx);
+    std::printf("  tunnel %u x %u x %u (%.0fM cells, %.1f x %.1f x %.1f m), moving road, %s, LES\n", g.nx, g.ny, g.nz,
+                double(g.nx) * g.ny * g.nz / 1e6, g.nx * dx, g.ny * dx, g.nz * dx, precisionName(prec));
+    std::printf("  model %s; wheels stationary (not rotating)\n",
+                rep.watertight() ? "watertight" : "not watertight: shrink-wrapped, surfaces offset 0.87 cells");
+
+    Solver s;
+    s.create(ctx, g);
+    s.flow.uIn = float(u);
+    s.flow.ground = true;
+    geo.apply(s, b);
+    const double frontal = geo.frontalCells() * dx * dx;
+    std::printf("  frontal area %.2f m^2 (as voxelized), blockage %.1f%%\n", frontal,
+                100.0 * geo.frontalCells() / (double(g.ny) * g.nz));
+    {
+        // Air gap under the car on its centre line, as voxelized: the floor
+        // only works if air can get under it.
+        std::vector<uint8_t> fl(s.cells());
+        ctx.download(s.flags(), fl.data(), fl.size());
+        std::printf("  air gap under the centre line (road to bodywork), as voxelized:");
+        for (const float f : {0.2f, 0.35f, 0.5f, 0.65f, 0.8f}) {
+            const uint32_t x = uint32_t(b.center.x + (f - 0.5f) * e.x * cells), z = uint32_t(b.center.z);
+            uint32_t y = 1;
+            while (y < g.ny && !(fl[(size_t(z) * g.ny + y) * g.nx + x] & 1u)) ++y;
+            std::printf("  %.0f mm", y >= g.ny ? -1.0 : (y - 0.5) * dx * 1e3);
+        }
+        std::printf("\n  (nose to tail at 20, 35, 50, 65, 80%% of the length; -1 = open to the sky)\n");
+        // Underside map: height of the lowest bodywork above the road, mm,
+        // across the width (columns) along the length (rows). Venturi
+        // tunnels show as high channels either side of the centre, a
+        // diffuser as heights rising towards the tail.
+        std::printf("  underside height (mm) across the width, left to right:\n");
+        for (int r = 0; r <= 20; ++r) {
+            const float f = r / 20.f;
+            const uint32_t x = std::min(g.nx - 1, uint32_t(b.center.x + (f - 0.5f) * e.x * cells));
+            std::printf("  %3.0f%%  ", 100 * f);
+            for (int c = -6; c <= 6; ++c) {
+                const uint32_t z = uint32_t(b.center.z + c / 6.f * 0.5f * e.z * cells);
+                uint32_t y = 1;
+                while (y < g.ny / 2 && !(fl[(size_t(z) * g.ny + y) * g.nx + x] & 1u)) ++y;
+                if (y >= g.ny / 2) std::printf("    .");
+                else std::printf(" %4.0f", (y - 0.5) * dx * 1e3);
+            }
+            std::printf("\n");
+        }
+        std::printf("\n");
+        std::fflush(stdout);
+    }
+    std::printf("  speed        Re        downforce     drag      C_L A    C_D A    L/D    spread   time\n");
+    const Properties air = properties(Ambient{});
+    const std::vector<double> speeds = speed > 0 ? std::vector<double>{speed} : std::vector<double>{50.0, 70.0, 90.0};
+    for (const double U : speeds) {
+        const auto start = std::chrono::steady_clock::now();
+        const double re = U * L / air.nu;
+        const FlowScaling sc = scaleFlow(re, cells, float(u), 0);
+        s.flow.tau = sc.tau;
+        s.flow.smagorinsky = sc.smagorinsky;
+        ctx.submitNow([&](VkCommandBuffer cmd) { s.reset(cmd); });
+        // 4 car lengths of flow to develop, then average over 3.
+        const uint32_t warm = uint32_t(4.0 * cells / u), window = uint32_t(3.0 * cells / u);
+        const uint32_t every = uint32_t(std::clamp<uint64_t>(4'000'000'000ull / s.cells(), 10, 100));  // see advance()
+        const ForceHistory h = run(ctx, s, warm, window, every, 0.f);
+        double fx = 0, fy = 0;
+        for (size_t k = 0; k < h.drag.size(); ++k) { fx += h.drag[k]; fy += h.lift[k]; }
+        fx /= double(h.drag.size()); fy /= double(h.drag.size());
+        // Spread: the two halves of the window against each other.
+        const size_t half = h.lift.size() / 2;
+        double a = 0, c = 0;
+        for (size_t k = 0; k < half; ++k) a += h.lift[k];
+        for (size_t k = half; k < h.lift.size(); ++k) c += h.lift[k];
+        a /= double(half); c /= double(h.lift.size() - half);
+        const double toArea = dx * dx / (0.5 * u * u);              // lattice force -> coefficient x area, m^2
+        const double cla = -fy * toArea, cda = fx * toArea;
+        const double q = 0.5 * air.rho * U * U;
+        const bool finite = std::isfinite(cla) && std::isfinite(cda);
+        ok = ok && finite;
+        std::printf("  %3.0f km/h  %8.2e   %6.0f kg   %6.0f N   %5.2f    %5.2f   %5.2f   %4.1f%%   %4.0f s\n",
+                    U * 3.6, double(sc.reSimulated), cla * q / 9.80665, cda * q, cla, cda, cla / cda,
+                    100.0 * std::abs(a - c) / std::max(std::abs(fy), 1e-12),
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+    }
+    if (double(s.cells()) * (bytesPerCell(prec) + 16) < 0.9 * double(ctx.vramBytes)) {   // probe needs 16 B/cell
+        // Where the lift comes from (last speed): the pressure part of the
+        // momentum exchange, sum of 2 w_q c_q (rho - 1) over the links from
+        // fluid into the car, binned by position along it and split into
+        // the car's lower surfaces (links pointing up into it: floor, wing
+        // undersides) and upper ones. Averaged over 5 snapshots.
+        std::vector<uint8_t> fl(s.cells());
+        ctx.download(s.flags(), fl.data(), fl.size());
+        const int bins = 10;
+        std::vector<double> lower(bins + 2, 0.0), upper(bins + 2, 0.0);
+        const double x0 = b.center.x - 0.5 * e.x * cells, len = e.x * cells;
+        std::vector<float> rhoU;
+        for (int snap = 0; snap < 5; ++snap) {
+            advance(ctx, s, uint32_t(0.2 * cells / u));
+            s.probe(rhoU);
+            for (uint32_t z = 1; z + 1 < g.nz; ++z)
+                for (uint32_t y = 1; y + 1 < g.ny; ++y)
+                    for (uint32_t x = 1; x + 1 < g.nx; ++x) {
+                        const size_t n = (size_t(z) * g.ny + y) * g.nx + x;
+                        if (fl[n] & 1u) continue;
+                        const double p = rhoU[4 * n] - 1.0;
+                        for (int q = 1; q < 19; ++q) {
+                            const int cx = cpu::CX[q], cy = cpu::CY[q], cz = cpu::CZ[q];
+                            if (cy == 0 || (y == 1 && cy < 0)) continue;      // no vertical part, or the road
+                            const size_t m = (size_t(int(z) + cz) * g.ny + size_t(int(y) + cy)) * g.nx + size_t(int(x) + cx);
+                            if (!(fl[m] & 1u)) continue;
+                            const double f = 2.0 * cpu::WQ[q] * cy * p / 5.0;   // / 5 snapshots
+                            const int k = std::clamp(int(std::floor((x - x0) / len * bins)) + 1, 0, bins + 1);
+                            (cy > 0 ? lower : upper)[k] += f;
+                        }
+                    }
+        }
+        const double toArea = dx * dx / (0.5 * u * u);
+        std::printf("\n  Lift by position (C_L A, m^2; negative = downforce), pressure part only:\n"
+                    "  nose to tail     lower surfaces   upper surfaces   net\n");
+        double tl = 0, tu = 0;
+        for (int k = 1; k <= bins; ++k) {
+            std::printf("  %3d-%3d%%         %7.2f          %7.2f          %6.2f\n", (k - 1) * 100 / bins, k * 100 / bins,
+                        lower[k] * toArea, upper[k] * toArea, (lower[k] + upper[k]) * toArea);
+            tl += lower[k]; tu += upper[k];
+        }
+        std::printf("  total            %7.2f          %7.2f          %6.2f\n", tl * toArea, tu * toArea, (tl + tu) * toArea);
+    }
+    std::printf("\n  Published estimates for 2022-25 cars: C_L A ~5-8 m^2 (downforce ~ weight at 150 km/h,\n"
+                "  3-4x at top speed); 2021 Williams CFD with moving ground and rotating wheels: C_L A 5.6,\n"
+                "  C_D A 1.83 m^2. Reported, not asserted: the model is a display mesh, not the race car.\n");
+    s.destroy();
+    geo.destroy();
+}
+
 } // namespace
 
-int runValidation(gpu::Context& ctx, Precision prec, const std::string& suite, float diameter) {
+int runValidation(gpu::Context& ctx, Precision prec, const std::string& suite, float diameter,
+                  const std::string& mesh, float speed) {
     const bool doLaminar   = suite == "standard" || suite == "laminar" || suite == "all";
     const bool doBluff     = suite == "standard" || suite == "all";
     const bool doTurbulent = suite == "turbulent" || suite == "all";
@@ -758,6 +957,7 @@ int runValidation(gpu::Context& ctx, Precision prec, const std::string& suite, f
     std::printf("\nCFD validation (%s suite), %s storage\n", suite.c_str(), precisionName(prec));
     if (doLaminar) laminarSuite(ctx, prec, ok);
     if (suite == "stability" || suite == "all") stabilitySuite(ctx, prec, ok);
+    if (suite == "car") carSuite(ctx, prec, mesh, diameter > 0 ? diameter : 280.f, speed, ok);
     if (doBluff) {
         std::printf("\n  BLUFF BODIES. Measured (published) values; tolerances C_D 8%%, St 6%%, L_r/D 12%%.\n");
         std::printf("  Experiments: Coutanceau & Bouard 1977 (wake length), Williamson 1996 (Strouhal),\n");
@@ -786,6 +986,7 @@ int runValidation(gpu::Context& ctx, Precision prec, const std::string& suite, f
             row(precisionName(p), cylinder(ctx, p, 100, 1.33, 0, 0.164), ok, 0.08, 0.06, 0.12);
     }
     if (doTurbulent) {
+        if (diameter <= 0) diameter = 40.f;
         const double cells = 25.0 * 20.0 * 3.14159265 * double(diameter) * diameter * diameter;
         std::printf("\n  TURBULENT: cylinder Re = 3900, 3D LES, D = %.0f, span pi D (%.0fM cells)\n",
                     diameter, cells / 1e6);

@@ -25,6 +25,10 @@ namespace gpu {
 
 void check(VkResult r, const char* what);
 
+// Validation warnings and errors so far (validation runs in debug builds, or
+// with WT_VALIDATION set).
+inline uint64_t validationMessages = 0;
+
 enum class Mem { Device, Upload, Readback };
 
 struct Buffer {

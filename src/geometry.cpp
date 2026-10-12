@@ -456,7 +456,7 @@ uint32_t Geometry::measureFrontal(Solver& s) {
         gpu::Bindings bnd = ctx_->emptyBindings();
         bnd[19] = s.flags().buf;
         bnd[22] = bits.buf;
-        const uint32_t fp[4] = {g.nx, g.ny, g.nz, 0};
+        const uint32_t fp[4] = {g.nx, g.ny, g.nz, s.flow.ground ? 1u : 0u};
         ctx_->bind(cmd, frontalK_, bnd, fp, sizeof fp);
         gpu::Context::dispatchThreads(cmd, s.cells());
     });

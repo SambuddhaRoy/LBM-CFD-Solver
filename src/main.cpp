@@ -26,19 +26,26 @@ void usage() {
         "                          bodies, ~15 min), laminar, turbulent (cylinder Re 3900,\n"
         "                          3D LES, ~15 min at D = 40), stability (default tunnel,\n"
         "                          every body, flow model and speed stays bounded, ~5 min),\n"
-        "                          all\n"
-        "  --diameter D            turbulent suite: cells across the cylinder (default 40)\n"
+        "                          car (--mesh FILE: a car on a moving road at 180, 252,\n"
+        "                          324 km/h, or --speed M), all\n"
+        "  --diameter D            turbulent suite: cells across the cylinder (default 40);\n"
+        "                          car suite: cells along the car (default 280)\n"
         "  --grid X Y Z            benchmark grid (default 256 256 256)\n"
         "  --steps N               benchmark steps per timing (default 200)\n"
         "  --precision P           fp32 | fp16s | fp16c | all (default: all for --bench,\n"
         "                          fp16c otherwise)\n"
         "  --peak GBs              device peak bandwidth, adds a %% of peak column\n"
         "  --capture FILE [N]      run the interactive app for N frames (default 300),\n"
-        "                          save the window as a PNG and exit\n\n"
+        "                          save the window as a PNG and exit\n"
+        "  --ui-test DIR           drive every control of the app with scripted input, check\n"
+        "                          it after each step, save screenshots in DIR (add --mesh\n"
+        "                          FILE to include model loading; WT_VALIDATION=1 adds\n"
+        "                          Vulkan validation)\n\n"
         "Initial state of the interactive app:\n"
         "  --preset N              grid preset index (default 1)\n"
         "  --mesh FILE             load a model (STL, OBJ, glTF, FBX, PLY, ...)\n"
         "  --realtime              start in real-time mode\n"
+        "  --road                  moving ground under the body (cars)\n"
         "  --speed M               wind speed in m/s (default 30)\n"
         "  --flow F                auto | laminar | les\n"
         "  --mesh-info FILE        list a model's parts, check it is watertight, and exit\n"
@@ -65,7 +72,8 @@ int main(int argc, char** argv) {
     std::vector<wt::Precision> precs;
     wt::StartSetup setup;
     std::string suite = "standard";
-    float diameter = 40.f;
+    float diameter = 0.f;
+    bool speedGiven = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--mesh-info" && i + 1 < argc) return wt::printMeshInfo(argv[++i]);
@@ -88,7 +96,9 @@ int main(int argc, char** argv) {
         else if (a == "--preset" && i + 1 < argc) setup.preset = std::atoi(argv[++i]);
         else if (a == "--mesh" && i + 1 < argc)   setup.meshPath = argv[++i];
         else if (a == "--realtime")               setup.realtime = true;
-        else if (a == "--speed" && i + 1 < argc)  setup.speed = float(std::atof(argv[++i]));
+        else if (a == "--road")                   setup.road = true;
+        else if (a == "--ui-test" && i + 1 < argc) setup.uiTestDir = argv[++i];
+        else if (a == "--speed" && i + 1 < argc)  { setup.speed = float(std::atof(argv[++i])); speedGiven = true; }
         else if (a == "--flow" && i + 1 < argc) {
             const std::string s = argv[++i];
             setup.flowModel = s == "laminar" ? 1 : s == "les" ? 2 : 0;
@@ -126,7 +136,8 @@ int main(int argc, char** argv) {
         else if (mode == "--bench") {
             if (!precs.empty()) bench.precisions = precs;
             rc = wt::runBenchmark(ctx, bench);
-        } else rc = wt::runValidation(ctx, precs.empty() ? wt::Precision::FP16C : precs.front(), suite, diameter);
+        } else rc = wt::runValidation(ctx, precs.empty() ? wt::Precision::FP16C : precs.front(), suite, diameter,
+                                      setup.meshPath, speedGiven ? setup.speed : 0.f);
         ctx.destroy();
         return rc;
     } catch (const std::exception& e) {

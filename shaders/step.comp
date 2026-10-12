@@ -108,22 +108,25 @@ float postPop(uint q, const Collision k) {
 }
 
 // Equilibrium, collision, wall blending and store, fused per direction pair.
-void storePairs(const Nbr b, const Collision k, uint solid, inout vec3 force) {
+void storePairs(const Nbr b, const Collision k, uint solid, bool road, inout vec3 force) {
     const uint n = b.n;
     ddfStore(0u, n, postPop(0u, k));
     [[unroll]] for (uint i = 1u; i < 19u; i += 2u) {
         float fa = postPop(i, k), fb = postPop(i + 1u, k);
         const bool sm = (solid & (1u << i)) != 0u;
         const bool sp = (solid & (1u << (i + 1u))) != 0u;
+        const bool rA = sm && road && C[i].y > 0;      // links into the road (see streamIn)
+        const bool rC = sp && road && C[i].y < 0;
 #if FORCES
-        // Outgoing half: c_out (f_out + w) for every population sent at a wall.
-        if (sp) force += vec3(C[i])      * (fa + W[i]);
-        if (sm) force += vec3(C[i + 1u]) * (fb + W[i]);
+        // Outgoing half: c_out f_out for every population sent at a wall
+        // (shifted, i.e. gauge: see streamIn).
+        if (sp && !rC) force += vec3(C[i])      * fa;
+        if (sm && !rA) force += vec3(C[i + 1u]) * fb;
 #endif
         // Bouzidi with the wall at or beyond halfway (q >= 1/2): store the
         // blend of this cell's own two post-collision populations into the
         // wall slot, where the next step's bounce-back read will find it.
-        if (sm != sp && pc.bouzidi != 0.0) {
+        if (sm != sp && pc.bouzidi != 0.0 && !rA && !rC) {
             if (sp) {
                 const float q = linkQ(n, nb(b, i));
                 if (q >= 0.5) { const float r = 0.5 / q; fa = r*fa + (1.0 - r)*fb; }
@@ -155,8 +158,9 @@ void cell(uvec3 p, inout vec3 force) {
     // compiler issue them all at once (16-bit storage needs twice the loads
     // in flight of FP32 to saturate memory).
     const uint solid = (fl & FLAG_WALL) != 0u ? wallLinks(b) : 0u;
+    const bool road = (pc.faces & 8u) != 0u && p.y == 1u;
     vec3 fin = vec3(0.0);
-    const Moments m = solid == 0u ? streamIn(b, odd, 0u, fin) : streamIn(b, odd, solid, fin);
+    const Moments m = solid == 0u ? streamIn(b, odd, 0u, false, fin) : streamIn(b, odd, solid, road, fin);
 #if FORCES
     force += fin;
 #endif
@@ -214,8 +218,8 @@ void cell(uvec3 p, inout vec3 force) {
     k.tm = am + k.keep * bm;
 
     // ── Store, fused per direction pair (bulk and wall copies, as above) ─
-    if (solid == 0u) storePairs(b, k, 0u, force);
-    else             storePairs(b, k, solid, force);
+    if (solid == 0u) storePairs(b, k, 0u, false, force);
+    else             storePairs(b, k, solid, road, force);
     writeField(b.n, p, k.rhom1, u);
 }
 
